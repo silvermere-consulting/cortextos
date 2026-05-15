@@ -4,8 +4,8 @@ import os from 'os';
 
 export const dynamic = 'force-dynamic';
 
-// Context window size for Claude models (tokens)
-const CONTEXT_LIMIT = 200_000;
+// Context window size for Claude Opus 4.7 / Opus 4.6 / Sonnet 4.6 (tokens)
+const CONTEXT_LIMIT = 1_000_000;
 
 // Thresholds for Green / Amber / Red
 const AMBER_THRESHOLD = 0.6;
