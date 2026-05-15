@@ -19,13 +19,13 @@
       "name": "heartbeat",
       "type": "recurring",
       "interval": "4h",
-      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, and work on your highest priority task."
+      "prompt": "HEARTBEAT CRON: Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, and work on your highest priority task."
     },
     {
       "name": "nightly-metrics",
       "type": "recurring",
       "interval": "24h",
-      "prompt": "Run nightly metrics collection: cortextos bus collect-metrics. Review the output and report any anomalies via Telegram to the orchestrator."
+      "prompt": "NIGHTLY CRON: Run nightly metrics collection: cortextos bus collect-metrics. Review the output and report any anomalies via Telegram to the orchestrator."
     },
     {
       "name": "auto-commit",

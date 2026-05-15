@@ -13,7 +13,7 @@
       "name": "heartbeat",
       "type": "recurring",
       "interval": "4h",
-      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, and work on your highest priority task."
+      "prompt": "HEARTBEAT CRON: Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, and work on your highest priority task."
     }
   ],
   "ecosystem": {
