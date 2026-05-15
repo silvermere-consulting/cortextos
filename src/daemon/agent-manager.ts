@@ -22,7 +22,7 @@ type LogFn = (msg: string) => void;
  * Manages all agents in a cortextOS instance.
  */
 export class AgentManager {
-  private agents: Map<string, { process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller }> = new Map();
+  private agents: Map<string, { state: 'starting' | 'running' | 'stopping'; process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller }> = new Map();
   private workers: Map<string, WorkerProcess> = new Map();
   /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
   private cronSchedulers: Map<string, CronScheduler> = new Map();
@@ -145,20 +145,25 @@ export class AgentManager {
    * `CTX_ORG` the daemon was started with.
    */
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
-    if (this.agents.has(name)) {
-      // BUG-031: this branch was the workaround for the BUG-011 PTY race
-      // (restart-all could send stop+start simultaneously, and the new
-      // start would arrive while the old stop's PTY exit was still in
-      // flight). PR #11 closed BUG-011 by making `AgentProcess.stop()`
-      // await the actual PTY exit before resolving — which means this
-      // branch should NEVER fire under normal restart paths.
-      //
-      // We log a regression warning here instead of deleting the branch
-      // entirely, so we'll know IMMEDIATELY if BUG-011 ever regresses
-      // (a future change accidentally breaks the exit-await). Phase 4 of
-      // the core stability test plan + cycle 2 of PR #13 both confirmed
-      // this branch is dormant. Once we have weeks of zero-warning
-      // production data, we can delete the queue mechanism entirely.
+    const existing = this.agents.get(name);
+    if (existing) {
+      if (existing.state === 'starting' || existing.state === 'stopping') {
+        // BUG-011 fix (state-machine): a concurrent IPC start-agent or restart-agent
+        // arrived while this agent is mid-start or mid-stop. The agent is already
+        // being managed — reject cleanly rather than queuing a duplicate.
+        //
+        // Root cause of the original regression: orphaned PTY processes from the
+        // previous daemon session connect to the new daemon's stable IPC socket
+        // (daemon.sock) during discoverAndStart() and issue restart-agent commands
+        // that race with the in-flight start(). PM2's default kill_timeout (1600ms)
+        // is shorter than daemon stop()'s 20s window, so orphans are structurally
+        // guaranteed on every pm2 restart. The state-machine closes the window
+        // regardless of orphan source (crash or clean restart).
+        console.log(`[agent-manager] Agent "${name}" is already ${existing.state} — ignoring concurrent IPC start-agent`);
+        return;
+      }
+      // Agent is 'running': this is a genuine unexpected double-start. Keep the
+      // BUG-011 regression warn + pendingRestarts safety net.
       console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
       this.pendingRestarts.add(name);
       return;
@@ -274,10 +279,22 @@ export class AgentManager {
       });
     }
 
-    this.agents.set(name, { process: agentProcess, checker });
+    // BUG-011 fix: register with state='starting' BEFORE the await so concurrent
+    // IPC start-agent calls see the in-progress state and reject cleanly. Set
+    // 'running' after start() resolves, or delete the entry on error so the agent
+    // is recoverable without a daemon restart.
+    this.agents.set(name, { state: 'starting', process: agentProcess, checker });
 
     // Start agent
-    await agentProcess.start();
+    try {
+      await agentProcess.start();
+      const entry = this.agents.get(name);
+      if (entry) entry.state = 'running';
+    } catch (err) {
+      this.agents.delete(name); // double-delete is harmless on Map — handles stopAgent racing with this error path
+      log(`startAgent failed — removed "${name}" from registry: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
 
     // Subtask 2.2: Auto-migrate crons from config.json → crons.json before
     // starting the scheduler, so the scheduler always has a populated crons.json
@@ -572,6 +589,10 @@ export class AgentManager {
       return;
     }
 
+    // BUG-011 fix: mark 'stopping' before the async stop() so a concurrent
+    // IPC start-agent that arrives during the await is rejected cleanly by
+    // startAgent()'s state guard rather than hitting the BUG-011 regression warn.
+    entry.state = 'stopping';
     if (entry.poller) entry.poller.stop();
     if (entry.activityPoller) entry.activityPoller.stop();
     entry.checker.stop();

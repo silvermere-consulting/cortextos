@@ -46,6 +46,11 @@ module.exports = {
       // fleet-wide outage.
       max_restarts: 10,
       restart_delay: 5000,
+      // BUG-011 fix: raise kill_timeout so PM2 gives the daemon enough time to
+      // finish graceful agent shutdown before sending SIGKILL. Default (1600ms)
+      // was shorter than daemon stop()'s 20s window, guaranteeing orphaned PTY
+      // processes on every pm2 restart. 25s covers the worst-case shutdown path.
+      kill_timeout: 25000,
       autorestart: true,
     },
   ],

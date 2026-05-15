@@ -24,7 +24,7 @@ vi.mock('../../../src/daemon/agent-process.js', () => ({
 // Mock FastChecker so it doesn't try to spawn anything either.
 vi.mock('../../../src/daemon/fast-checker.js', () => ({
   FastChecker: class {
-    start() { /* no-op */ }
+    start() { return Promise.resolve(); }
     stop() { /* no-op */ }
     wake() { /* no-op */ }
   },
@@ -444,5 +444,57 @@ describe('AgentManager.reloadCrons - silent-success bug fix (iter 7)', () => {
     const result = am.reloadCrons('ghost');
     expect(result).toBe(false);
     expect((am as any).cronSchedulers.has('ghost')).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUG-011 regression: concurrent startAgent race on pm2 restart
+//
+// Root cause: agent-manager.ts registers the agent in this.agents BEFORE
+// await agentProcess.start(). During the async suspension window an IPC
+// restart-agent command from an orphaned old PTY process connects to the new
+// daemon's stable IPC socket and calls startAgent() again, hitting the guard.
+//
+// Fix: state-machine ('starting' | 'running' | 'stopping') in the agents Map
+// so concurrent IPC calls are rejected cleanly rather than queued via
+// pendingRestarts. See startAgent() and stopAgent() in agent-manager.ts.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('AgentManager.startAgent — BUG-011 race prevention', () => {
+  let testDir: string;
+  let ctxRoot: string;
+  let frameworkRoot: string;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-bug011-'));
+    ctxRoot = join(testDir, 'instance');
+    frameworkRoot = join(testDir, 'framework');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme', 'agents', 'analyst'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it('concurrent startAgent does not double-start or emit BUG-011 warning', async () => {
+    // Two synchronous startAgent calls for the same agent simulate an IPC
+    // restart-agent arriving while the first start() is awaiting. The first call
+    // registers state='starting' synchronously then suspends; the second call
+    // finds that state and returns cleanly — no duplicate process, no warning.
+    const warnSpy = vi.spyOn(console, 'warn');
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const agentDir = join(frameworkRoot, 'orgs', 'acme', 'agents', 'analyst');
+
+    const firstStart = am.startAgent('analyst', agentDir);
+    const secondStart = am.startAgent('analyst', agentDir);
+    await Promise.all([firstStart, secondStart]);
+
+    // No BUG-011 warning — second call rejected cleanly via state check
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining('BUG-011 REGRESSION CHECK'),
+    );
+    // Exactly one agent entry in the registry
+    expect((am as any).agents.size).toBe(1);
   });
 });
