@@ -25,10 +25,15 @@ Complete the following in order. Do not skip steps.
    ```bash
    cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID "Booting up... one moment"
    ```
-2. Read all bootstrap files: IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md, USER.md, TOOLS.md, SYSTEM.md
+2. **Trigger-aware file loading** — check the startup prompt for a signal keyword before reading files:
+   - **No signal** (cold boot or any unrecognised startup prompt): read all bootstrap files: IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md, USER.md, TOOLS.md, SYSTEM.md
+   - **`HEARTBEAT CRON:` prefix**: minimal load — read HEARTBEAT.md + MEMORY.md only; skip SOUL, GUARDRAILS, IDENTITY, TOOLS, SYSTEM (already in session context or compaction summary)
+   - **`NIGHTLY CRON:` prefix**: read GOALS.md + MEMORY.md only
+   - **`CONTEXT HANDOFF`**: read all bootstrap files as for cold boot
+   - If in an already-running session (cron fires mid-session, not fresh boot): do NOT re-read bootstrap files — execute the cron's instructions directly
    - TOOLS.md is a compact command index — load the relevant skill (e.g. `tasks/SKILL.md`, `comms/SKILL.md`) when you need full docs for a workflow
-3. Read org knowledge base: `../../knowledge.md` (shared facts all agents need)
-4. Discover available skills: `cortextos bus list-skills --format text`
+3. Read org knowledge base: `../../knowledge.md` (shared facts all agents need) — **skip for `HEARTBEAT CRON:` and `NIGHTLY CRON:` triggers**
+4. Discover available skills: `cortextos bus list-skills --format text` — **skip for `HEARTBEAT CRON:` and `NIGHTLY CRON:` triggers**
 5. Discover active agents: `cortextos bus list-agents` (live roster from enabled-agents.json)
 6. **Crons are daemon-managed.** External crons auto-load from `${CTX_ROOT}/state/${CTX_AGENT_NAME}/crons.json` on daemon start; you do not need to restore them. Use `cortextos bus list-crons $CTX_AGENT_NAME` to see what's scheduled. To add or change a cron at runtime, use the `cron-management` skill (do NOT use CronCreate or `/loop` for persistent scheduling — those are session-only).
 7. Check today's memory file (`memory/$(date -u +%Y-%m-%d).md`) for any in-progress work
@@ -72,6 +77,35 @@ MEMEOF
    ```
 
 **--continue restarts** (71h auto-restart): No user notification needed. Session history is preserved.
+
+---
+
+## Trigger-Aware Bootstrap
+
+Bootstrap file loading is the largest token cost on fresh session starts. On a cold boot with a 1M-context model, reading all bootstrap files + knowledge.md + `list-skills` costs ~4–5k tokens as cache misses. On `--continue` sessions those reads are prompt-cached (~72% cheaper). But for cron-triggered micro-sessions and post-`/compact` turns, most of those files are redundant.
+
+**Signal keywords** embedded in cron prompts tell you what the current session is doing so you can load only what's needed:
+
+| Signal prefix | Minimal file set | Skip |
+|---|---|---|
+| `HEARTBEAT CRON:` | HEARTBEAT.md, MEMORY.md | SOUL, GUARDRAILS, IDENTITY, TOOLS, SYSTEM, knowledge.md, list-skills |
+| `NIGHTLY CRON:` | GOALS.md, MEMORY.md | all others |
+| None / cold boot | All bootstrap files | nothing |
+
+**Rules:**
+- Persistent agent, cron fires mid-session: **do not re-read any bootstrap files** — they are loaded. Execute the cron's task directly.
+- On-demand agent booted specifically for a cron: check the prompt's signal keyword → load minimal set, skip the rest.
+- After `/compact`: your compaction summary holds all bootstrap content. When the next cron fires, trust the summary — do not re-read from disk.
+- When in doubt, use the full set. Lazy loading is an optimisation, not a correctness constraint.
+
+**Adding a signal-aware cron:**
+```bash
+# Heartbeat with lazy signal
+cortextos bus add-cron $CTX_AGENT_NAME heartbeat 4h "HEARTBEAT CRON: Read HEARTBEAT.md and follow its instructions."
+
+# Nightly metrics with lazy signal
+cortextos bus add-cron $CTX_AGENT_NAME nightly-metrics "0 23 * * *" "NIGHTLY CRON: Run cortextos bus collect-metrics and report anomalies."
+```
 
 ---
 
@@ -453,7 +487,7 @@ You do not need to do anything. If you want to verify: check that `.crons-migrat
 
 **1. Heartbeat every 6 hours:**
 ```bash
-cortextos bus add-cron $CTX_AGENT_NAME heartbeat 6h Read HEARTBEAT.md and follow its instructions.
+cortextos bus add-cron $CTX_AGENT_NAME heartbeat 6h "HEARTBEAT CRON: Read HEARTBEAT.md and follow its instructions."
 ```
 
 **2. Nightly metrics at 1am daily (cron expression):**
