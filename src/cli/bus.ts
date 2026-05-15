@@ -626,6 +626,26 @@ busCommand
   });
 
 busCommand
+  .command('self-compact')
+  .description('Inject /compact into this agent\'s PTY so Claude Code compacts session context between tasks')
+  .action(async () => {
+    const env = resolveEnv();
+    const ipc = new IPCClient(env.instanceId);
+    const daemonRunning = await ipc.isDaemonRunning();
+    if (!daemonRunning) {
+      console.error('ERROR: Node daemon is not running.');
+      process.exit(1);
+    }
+    const resp = await ipc.send({ type: 'compact-agent', agent: env.agentName, source: 'cortextos bus self-compact' });
+    if (resp.success) {
+      console.log(resp.data);
+    } else {
+      console.error(`Compact failed: ${resp.error}`);
+      process.exit(1);
+    }
+  });
+
+busCommand
   .command('hard-restart')
   .description('Plan a hard restart (fresh session, no --continue)')
   .option('--reason <why>', 'Reason for restart')

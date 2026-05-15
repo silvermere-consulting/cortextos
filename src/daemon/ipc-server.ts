@@ -641,6 +641,21 @@ export class IPCServer {
           }
           break;
 
+        case 'compact-agent':
+          // Inject /compact into the agent's PTY so Claude Code compacts context
+          if (request.agent) {
+            const checker = this.agentManager.getFastChecker(request.agent);
+            if (checker) {
+              checker.compact();
+              response = { success: true, data: `Injecting /compact for ${request.agent}` };
+            } else {
+              response = { success: false, error: `Agent ${request.agent} not found or not running` };
+            }
+          } else {
+            response = { success: false, error: 'Agent name required' };
+          }
+          break;
+
         case 'spawn-worker': {
           const d = request.data as { name?: string; dir?: string; prompt?: string; parent?: string; model?: string } | undefined;
           if (!d?.name || !d?.dir || !d?.prompt) {

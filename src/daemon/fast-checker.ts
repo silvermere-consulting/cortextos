@@ -155,6 +155,14 @@ export class FastChecker {
   }
 
   /**
+   * Inject /compact as a PTY input line so Claude Code compacts the session
+   * context on its next idle cycle. Called by IPC 'compact-agent' command.
+   */
+  compact(): void {
+    this.agent.write('/compact\r\n');
+  }
+
+  /**
    * Queue a formatted Telegram message for injection.
    * Called by the daemon's Telegram handler.
    */
