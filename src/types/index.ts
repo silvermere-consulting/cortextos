@@ -396,6 +396,19 @@ export interface CronDefinition {
    * @default false (manual fire is allowed by default — opt-out model)
    */
   manualFireDisabled?: boolean;
+
+  /**
+   * Maximum milliseconds the scheduler allows a cron to remain in the
+   * "firing" state before it is considered stuck and the firing flag is reset.
+   *
+   * When absent, the scheduler applies name-based defaults:
+   *   - "heartbeat" patterns → 300 000 ms (5 min)
+   *   - "*-review" / "morning-review" / "evening-review" patterns → 1 800 000 ms (30 min)
+   *   - All others → 900 000 ms (15 min)
+   *
+   * @example 1800000  — 30 minutes for a long-running review cron
+   */
+  max_firing_ms?: number;
 }
 
 // ---------------------------------------------------------------------------
