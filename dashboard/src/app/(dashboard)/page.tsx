@@ -11,10 +11,9 @@ import { ActionRequired } from '@/components/overview/action-required';
 import { CurrentFocus } from '@/components/overview/current-focus';
 import { TodaysProgress } from '@/components/overview/todays-progress';
 import { LiveActivity } from '@/components/overview/live-activity';
-import { SystemHealth } from '@/components/overview/system-health';
 import { MetricCards } from '@/components/overview/metric-cards';
 import { AgentStatusGrid } from '@/components/overview/agent-status-grid';
-import { SessionContextGauge } from '@/components/overview/session-context-gauge';
+import { FleetHealth } from '@/components/overview/fleet-health';
 
 export const dynamic = 'force-dynamic';
 
@@ -135,11 +134,8 @@ export default async function OverviewPage({
         </div>
       </div>
 
-      {/* System Health + Session Context */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <SystemHealth summary={healthSummary} />
-        <SessionContextGauge />
-      </div>
+      {/* Fleet Health — unified agent health + context + quota */}
+      <FleetHealth />
     </div>
   );
 }
