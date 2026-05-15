@@ -14,6 +14,7 @@ import { LiveActivity } from '@/components/overview/live-activity';
 import { SystemHealth } from '@/components/overview/system-health';
 import { MetricCards } from '@/components/overview/metric-cards';
 import { AgentStatusGrid } from '@/components/overview/agent-status-grid';
+import { SessionContextGauge } from '@/components/overview/session-context-gauge';
 
 export const dynamic = 'force-dynamic';
 
@@ -134,8 +135,11 @@ export default async function OverviewPage({
         </div>
       </div>
 
-      {/* System Health */}
-      <SystemHealth summary={healthSummary} />
+      {/* System Health + Session Context */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <SystemHealth summary={healthSummary} />
+        <SessionContextGauge />
+      </div>
     </div>
   );
 }
