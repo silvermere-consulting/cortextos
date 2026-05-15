@@ -138,6 +138,16 @@ interface ScheduledCron {
   changeKey: string;
   /** True while onFire (+ retries) is executing — prevents re-entry on the next tick. */
   firing?: boolean;
+  /** Epoch ms when firing was set to true — used by stuck-firing guard. */
+  firingStartedAt?: number;
+}
+
+/** Return the max ms a cron may remain in the firing state before being reset. */
+function maxFiringMs(cron: CronDefinition): number {
+  if (cron.max_firing_ms != null) return cron.max_firing_ms;
+  if (/heartbeat/.test(cron.name)) return 300_000;                              // 5 min
+  if (/review/.test(cron.name)) return 1_800_000;                               // 30 min
+  return 900_000;                                                                // 15 min default
 }
 
 function changeKeyFor(c: CronDefinition): string {
@@ -456,89 +466,127 @@ export class CronScheduler {
     const now = Date.now();
 
     for (const [name, sc] of this.scheduled) {
+      // Diagnostic log: emit one line per cron per tick so anomalies are traceable.
+      const decision = sc.nextFireAt > now ? 'skip_future' : sc.firing ? 'skip_firing' : 'fire';
+      this.logger(
+        `[cron-scheduler] tick ${new Date(now).toISOString()} | "${name}" | ` +
+        `nextFireAt=${new Date(sc.nextFireAt).toISOString()} | firing=${sc.firing ?? false} | decision=${decision}`
+      );
+
       if (sc.nextFireAt > now) {
         continue; // not yet due
       }
 
       // Guard against re-entry: if a previous tick's async fire+retry is still
       // in flight (can happen with fake timers or very slow onFire), skip.
+      // Stuck-firing guard: if the cron has been firing beyond its threshold,
+      // reset the flag and fall through to re-fire.
       if (sc.firing) {
-        continue;
-      }
-
-      sc.firing = true;
-      const cron = sc.definition;
-      this.logger(`[cron-scheduler] firing cron "${name}" (was due ${new Date(sc.nextFireAt).toISOString()})`);
-
-      // Persist last_fire_attempted_at to disk BEFORE awaiting the dispatch.
-      // If the daemon crashes between this point and the post-success
-      // updateCron below, loadCrons() on restart will see this attempt
-      // timestamp in the referenceMs candidates and avoid re-firing the
-      // same slot via the catch-up gate. (See iter 10/11 audit.)
-      const attemptIso = new Date(now).toISOString();
-      try {
-        updateCron(this.agentName, name, { last_fire_attempted_at: attemptIso });
-        sc.definition = { ...cron, last_fire_attempted_at: attemptIso };
-      } catch (err) {
-        this.logger(
-          `[cron-scheduler] WARNING: failed to persist last_fire_attempted_at for "${name}" — ` +
-          `${err instanceof Error ? err.message : String(err)}. ` +
-          `Continuing dispatch; crash mid-fire could double-fire on restart.`
-        );
-      }
-
-      const success = await fireWithRetry(cron, this.agentName, this.onFire, this.logger);
-
-      if (success) {
-        // Persist last_fired_at + fire_count to disk.
-        // updateCron writes through atomicWriteSync and can throw ENOSPC or
-        // EACCES (disk full / read-only filesystem).  These errors must not
-        // crash the tick loop — we log and keep the in-memory schedule intact.
-        const nowIso = new Date(now).toISOString();
-        const newFireCount = (cron.fire_count ?? 0) + 1;
-        try {
-          updateCron(this.agentName, name, {
-            last_fired_at: nowIso,
-            fire_count: newFireCount,
-          });
-        } catch (err) {
+        const threshold = maxFiringMs(sc.definition);
+        if (sc.firingStartedAt != null && (now - sc.firingStartedAt) > threshold) {
           this.logger(
-            `[cron-scheduler] WARNING: failed to persist fire state for "${name}" — ` +
-            `${err instanceof Error ? err.message : String(err)}. ` +
-            `In-memory schedule retained; state will be lost if daemon restarts.`
+            `[cron-scheduler] WARNING: cron "${name}" stuck in firing state for ` +
+            `${Math.round((now - sc.firingStartedAt) / 1000)}s (threshold ${threshold / 1000}s) — resetting`
           );
-        }
-
-        // Advance in-memory nextFireAt
-        const next = computeNextFireAt(cron, now);
-        if (!isNaN(next)) {
-          sc.nextFireAt = next;
-          sc.definition = { ...cron, last_fired_at: nowIso, fire_count: newFireCount };
+          sc.firing = false;
+          sc.firingStartedAt = undefined;
+          // Fall through to fire
         } else {
-          // Unrecognised schedule after fire — remove from schedule to avoid infinite loops
-          this.scheduled.delete(name);
-          this.logger(`[cron-scheduler] WARNING: removed "${name}" from schedule after fire — schedule unparseable`);
-          continue; // sc is gone, skip clearing firing flag
-        }
-      } else {
-        // Dispatch failed (all retries exhausted). Advance nextFireAt anyway so
-        // we don't re-fire the same scheduled slot on every subsequent tick —
-        // that produced a busy-loop when an agent was unreachable. Treat the
-        // failed window as a missed slot and schedule the next normal fire.
-        const next = computeNextFireAt(cron, now);
-        if (!isNaN(next)) {
-          sc.nextFireAt = next;
-          this.logger(
-            `[cron-scheduler] WARNING: "${name}" dispatch failed — advancing to next slot ${new Date(next).toISOString()} ` +
-            `to avoid busy-loop (no last_fired_at update; failure recorded in execution log)`
-          );
-        } else {
-          this.scheduled.delete(name);
-          this.logger(`[cron-scheduler] WARNING: removed "${name}" from schedule after failure — schedule unparseable`);
           continue;
         }
       }
+
+      sc.firing = true;
+      sc.firingStartedAt = now;
+      const cron = sc.definition;
+      this.logger(`[cron-scheduler] firing cron "${name}" (was due ${new Date(sc.nextFireAt).toISOString()})`);
+
+      // Wrap the entire fire body so an unexpected throw cannot permanently
+      // strand sc.firing = true and silently block this cron forever.
+      try {
+        // Persist last_fire_attempted_at to disk BEFORE awaiting the dispatch.
+        // If the daemon crashes between this point and the post-success
+        // updateCron below, loadCrons() on restart will see this attempt
+        // timestamp in the referenceMs candidates and avoid re-firing the
+        // same slot via the catch-up gate. (See iter 10/11 audit.)
+        const attemptIso = new Date(now).toISOString();
+        try {
+          updateCron(this.agentName, name, { last_fire_attempted_at: attemptIso });
+          sc.definition = { ...cron, last_fire_attempted_at: attemptIso };
+        } catch (err) {
+          this.logger(
+            `[cron-scheduler] WARNING: failed to persist last_fire_attempted_at for "${name}" — ` +
+            `${err instanceof Error ? err.message : String(err)}. ` +
+            `Continuing dispatch; crash mid-fire could double-fire on restart.`
+          );
+        }
+
+        const success = await fireWithRetry(cron, this.agentName, this.onFire, this.logger);
+
+        if (success) {
+          // Persist last_fired_at + fire_count to disk.
+          // updateCron writes through atomicWriteSync and can throw ENOSPC or
+          // EACCES (disk full / read-only filesystem).  These errors must not
+          // crash the tick loop — we log and keep the in-memory schedule intact.
+          const nowIso = new Date(now).toISOString();
+          const newFireCount = (cron.fire_count ?? 0) + 1;
+          try {
+            updateCron(this.agentName, name, {
+              last_fired_at: nowIso,
+              fire_count: newFireCount,
+            });
+          } catch (err) {
+            this.logger(
+              `[cron-scheduler] WARNING: failed to persist fire state for "${name}" — ` +
+              `${err instanceof Error ? err.message : String(err)}. ` +
+              `In-memory schedule retained; state will be lost if daemon restarts.`
+            );
+          }
+
+          // Advance in-memory nextFireAt
+          const next = computeNextFireAt(cron, now);
+          if (!isNaN(next)) {
+            sc.nextFireAt = next;
+            sc.definition = { ...cron, last_fired_at: nowIso, fire_count: newFireCount };
+          } else {
+            // Unrecognised schedule after fire — remove from schedule to avoid infinite loops
+            this.scheduled.delete(name);
+            this.logger(`[cron-scheduler] WARNING: removed "${name}" from schedule after fire — schedule unparseable`);
+            continue; // sc is gone, skip clearing firing flag
+          }
+        } else {
+          // Dispatch failed (all retries exhausted). Advance nextFireAt anyway so
+          // we don't re-fire the same scheduled slot on every subsequent tick —
+          // that produced a busy-loop when an agent was unreachable. Treat the
+          // failed window as a missed slot and schedule the next normal fire.
+          const next = computeNextFireAt(cron, now);
+          if (!isNaN(next)) {
+            sc.nextFireAt = next;
+            this.logger(
+              `[cron-scheduler] WARNING: "${name}" dispatch failed — advancing to next slot ${new Date(next).toISOString()} ` +
+              `to avoid busy-loop (no last_fired_at update; failure recorded in execution log)`
+            );
+          } else {
+            this.scheduled.delete(name);
+            this.logger(`[cron-scheduler] WARNING: removed "${name}" from schedule after failure — schedule unparseable`);
+            continue;
+          }
+        }
+      } catch (err) {
+        // Unexpected error outside the normal fire/retry paths. Reset sc.firing
+        // and let the next tick re-evaluate from current state rather than
+        // advancing nextFireAt (we don't know what partially ran).
+        const errMsg = err instanceof Error ? err.message : String(err);
+        this.logger(
+          `[cron-scheduler] UNEXPECTED ERROR in cron "${name}" fire body — resetting firing flag. Error: ${errMsg}`
+        );
+        sc.firing = false;
+        sc.firingStartedAt = undefined;
+        continue;
+      }
+
       sc.firing = false;
+      sc.firingStartedAt = undefined;
     }
   }
 }
