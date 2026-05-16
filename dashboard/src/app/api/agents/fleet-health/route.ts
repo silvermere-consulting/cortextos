@@ -7,7 +7,7 @@ export const dynamic = 'force-dynamic';
 const CONTEXT_LIMIT = 1_000_000;
 const AMBER_THRESHOLD = 0.6;
 const RED_THRESHOLD = 0.85;
-const USAGE_STALE_MS = 10 * 60 * 1000; // treat usage data older than 10 min as unavailable
+const USAGE_STALE_MS = 10 * 60 * 1000;
 
 export type HealthStatus = 'healthy' | 'stale' | 'down';
 export type ContextStatus = 'green' | 'amber' | 'red' | 'unknown';
@@ -31,9 +31,26 @@ export interface UsageData {
   fetched_at: string;
 }
 
+export interface AgentTokenData {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate: number;
+  costUsd: number;
+  model: string;
+  tasksToday: number;
+}
+
+export interface FleetTokenSummary {
+  agents: Record<string, AgentTokenData>;
+  fleetCostToday: number;
+  asOf: string;
+}
+
 export interface FleetHealthResponse {
   agents: FleetAgentData[];
   usage: UsageData | null;
+  tokens: FleetTokenSummary | null;
   healthy: number;
   stale: number;
   down: number;
@@ -196,6 +213,177 @@ async function readAllContextMetrics(): Promise<Map<string, { fillPct: number; c
   return result;
 }
 
+// --- Token tracking (JSONL incremental scanner) ---
+
+const MODEL_PRICES: Record<string, { input: number; output: number; cacheWrite1h: number; cacheWrite5m: number; cacheRead: number }> = {
+  'claude-opus-4-7':   { input: 5.00, output: 25.00, cacheWrite1h: 10.00, cacheWrite5m: 6.25, cacheRead: 0.50 },
+  'claude-sonnet-4-6': { input: 3.00, output: 15.00, cacheWrite1h:  6.00, cacheWrite5m: 3.75, cacheRead: 0.30 },
+  'claude-haiku-4-5':  { input: 1.00, output:  5.00, cacheWrite1h:  2.00, cacheWrite5m: 1.25, cacheRead: 0.10 },
+};
+const MTOK = 1_000_000;
+const KNOWN_AGENTS = ['chief', 'analyst', 'research', 'business-analyst'];
+
+const CTX_ROOT = path.join(os.homedir(), '.cortextos', 'default');
+const CURSOR_PATH = path.join(CTX_ROOT, 'analytics', 'token-cursor.json');
+const TOTALS_PATH = path.join(CTX_ROOT, 'analytics', 'token-totals.json');
+
+interface AgentCursor { filePath: string; lineCount: number; }
+interface CursorStore  { date: string; cursors: Record<string, AgentCursor>; }
+interface TotalsStore  { date: string; agents: Record<string, AgentTokenData>; updatedAt: string; }
+
+function todayUTC(): string {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+function calcTurnCost(model: string, inp: number, out: number, cr: number, cc1h: number, cc5m: number): number {
+  const p = MODEL_PRICES[model] ?? MODEL_PRICES['claude-sonnet-4-6'];
+  return (inp / MTOK) * p.input
+       + (out / MTOK) * p.output
+       + (cr  / MTOK) * p.cacheRead
+       + (cc1h / MTOK) * p.cacheWrite1h
+       + (cc5m / MTOK) * p.cacheWrite5m;
+}
+
+async function readOrInit<T>(filePath: string, defaultVal: T, dateKey?: string): Promise<T> {
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8');
+    const parsed = JSON.parse(raw) as T & { date?: string };
+    if (dateKey && parsed.date !== dateKey) return defaultVal;
+    return parsed;
+  } catch {
+    return defaultVal;
+  }
+}
+
+async function getLatestJsonlForAgent(agentName: string): Promise<string | null> {
+  const dir = path.join(os.homedir(), '.claude', 'projects', `-home-cortext-cortextos-orgs-silvermere-tech-agents-${agentName}`);
+  let files: string[];
+  try {
+    files = (await fs.readdir(dir)).filter(f => f.endsWith('.jsonl'));
+  } catch {
+    return null;
+  }
+  if (files.length === 0) return null;
+  const statted = await Promise.all(files.map(async f => {
+    const fp = path.join(dir, f);
+    const stat = await fs.stat(fp).catch(() => null);
+    return { fp, mtime: stat?.mtimeMs ?? 0 };
+  }));
+  statted.sort((a, b) => b.mtime - a.mtime);
+  return statted[0].fp;
+}
+
+async function scanAgentTokens(
+  agentName: string,
+  cursor: AgentCursor | undefined,
+  prior: AgentTokenData | undefined,
+  today: string,
+): Promise<{ tokens: AgentTokenData; newCursor: AgentCursor | null }> {
+  const latestFile = await getLatestJsonlForAgent(agentName);
+  const empty: AgentTokenData = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, costUsd: 0, model: 'unknown', tasksToday: 0 };
+
+  if (!latestFile) return { tokens: prior ?? empty, newCursor: null };
+
+  const content = await fs.readFile(latestFile, 'utf-8').catch(() => '');
+  const lines = content.split('\n').filter(Boolean);
+
+  // Carry forward prior totals when continuing same file; reset on file change or new day
+  const sameFile = cursor?.filePath === latestFile;
+  const startLine = sameFile ? (cursor?.lineCount ?? 0) : 0;
+  const tokens: AgentTokenData = (sameFile && prior) ? { ...prior } : { ...empty };
+
+  const modelCounts: Record<string, number> = {};
+  const todayPrefix = today; // ISO timestamp starts with "YYYY-MM-DD"
+
+  for (let i = startLine; i < lines.length; i++) {
+    let obj: Record<string, unknown>;
+    try { obj = JSON.parse(lines[i]); } catch { continue; }
+
+    const ts = obj.timestamp as string | undefined;
+    if (!ts?.startsWith(todayPrefix)) continue;
+
+    const msg = obj.message as Record<string, unknown> | undefined;
+    if (!msg || msg.role !== 'assistant') continue;
+    const usage = msg.usage as Record<string, unknown> | undefined;
+    if (!usage) continue;
+
+    const model = (msg.model as string) || 'unknown';
+    modelCounts[model] = (modelCounts[model] ?? 0) + 1;
+
+    const inp = (usage.input_tokens as number) ?? 0;
+    const out = (usage.output_tokens as number) ?? 0;
+    const cr  = (usage.cache_read_input_tokens as number) ?? 0;
+    const cc  = (usage.cache_creation_input_tokens as number) ?? 0;
+    const ccObj = usage.cache_creation as Record<string, number> | undefined;
+    const cc1h = ccObj?.ephemeral_1h_input_tokens ?? cc;
+    const cc5m = ccObj?.ephemeral_5m_input_tokens ?? 0;
+
+    tokens.input      += inp;
+    tokens.output     += out;
+    tokens.cacheRead  += cr;
+    tokens.cacheCreate += cc;
+    tokens.costUsd    += calcTurnCost(model, inp, out, cr, cc1h, cc5m);
+  }
+
+  if (Object.keys(modelCounts).length > 0) {
+    tokens.model = Object.entries(modelCounts).sort((a, b) => b[1] - a[1])[0][0];
+  }
+
+  return { tokens, newCursor: { filePath: latestFile, lineCount: lines.length } };
+}
+
+async function countTasksToday(agentName: string, today: string): Promise<number> {
+  const auditDir = path.join(CTX_ROOT, 'orgs', 'silvermere-tech', 'tasks', 'audit');
+  let files: string[];
+  try { files = (await fs.readdir(auditDir)).filter(f => f.endsWith('.jsonl')); }
+  catch { return 0; }
+
+  let count = 0;
+  await Promise.all(files.map(async (file) => {
+    const content = await fs.readFile(path.join(auditDir, file), 'utf-8').catch(() => '');
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line) as { event?: string; agent?: string; ts?: string };
+        if (obj.event === 'complete' && obj.agent === agentName && obj.ts?.startsWith(today)) count++;
+      } catch { /* skip */ }
+    }
+  }));
+  return count;
+}
+
+async function readAndUpdateTokenMetrics(): Promise<FleetTokenSummary> {
+  const today = todayUTC();
+
+  const [cursorStore, totalsStore] = await Promise.all([
+    readOrInit<CursorStore>(CURSOR_PATH, { date: today, cursors: {} }, today),
+    readOrInit<TotalsStore>(TOTALS_PATH, { date: today, agents: {}, updatedAt: '' }, today),
+  ]);
+
+  const newCursors: CursorStore = { date: today, cursors: { ...cursorStore.cursors } };
+  const newTotals: TotalsStore  = { date: today, agents: { ...totalsStore.agents }, updatedAt: new Date().toISOString() };
+
+  await Promise.all(KNOWN_AGENTS.map(async (agent) => {
+    const [scanResult, tasksToday] = await Promise.all([
+      scanAgentTokens(agent, cursorStore.cursors[agent], totalsStore.agents[agent], today),
+      countTasksToday(agent, today),
+    ]);
+    newTotals.agents[agent] = { ...scanResult.tokens, tasksToday };
+    if (scanResult.newCursor) newCursors.cursors[agent] = scanResult.newCursor;
+  }));
+
+  // Persist state (fire-and-forget, non-blocking)
+  void Promise.all([
+    fs.writeFile(CURSOR_PATH, JSON.stringify(newCursors, null, 2)).catch(() => {}),
+    fs.writeFile(TOTALS_PATH, JSON.stringify(newTotals, null, 2)).catch(() => {}),
+  ]);
+
+  const fleetCostToday = Object.values(newTotals.agents).reduce((s, a) => s + a.costUsd, 0);
+
+  return { agents: newTotals.agents, fleetCostToday, asOf: newTotals.updatedAt };
+}
+
 // --- Usage data helper ---
 
 interface UsageLatest {
@@ -225,10 +413,11 @@ async function readUsageData(): Promise<UsageData | null> {
 // --- Route handler ---
 
 export async function GET() {
-  const [heartbeats, contextMetrics, usage] = await Promise.all([
+  const [heartbeats, contextMetrics, usage, tokens] = await Promise.all([
     readHeartbeats(),
     readAllContextMetrics(),
     readUsageData(),
+    readAndUpdateTokenMetrics().catch(() => null),
   ]);
 
   // Union of all known agents
@@ -267,6 +456,6 @@ export async function GET() {
     return b.fillPct - a.fillPct;
   });
 
-  const response: FleetHealthResponse = { agents, usage, healthy, stale, down };
+  const response: FleetHealthResponse = { agents, usage, tokens, healthy, stale, down };
   return Response.json(response);
 }

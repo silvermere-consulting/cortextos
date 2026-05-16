@@ -4,8 +4,51 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { HealthDot } from '@/components/shared/health-dot';
-import { IconShieldHalfFilled } from '@tabler/icons-react';
-import type { FleetAgentData, FleetHealthResponse, ContextStatus, HealthStatus } from '@/app/api/agents/fleet-health/route';
+import { IconShieldHalfFilled, IconCoin } from '@tabler/icons-react';
+import type { FleetAgentData, FleetHealthResponse, ContextStatus, HealthStatus, AgentTokenData } from '@/app/api/agents/fleet-health/route';
+
+// Dubai working hours: 06:00–22:00 = 02:00–18:00 UTC
+function refreshInterval(): number {
+  const utcHour = new Date().getUTCHours();
+  return (utcHour >= 2 && utcHour < 18) ? 30_000 : 60_000;
+}
+
+function fmtCost(usd: number): string {
+  if (usd < 0.01) return '<$0.01';
+  return `$${usd.toFixed(2)}`;
+}
+
+function fmtTok(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000)     return `${Math.round(n / 1_000)}k`;
+  return String(n);
+}
+
+function modelBadge(model: string): string {
+  if (model.includes('opus'))   return 'Opus';
+  if (model.includes('sonnet')) return 'Sonnet';
+  if (model.includes('haiku'))  return 'Haiku';
+  return '—';
+}
+
+function TokenRow({ agent, data }: { agent: string; data: AgentTokenData }) {
+  const totalTok = data.input + data.output + data.cacheRead + data.cacheCreate;
+  const tokPerTask = data.tasksToday > 0 ? Math.round(totalTok / data.tasksToday) : null;
+  return (
+    <tr className="border-b last:border-0 text-xs">
+      <td className="py-1.5 font-medium">{agent}</td>
+      <td className="py-1.5 text-right">
+        <span className="rounded bg-muted/60 px-1 py-0.5 text-[10px] font-mono">{modelBadge(data.model)}</span>
+      </td>
+      <td className="py-1.5 text-right tabular-nums font-medium">{fmtCost(data.costUsd)}</td>
+      <td className="py-1.5 text-right tabular-nums text-muted-foreground">{fmtTok(totalTok)}</td>
+      <td className="py-1.5 text-right tabular-nums text-muted-foreground">{data.tasksToday}</td>
+      <td className="py-1.5 text-right tabular-nums text-muted-foreground">
+        {tokPerTask !== null ? fmtTok(tokPerTask) : '—'}
+      </td>
+    </tr>
+  );
+}
 
 const CONTEXT_COLORS: Record<ContextStatus, { bar: string; text: string }> = {
   green:   { bar: 'bg-emerald-500', text: 'text-emerald-600 dark:text-emerald-400' },
@@ -14,19 +57,6 @@ const CONTEXT_COLORS: Record<ContextStatus, { bar: string; text: string }> = {
   unknown: { bar: 'bg-muted',       text: 'text-muted-foreground' },
 };
 
-function QuotaBar({ label, value }: { label: string; value: number }) {
-  const pct = Math.round(value * 100);
-  const color = pct >= 85 ? 'bg-red-500' : pct >= 70 ? 'bg-amber-400' : 'bg-emerald-500';
-  return (
-    <div className="flex items-center gap-2 min-w-0">
-      <span className="text-[10px] text-muted-foreground shrink-0">{label}</span>
-      <div className="h-1 flex-1 rounded-full bg-muted overflow-hidden">
-        <div className={`h-full rounded-full ${color}`} style={{ width: `${pct}%` }} />
-      </div>
-      <span className="text-[10px] font-mono text-muted-foreground shrink-0">{pct}%</span>
-    </div>
-  );
-}
 
 function AgentRow({ agent }: { agent: FleetAgentData }) {
   const ctx = CONTEXT_COLORS[agent.contextStatus];
@@ -68,6 +98,7 @@ export function FleetHealth() {
 
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
 
     async function fetchData() {
       try {
@@ -78,13 +109,13 @@ export function FleetHealth() {
       } catch {
         // non-critical
       }
+      if (!cancelled) timer = setTimeout(fetchData, refreshInterval());
     }
 
     fetchData();
-    const interval = setInterval(fetchData, 30_000);
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      clearTimeout(timer);
     };
   }, []);
 
@@ -132,16 +163,40 @@ export function FleetHealth() {
           </div>
         )}
 
-        {/* Quota footer */}
-        <div className="border-t pt-2 space-y-1.5">
-          {data?.usage ? (
-            <>
-              <QuotaBar label="5h quota" value={data.usage.five_hour_utilization} />
-              <QuotaBar label="7d quota" value={data.usage.seven_day_utilization} />
-            </>
+        {/* Token spend section */}
+        <div className="border-t pt-2">
+          <div className="flex items-center gap-2 px-2 mb-2">
+            <IconCoin size={13} className="text-muted-foreground" />
+            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">Today's Spend</span>
+            {data?.tokens && (
+              <span className="ml-auto text-sm font-semibold tabular-nums">
+                {fmtCost(data.tokens.fleetCostToday)}
+              </span>
+            )}
+          </div>
+          {data?.tokens ? (
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead>
+                  <tr className="text-[10px] text-muted-foreground">
+                    <th className="text-left pb-1 font-medium pl-2">Agent</th>
+                    <th className="text-right pb-1 font-medium">Model</th>
+                    <th className="text-right pb-1 font-medium">Cost</th>
+                    <th className="text-right pb-1 font-medium">Tokens</th>
+                    <th className="text-right pb-1 font-medium">Tasks</th>
+                    <th className="text-right pb-1 font-medium pr-2">Tok/Task</th>
+                  </tr>
+                </thead>
+                <tbody className="[&_td]:px-0 [&_td:first-child]:pl-2 [&_td:last-child]:pr-2">
+                  {Object.entries(data.tokens.agents).map(([agent, tokenData]) => (
+                    <TokenRow key={agent} agent={agent} data={tokenData} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
           ) : (
             <p className="text-[10px] text-muted-foreground px-2">
-              Quota unavailable — usage API pending
+              Scanning token data…
             </p>
           )}
         </div>
