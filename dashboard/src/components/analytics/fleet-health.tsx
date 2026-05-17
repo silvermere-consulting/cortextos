@@ -51,7 +51,7 @@ export function FleetHealth({ data }: FleetHealthProps) {
         </CardHeader>
         <CardContent>
           <p className="text-xs text-muted-foreground">
-            No health data available. Run collect-analytics.sh to generate reports.
+            No health data available. Run <code>cortextos bus collect-metrics</code> to generate reports.
           </p>
         </CardContent>
       </Card>

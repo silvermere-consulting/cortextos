@@ -62,7 +62,7 @@ export default async function AnalyticsPage({
       {/* Live Fleet Health — agent status, context fill bars, Today's Spend */}
       <FleetHealth />
 
-      {/* Fleet Stability — historical stability scores from collect-analytics */}
+      {/* Fleet Stability — historical stability scores from collect-metrics */}
       <FleetStability data={fleetHealth} />
 
       {/* Task Throughput */}
