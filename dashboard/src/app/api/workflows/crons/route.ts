@@ -160,12 +160,37 @@ function computeNextFire(
   }
 
   // Try as a 5-field cron expression
-  const nextMs = nextFireFromCronExpr(schedule, now);
+  const tz = process.env.CTX_TIMEZONE;
+  const nextMs = nextFireFromCronExpr(schedule, now, tz);
   if (!isNaN(nextMs)) {
     return new Date(nextMs).toISOString();
   }
 
   return 'unknown';
+}
+
+/**
+ * Extract calendar fields in the given timezone (or process-local if omitted).
+ * Mirrors getTzParts() in src/daemon/cron-scheduler.ts.
+ */
+function getTzParts(ms: number, timezone: string | undefined) {
+  if (!timezone) {
+    const d = new Date(ms);
+    return { m: d.getMinutes(), h: d.getHours(), dy: d.getDate(), mo: d.getMonth() + 1, dw: d.getDay() };
+  }
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric', month: 'numeric', day: 'numeric',
+    hour: 'numeric', minute: 'numeric', hour12: false,
+  }).formatToParts(new Date(ms));
+  const get = (type: string): number => parseInt(parts.find(p => p.type === type)?.value ?? '0', 10);
+  const year = get('year');
+  const mo   = get('month');
+  const dy   = get('day');
+  const h    = get('hour') % 24;
+  const m    = get('minute');
+  const dw   = new Date(Date.UTC(year, mo - 1, dy)).getUTCDay();
+  return { m, h, dy, mo, dw };
 }
 
 /**
@@ -175,7 +200,7 @@ function computeNextFire(
  *
  * Fields: minute hour dom month dow
  */
-function nextFireFromCronExpr(expr: string, fromMs: number): number {
+function nextFireFromCronExpr(expr: string, fromMs: number, timezone?: string): number {
   const parts = expr.trim().split(/\s+/);
   if (parts.length !== 5) return NaN;
 
@@ -219,13 +244,13 @@ function nextFireFromCronExpr(expr: string, fromMs: number): number {
   let candidate = startMs;
 
   for (let i = 0; i < MAX_MINUTES; i++) {
-    const d = new Date(candidate);
+    const { m, h, dy, mo, dw } = getTzParts(candidate, timezone);
     if (
-      months.includes(d.getMonth() + 1) &&
-      doms.includes(d.getDate()) &&
-      dows.includes(d.getDay()) &&
-      hours.includes(d.getHours()) &&
-      minutes.includes(d.getMinutes())
+      months.includes(mo) &&
+      doms.includes(dy) &&
+      dows.includes(dw) &&
+      hours.includes(h) &&
+      minutes.includes(m)
     ) {
       return candidate;
     }
