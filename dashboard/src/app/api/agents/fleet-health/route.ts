@@ -420,8 +420,11 @@ export async function GET() {
     readAndUpdateTokenMetrics().catch(() => null),
   ]);
 
-  // Union of all known agents
-  const allAgents = new Set([...heartbeats.keys(), ...contextMetrics.keys()]);
+  // Union of all known agents — exclude the cortextos watchdog process itself
+  const EXCLUDED_AGENTS = new Set(['cortextos']);
+  const allAgents = new Set(
+    [...heartbeats.keys(), ...contextMetrics.keys()].filter(n => !EXCLUDED_AGENTS.has(n))
+  );
 
   const agents: FleetAgentData[] = [];
   let healthy = 0, stale = 0, down = 0;
