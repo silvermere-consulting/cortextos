@@ -108,6 +108,13 @@ export class OutputBuffer {
       if (cleaned.includes('trust') && !cleaned.includes('> ')) {
         return false;
       }
+      // Exclude bypass-permissions warning false positives.
+      // --dangerously-skip-permissions shows "No, exit" / "Yes, I accept" before
+      // the real status bar. If the fast-checker bootstraps here, it injects
+      // Telegram messages into the menu which crashes the agent (exit code 1).
+      if (cleaned.includes('No,exit') || cleaned.includes('No, exit')) {
+        return false;
+      }
     }
 
     return cleaned.includes(this.bootstrapPattern);

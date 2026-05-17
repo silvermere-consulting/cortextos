@@ -102,19 +102,33 @@ export default function LoginPage() {
     body.set('password', passwordInput?.value || '');
 
     try {
+      // Use redirect:'manual' so the browser never tries to follow a redirect
+      // to http://localhost:3000 — which fails when the dashboard is accessed
+      // from another machine. We read the Location header ourselves and navigate
+      // to a relative path so the browser stays on the correct host.
       const res = await fetch(form.action, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: body.toString(),
         credentials: 'same-origin',
-        redirect: 'follow',
+        redirect: 'manual',
       });
-      if (res.redirected) {
-        const target = new URL(res.url);
-        if (target.pathname.startsWith('/login')) {
-          const code = target.searchParams.get('error') || 'Unknown';
-          // CallbackRouteError usually means the rate limiter blocked the request.
-          // Show a human-readable message instead of the raw error code.
+
+      // NextAuth returns 302/303 on both success and failure.
+      if (res.status === 302 || res.status === 303 || res.type === 'opaqueredirect') {
+        const location = res.headers.get('Location') || '/';
+        // Extract only the path+search from the Location header so we never
+        // redirect the browser to localhost or a different host.
+        let target = '/';
+        try {
+          const parsed = new URL(location, window.location.origin);
+          target = parsed.pathname + parsed.search;
+        } catch {
+          if (location.startsWith('/')) target = location;
+        }
+        if (target.startsWith('/login')) {
+          const params = new URLSearchParams(target.split('?')[1] || '');
+          const code = params.get('error') || 'Unknown';
           const msg = code === 'CallbackRouteError'
             ? 'Too many attempts. Please wait a few minutes and try again.'
             : `Sign-in failed: ${code}`;
@@ -122,14 +136,8 @@ export default function LoginPage() {
           setLoading(false);
           return;
         }
-        // Navigate to the original destination the user tried to reach, or /
-        // if none was recorded. Use window.location.origin to build a safe
-        // relative-only target — res.url can be http://localhost:3000/ behind
-        // a reverse proxy (when AUTH_URL is not set), which would send the
-        // browser to the wrong host.
         const callbackParam = new URL(window.location.href).searchParams.get('callbackUrl');
-        // Validate same-origin: must start with / but not // (which is a protocol-relative URL)
-        const safeTarget = callbackParam && callbackParam.startsWith('/') && !callbackParam.startsWith('//') ? callbackParam : '/';
+        const safeTarget = callbackParam && callbackParam.startsWith('/') && !callbackParam.startsWith('//') ? callbackParam : target;
         window.location.href = safeTarget;
         return;
       }

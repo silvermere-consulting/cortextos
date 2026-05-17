@@ -153,9 +153,26 @@ export class AgentPTY {
 
     this._alive = true;
 
+    // Track whether we've already accepted the bypass-permissions prompt so we
+    // don't send the key sequence multiple times.
+    let bypassAccepted = false;
+
     // Set up output capture
     this.pty.onData((data: string) => {
       this.outputBuffer.push(data);
+
+      // Auto-accept the "Bypass Permissions mode" warning immediately when it appears.
+      // The prompt defaults to option 1 "No, exit" — we must press Down then Enter
+      // to reach option 2 "Yes, I accept". Using onData (not setTimeout) because
+      // the agent exits in under 2s if nothing responds.
+      if (!bypassAccepted && this.pty) {
+        const cleaned = data.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+        if (cleaned.includes('No,exit') || cleaned.includes('No, exit')) {
+          bypassAccepted = true;
+          // Small delay so the PTY finishes rendering before we send input
+          setTimeout(() => { this.pty?.write('\x1b[B\r'); }, 100);
+        }
+      }
     });
 
     // Set up exit handler
@@ -170,22 +187,25 @@ export class AgentPTY {
     // Claude Code shows a "trust this folder?" prompt on first run in a new directory.
     // Auto-accept by sending Enter after the prompt appears.
     // The prompt takes ~3-5s to render; we send Enter at 5s and 8s for reliability.
-    setTimeout(() => {
-      if (this.pty) {
-        const recent = this.outputBuffer.getRecent();
-        if (recent.includes('trust') || recent.includes('Yes')) {
-          this.pty.write('\r');
-        }
+    //
+    // Claude Code also shows a "Bypass Permissions mode" warning on first run with
+    // --dangerously-skip-permissions. That prompt defaults to option 1 "No, exit",
+    // so we must press Down (\x1b[B) to reach option 2 "Yes, I accept" before Enter.
+    const acceptPrompt = () => {
+      if (!this.pty) return;
+      const recent = this.outputBuffer.getRecent();
+      const cleaned = recent.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+      if (cleaned.includes('No,exit') || cleaned.includes('No, exit')) {
+        // Bypass permissions prompt: "No, exit" is option 1 (default highlight).
+        // Press Down to move to "Yes, I accept", then Enter to confirm.
+        this.pty.write('\x1b[B\r');
+      } else if (cleaned.includes('trust') || cleaned.includes('Yes')) {
+        this.pty.write('\r');
       }
-    }, 5000);
-    setTimeout(() => {
-      if (this.pty) {
-        const recent = this.outputBuffer.getRecent();
-        if (recent.includes('trust') || recent.includes('Yes')) {
-          this.pty.write('\r');
-        }
-      }
-    }, 8000);
+    };
+    setTimeout(acceptPrompt, 2000);
+    setTimeout(acceptPrompt, 5000);
+    setTimeout(acceptPrompt, 8000);
   }
 
   /**
