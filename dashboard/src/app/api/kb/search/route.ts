@@ -48,7 +48,7 @@ export async function GET(request: NextRequest) {
 
   const scope = searchParams.get('scope') || 'all';
   const limit = parseInt(searchParams.get('limit') || '10', 10);
-  const threshold = parseFloat(searchParams.get('threshold') || '0.5');
+  const threshold = parseFloat(searchParams.get('threshold') || '0.3');
 
   if (!q || q.trim().length === 0) {
     return Response.json({ error: 'q parameter required' }, { status: 400 });

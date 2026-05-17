@@ -12,6 +12,7 @@ import {
   IconAlertCircle,
   IconLoader2,
   IconChevronDown,
+  IconChevronLeft,
 } from '@tabler/icons-react';
 import { KnowledgeBaseView } from './kb-view';
 import { KbDocViewer } from './kb-doc-viewer';
@@ -28,6 +29,13 @@ interface SearchResult {
 interface Collection {
   name: string;
   count: number;
+}
+
+interface KbDocument {
+  source: string;
+  filename: string;
+  type: string;
+  chunks: number;
 }
 
 interface KnowledgeBaseClientProps {
@@ -60,6 +68,9 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
   const [collectionsLoading, setCollectionsLoading] = useState(true);
   const [totalDocs, setTotalDocs] = useState(0);
   const [openDocPath, setOpenDocPath] = useState<string | null>(null);
+  const [browseCollection, setBrowseCollection] = useState<string | null>(null);
+  const [browseDocuments, setBrowseDocuments] = useState<KbDocument[] | null>(null);
+  const [browseLoading, setBrowseLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -108,6 +119,25 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
       setResults([]);
     } finally {
       setSearching(false);
+    }
+  };
+
+  const openCollection = async (colName: string) => {
+    setBrowseCollection(colName);
+    setBrowseDocuments(null);
+    setBrowseLoading(true);
+    try {
+      const res = await fetch(`/api/kb/documents?org=${encodeURIComponent(org)}&collection=${encodeURIComponent(colName)}`);
+      if (res.ok) {
+        const data = await res.json() as { documents: KbDocument[] };
+        setBrowseDocuments(data.documents || []);
+      } else {
+        setBrowseDocuments([]);
+      }
+    } catch {
+      setBrowseDocuments([]);
+    } finally {
+      setBrowseLoading(false);
     }
   };
 
@@ -328,7 +358,64 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
 
       {/* Collections Tab */}
       <TabsContent value="collections" className="mt-3">
-        {collectionsLoading ? (
+        {/* Collection drill-down: document list */}
+        {browseCollection !== null ? (
+          <div className="space-y-2">
+            <button
+              onClick={() => { setBrowseCollection(null); setBrowseDocuments(null); }}
+              className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors mb-1"
+            >
+              <IconChevronLeft size={13} />
+              All collections
+            </button>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <IconDatabase size={14} className="text-muted-foreground" />
+                <span className="text-sm font-medium">{collectionLabel(browseCollection)}</span>
+              </div>
+              {browseDocuments && (
+                <span className="text-[11px] text-muted-foreground">{browseDocuments.length} file{browseDocuments.length !== 1 ? 's' : ''}</span>
+              )}
+            </div>
+            {browseLoading ? (
+              <div className="space-y-1.5">
+                {[1, 2, 3, 4].map((i) => (
+                  <div key={i} className="h-10 rounded-md bg-muted/30 animate-pulse" />
+                ))}
+              </div>
+            ) : browseDocuments && browseDocuments.length > 0 ? (
+              <div className="space-y-1">
+                {browseDocuments.map((doc) => (
+                  <Card
+                    key={doc.source}
+                    className="hover:bg-muted/30 transition-colors cursor-pointer"
+                    onClick={() => setOpenDocPath(doc.source)}
+                  >
+                    <CardContent className="py-2.5 flex items-center gap-2.5">
+                      <IconFileText size={14} className="text-muted-foreground shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium truncate">{doc.filename || doc.source.split('/').pop()}</p>
+                        <p className="text-[10px] text-muted-foreground truncate font-mono">
+                          {doc.source.length > 60 ? '…' + doc.source.slice(-57) : doc.source}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <Badge variant="outline" className="text-[10px]">{doc.chunks} chunk{doc.chunks !== 1 ? 's' : ''}</Badge>
+                        <span className="text-[10px] text-primary/70">View →</span>
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            ) : (
+              <Card className="border-dashed">
+                <CardContent className="py-6 text-center text-xs text-muted-foreground">
+                  No documents found in this collection.
+                </CardContent>
+              </Card>
+            )}
+          </div>
+        ) : collectionsLoading ? (
           <div className="space-y-2">
             {[1, 2, 3].map((i) => (
               <div key={i} className="h-12 rounded-lg bg-muted/30 animate-pulse" />
@@ -340,12 +427,7 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
               <Card
                 key={col.name}
                 className="hover:bg-muted/20 transition-colors cursor-pointer"
-                onClick={() => {
-                  setSelectedCollection(col.name);
-                  // Switch to search tab by dispatching a click on the tab trigger
-                  document.querySelector<HTMLElement>('[data-slot="tabs-trigger"][value="search"]')?.click();
-                  inputRef.current?.focus();
-                }}
+                onClick={() => openCollection(col.name)}
               >
                 <CardContent className="py-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -357,7 +439,7 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
                   </div>
                   <div className="flex items-center gap-2">
                     <Badge variant="secondary">{col.count} docs</Badge>
-                    <span className="text-[10px] text-muted-foreground">Search →</span>
+                    <span className="text-[10px] text-muted-foreground">Browse →</span>
                   </div>
                 </CardContent>
               </Card>
