@@ -12,7 +12,8 @@ import { TaskThroughput } from '@/components/analytics/task-throughput';
 import { AgentEffectiveness } from '@/components/analytics/agent-effectiveness';
 import { CostTracking } from '@/components/analytics/cost-tracking';
 import { GoalProgress } from '@/components/analytics/goal-progress';
-import { FleetHealth } from '@/components/analytics/fleet-health';
+import { FleetHealth as FleetStability } from '@/components/analytics/fleet-health';
+import { FleetHealth } from '@/components/overview/fleet-health';
 import { getFleetHealth, getLatestSnapshot, getPlanUsage, getUsageHistory } from '@/lib/data/reports';
 
 export default async function AnalyticsPage({
@@ -58,8 +59,11 @@ export default async function AnalyticsPage({
         </p>
       </div>
 
-      {/* Fleet Health */}
-      <FleetHealth data={fleetHealth} />
+      {/* Live Fleet Health — agent status, context fill bars, Today's Spend */}
+      <FleetHealth />
+
+      {/* Fleet Stability — historical stability scores from collect-analytics */}
+      <FleetStability data={fleetHealth} />
 
       {/* Task Throughput */}
       <TaskThroughput data={taskData} />

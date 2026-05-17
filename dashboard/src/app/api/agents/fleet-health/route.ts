@@ -221,7 +221,36 @@ const MODEL_PRICES: Record<string, { input: number; output: number; cacheWrite1h
   'claude-haiku-4-5':  { input: 1.00, output:  5.00, cacheWrite1h:  2.00, cacheWrite5m: 1.25, cacheRead: 0.10 },
 };
 const MTOK = 1_000_000;
-const KNOWN_AGENTS = ['chief', 'analyst', 'research', 'business-analyst'];
+// Discover agents dynamically from project session dirs; falls back to a baseline list
+async function discoverKnownAgents(): Promise<string[]> {
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
+  const stateDir = path.join(os.homedir(), '.cortextos', 'default', 'state');
+  const agents = new Set<string>();
+
+  // From JSONL session dirs: -home-cortext-cortextos-orgs-<org>-agents-<name>
+  try {
+    const entries = await fs.readdir(projectsDir);
+    for (const e of entries) {
+      const m = e.match(/-agents-([a-z0-9_-]+)$/);
+      if (m) agents.add(m[1]);
+    }
+  } catch { /* ignore */ }
+
+  // From heartbeat state dirs
+  try {
+    const entries = await fs.readdir(stateDir);
+    for (const name of entries) {
+      const hbPath = path.join(stateDir, name, 'heartbeat.json');
+      try {
+        await fs.access(hbPath);
+        agents.add(name);
+      } catch { /* skip */ }
+    }
+  } catch { /* ignore */ }
+
+  const EXCLUDED = new Set(['usage', 'oauth', 'analytics', 'cortextos']);
+  return [...agents].filter(a => !EXCLUDED.has(a));
+}
 
 const CTX_ROOT = path.join(os.homedir(), '.cortextos', 'default');
 const CURSOR_PATH = path.join(CTX_ROOT, 'analytics', 'token-cursor.json');
@@ -356,15 +385,16 @@ async function countTasksToday(agentName: string, today: string): Promise<number
 async function readAndUpdateTokenMetrics(): Promise<FleetTokenSummary> {
   const today = todayUTC();
 
-  const [cursorStore, totalsStore] = await Promise.all([
+  const [cursorStore, totalsStore, knownAgents] = await Promise.all([
     readOrInit<CursorStore>(CURSOR_PATH, { date: today, cursors: {} }, today),
     readOrInit<TotalsStore>(TOTALS_PATH, { date: today, agents: {}, updatedAt: '' }, today),
+    discoverKnownAgents(),
   ]);
 
   const newCursors: CursorStore = { date: today, cursors: { ...cursorStore.cursors } };
   const newTotals: TotalsStore  = { date: today, agents: { ...totalsStore.agents }, updatedAt: new Date().toISOString() };
 
-  await Promise.all(KNOWN_AGENTS.map(async (agent) => {
+  await Promise.all(knownAgents.map(async (agent) => {
     const [scanResult, tasksToday] = await Promise.all([
       scanAgentTokens(agent, cursorStore.cursors[agent], totalsStore.agents[agent], today),
       countTasksToday(agent, today),
@@ -394,20 +424,28 @@ interface UsageLatest {
 
 async function readUsageData(): Promise<UsageData | null> {
   const ctxRoot = path.join(os.homedir(), '.cortextos', 'default');
-  const latestPath = path.join(ctxRoot, 'state', 'usage', 'latest.json');
-  try {
-    const raw = await fs.readFile(latestPath, 'utf-8');
-    const data = JSON.parse(raw) as UsageLatest;
-    const age = Date.now() - new Date(data.fetched_at).getTime();
-    if (age > USAGE_STALE_MS) return null;
-    return {
-      five_hour_utilization: data.five_hour_utilization,
-      seven_day_utilization: data.seven_day_utilization,
-      fetched_at: data.fetched_at,
-    };
-  } catch {
-    return null;
+  // Prefer api-latest.json (written by check-usage-api); fall back to latest.json
+  const candidates = [
+    path.join(ctxRoot, 'state', 'usage', 'api-latest.json'),
+    path.join(ctxRoot, 'state', 'usage', 'latest.json'),
+  ];
+  for (const latestPath of candidates) {
+    try {
+      const raw = await fs.readFile(latestPath, 'utf-8');
+      const data = JSON.parse(raw) as UsageLatest;
+      if (!data.five_hour_utilization && !data.seven_day_utilization) continue;
+      const age = Date.now() - new Date(data.fetched_at).getTime();
+      if (age > USAGE_STALE_MS) continue;
+      return {
+        five_hour_utilization: data.five_hour_utilization,
+        seven_day_utilization: data.seven_day_utilization,
+        fetched_at: data.fetched_at,
+      };
+    } catch {
+      // try next candidate
+    }
   }
+  return null;
 }
 
 // --- Route handler ---

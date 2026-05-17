@@ -108,6 +108,10 @@ function usageDailyPath(ctxRoot: string): string {
   return join(usageDir(ctxRoot), `${today}.jsonl`);
 }
 
+function usageApiLatestPath(ctxRoot: string): string {
+  return join(usageDir(ctxRoot), 'api-latest.json');
+}
+
 // --- Account store helpers ---
 
 export function loadAccounts(ctxRoot: string): AccountsStore | null {
@@ -155,7 +159,27 @@ function saveCache(ctxRoot: string, snapshot: UsageSnapshot): void {
     expires_at: Date.now() + CACHE_TTL_MS,
   };
   atomicWriteSync(usageCachePath(ctxRoot), JSON.stringify(cache, null, 2));
-  atomicWriteSync(usageLatestPath(ctxRoot), JSON.stringify(snapshot, null, 2));
+
+  // api-latest.json: raw UsageSnapshot for fleet-health route
+  atomicWriteSync(usageApiLatestPath(ctxRoot), JSON.stringify(snapshot, null, 2));
+
+  // latest.json: PlanUsage-compatible format for the dashboard cost-tracking widget
+  const planUsage = {
+    agent: snapshot.account,
+    timestamp: snapshot.fetched_at,
+    session: {
+      used_pct: Math.round(snapshot.five_hour_utilization * 100),
+      resets: '',
+    },
+    week_all_models: {
+      used_pct: Math.round(snapshot.seven_day_utilization * 100),
+      resets: '',
+    },
+    week_sonnet: {
+      used_pct: Math.round(snapshot.seven_day_utilization * 100),
+    },
+  };
+  atomicWriteSync(usageLatestPath(ctxRoot), JSON.stringify(planUsage, null, 2));
 
   // Append to daily JSONL log
   const { appendFileSync } = require('fs');
@@ -205,12 +229,34 @@ export async function checkUsageApi(
     }
   }
 
-  const response = await fetch('https://api.anthropic.com/api/oauth/usage', {
+  let response = await fetch('https://api.anthropic.com/api/oauth/usage', {
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'anthropic-beta': 'oauth-2025-04-20',
     },
   });
+
+  // Auto-heal: on 401, try syncing from Claude Code credentials and retry once
+  if (response.status === 401 && !opts.account) {
+    try {
+      const synced = await syncOAuthFromCredentials(ctxRoot);
+      if (synced) {
+        const healed = getActiveAccount(ctxRoot);
+        if (healed) {
+          accessToken = healed.account.access_token;
+          accountName = healed.name;
+          response = await fetch('https://api.anthropic.com/api/oauth/usage', {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'anthropic-beta': 'oauth-2025-04-20',
+            },
+          });
+        }
+      }
+    } catch {
+      // sync failed — fall through to original error
+    }
+  }
 
   if (!response.ok) {
     throw new Error(`Usage API returned ${response.status}: ${await response.text()}`);
@@ -469,4 +515,66 @@ function writeTokenToAgents(
       try { chmodSync(envPath, 0o600); } catch { /* ignore */ }
     } catch { /* skip agents whose .env we can't write */ }
   }
+}
+
+// --- sync-oauth-from-credentials ---
+
+/**
+ * Sync accounts.json access/refresh tokens from Claude Code's local credentials file.
+ * Claude Code stores tokens at ~/.claude/.credentials.json. When the user re-authenticates
+ * (e.g. after a plan change), the credentials file is updated but accounts.json is not.
+ * This function bridges that gap.
+ *
+ * Returns true if accounts.json was updated, false if no credentials file found.
+ */
+export async function syncOAuthFromCredentials(ctxRoot: string): Promise<boolean> {
+  const { homedir } = await import('os');
+  const credsPath = join(homedir(), '.claude', '.credentials.json');
+
+  if (!existsSync(credsPath)) return false;
+
+  let creds: { claudeAiOauth?: { accessToken?: string; refreshToken?: string; expiresAt?: number } };
+  try {
+    creds = JSON.parse(readFileSync(credsPath, 'utf-8'));
+  } catch {
+    return false;
+  }
+
+  const oauth = creds.claudeAiOauth;
+  if (!oauth?.accessToken) return false;
+
+  const store = loadAccounts(ctxRoot);
+  if (!store) {
+    // Bootstrap a minimal accounts.json from scratch
+    const newStore: AccountsStore = {
+      active: 'primary',
+      accounts: {
+        primary: {
+          label: 'primary',
+          access_token: oauth.accessToken,
+          refresh_token: oauth.refreshToken ?? '',
+          expires_at: oauth.expiresAt ?? (Date.now() + 3600 * 1000),
+          last_refreshed: new Date().toISOString(),
+          five_hour_utilization: 0,
+          seven_day_utilization: 0,
+        },
+      },
+      rotation_log: [],
+    };
+    ensureDir(oauthDir(ctxRoot));
+    atomicWriteSync(join(oauthDir(ctxRoot), 'accounts.json'), JSON.stringify(newStore, null, 2));
+    try { chmodSync(join(oauthDir(ctxRoot), 'accounts.json'), 0o600); } catch { /* ignore */ }
+    return true;
+  }
+
+  const name = store.active;
+  if (!store.accounts[name]) return false;
+
+  store.accounts[name].access_token = oauth.accessToken;
+  if (oauth.refreshToken) store.accounts[name].refresh_token = oauth.refreshToken;
+  if (oauth.expiresAt) store.accounts[name].expires_at = oauth.expiresAt;
+  store.accounts[name].last_refreshed = new Date().toISOString();
+
+  saveAccounts(ctxRoot, store);
+  return true;
 }

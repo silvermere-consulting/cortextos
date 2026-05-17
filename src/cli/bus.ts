@@ -18,7 +18,7 @@ import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-stat
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
-import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
+import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, syncOAuthFromCredentials, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
@@ -2520,6 +2520,26 @@ busCommand
       const warn7d = acct.seven_day_utilization >= ALERT_7D ? ' ⚠️' : '';
       console.log(`${name}${active}`);
       console.log(`  5h: ${pct(acct.five_hour_utilization)}${warn5h}  7d: ${pct(acct.seven_day_utilization)}${warn7d}  expires: ${expiry}`);
+    }
+  });
+
+busCommand
+  .command('sync-oauth-from-credentials')
+  .description('Sync accounts.json tokens from ~/.claude/.credentials.json (use after re-authenticating Claude Code)')
+  .action(async () => {
+    const env = resolveEnv();
+    const synced = await syncOAuthFromCredentials(env.ctxRoot);
+    if (synced) {
+      const store = loadAccounts(env.ctxRoot);
+      const name = store?.active ?? 'primary';
+      const expires = store?.accounts[name]?.expires_at
+        ? new Date(store.accounts[name].expires_at).toISOString()
+        : 'unknown';
+      console.log(`Synced account '${name}' from ~/.claude/.credentials.json`);
+      console.log(`Token expires: ${expires}`);
+    } else {
+      console.error('No credentials found at ~/.claude/.credentials.json');
+      process.exit(1);
     }
   });
 

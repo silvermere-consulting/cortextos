@@ -13,7 +13,6 @@ import { TodaysProgress } from '@/components/overview/todays-progress';
 import { LiveActivity } from '@/components/overview/live-activity';
 import { MetricCards } from '@/components/overview/metric-cards';
 import { AgentStatusGrid } from '@/components/overview/agent-status-grid';
-import { FleetHealth } from '@/components/overview/fleet-health';
 
 export const dynamic = 'force-dynamic';
 
@@ -134,8 +133,6 @@ export default async function OverviewPage({
         </div>
       </div>
 
-      {/* Fleet Health — unified agent health + context + quota */}
-      <FleetHealth />
     </div>
   );
 }
