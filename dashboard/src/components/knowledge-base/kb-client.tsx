@@ -14,6 +14,7 @@ import {
   IconChevronDown,
 } from '@tabler/icons-react';
 import { KnowledgeBaseView } from './kb-view';
+import { KbDocViewer } from './kb-doc-viewer';
 
 interface SearchResult {
   content: string;
@@ -58,6 +59,7 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
   const [collections, setCollections] = useState<Collection[]>([]);
   const [collectionsLoading, setCollectionsLoading] = useState(true);
   const [totalDocs, setTotalDocs] = useState(0);
+  const [openDocPath, setOpenDocPath] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -134,6 +136,7 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
   };
 
   return (
+    <>
     <Tabs defaultValue="search">
       <TabsList variant="line">
         <TabsTrigger value="search">
@@ -260,32 +263,41 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
                 </CardContent>
               </Card>
             )}
-            {results.map((result, i) => (
-              <Card key={i} className="hover:bg-muted/20 transition-colors">
-                <CardContent className="py-3 space-y-2">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <Badge variant="secondary" className="text-[10px]">
-                      {collectionLabel(result.collection)}
-                    </Badge>
-                    {result.doc_type && result.doc_type !== 'text' && (
-                      <Badge variant="outline" className="text-[10px]">
-                        {result.doc_type}
+            {results.map((result, i) => {
+              const srcPath = result.source_file || result.filename || '';
+              const canOpen = !!srcPath;
+              return (
+                <Card
+                  key={i}
+                  className={`transition-colors ${canOpen ? 'hover:bg-muted/30 cursor-pointer' : 'hover:bg-muted/20'}`}
+                  onClick={canOpen ? () => setOpenDocPath(srcPath) : undefined}
+                >
+                  <CardContent className="py-3 space-y-2">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <Badge variant="secondary" className="text-[10px]">
+                        {collectionLabel(result.collection)}
                       </Badge>
+                      {result.doc_type && result.doc_type !== 'text' && (
+                        <Badge variant="outline" className="text-[10px]">
+                          {result.doc_type}
+                        </Badge>
+                      )}
+                      <span className="text-[10px] text-muted-foreground ml-auto tabular-nums">
+                        {(result.score * 100).toFixed(0)}% match
+                      </span>
+                    </div>
+                    <p className="text-sm leading-relaxed line-clamp-4">{result.content}</p>
+                    {srcPath && (
+                      <p className="text-[11px] text-muted-foreground flex items-center gap-1">
+                        <IconFileText size={11} />
+                        {shortPath(srcPath)}
+                        {canOpen && <span className="ml-auto text-[10px] text-primary/70">View →</span>}
+                      </p>
                     )}
-                    <span className="text-[10px] text-muted-foreground ml-auto tabular-nums">
-                      {(result.score * 100).toFixed(0)}% match
-                    </span>
-                  </div>
-                  <p className="text-sm leading-relaxed line-clamp-4">{result.content}</p>
-                  {(result.filename || result.source_file) && (
-                    <p className="text-[11px] text-muted-foreground flex items-center gap-1">
-                      <IconFileText size={11} />
-                      {shortPath(result.filename || result.source_file)}
-                    </p>
-                  )}
-                </CardContent>
-              </Card>
-            ))}
+                  </CardContent>
+                </Card>
+              );
+            })}
           </div>
         )}
 
@@ -372,5 +384,14 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
         )}
       </TabsContent>
     </Tabs>
+
+    {openDocPath && (
+      <KbDocViewer
+        filePath={openDocPath}
+        org={org}
+        onClose={() => setOpenDocPath(null)}
+      />
+    )}
+    </>
   );
 }
