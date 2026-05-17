@@ -13,6 +13,11 @@ import { PriorityBadge, StatusBadge, OrgBadge, TimeAgo } from '@/components/shar
 import { IconArrowsSort, IconSortAscending, IconSortDescending } from '@tabler/icons-react';
 import type { Task } from '@/lib/types';
 
+const REQUESTOR_NAMES: Record<string, string> = {
+  '8704100535': 'Steven',
+  '8465948173': 'Jen',
+};
+
 type SortField = 'title' | 'status' | 'priority' | 'assignee' | 'org' | 'created_at';
 type SortDir = 'asc' | 'desc';
 
@@ -84,6 +89,7 @@ export function TaskListTable({ tasks, onTaskClick }: TaskListTableProps) {
     { field: 'org', label: 'Org' },
     { field: 'created_at', label: 'Created' },
   ];
+  const hasRequestor = sorted.some((t) => t.requestor);
 
   return (
     <Table>
@@ -101,12 +107,13 @@ export function TaskListTable({ tasks, onTaskClick }: TaskListTableProps) {
               </span>
             </TableHead>
           ))}
+          {hasRequestor && <TableHead>Requestor</TableHead>}
         </TableRow>
       </TableHeader>
       <TableBody>
         {sorted.length === 0 ? (
           <TableRow>
-            <TableCell colSpan={6} className="text-center text-muted-foreground py-8">
+            <TableCell colSpan={hasRequestor ? 7 : 6} className="text-center text-muted-foreground py-8">
               No tasks found
             </TableCell>
           </TableRow>
@@ -135,6 +142,11 @@ export function TaskListTable({ tasks, onTaskClick }: TaskListTableProps) {
               <TableCell>
                 <TimeAgo date={task.created_at} />
               </TableCell>
+              {hasRequestor && (
+                <TableCell className="text-muted-foreground">
+                  {task.requestor ? (REQUESTOR_NAMES[task.requestor] ?? task.requestor) : '-'}
+                </TableCell>
+              )}
             </TableRow>
           ))
         )}

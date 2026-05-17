@@ -43,6 +43,10 @@ function createDatabase(): Database.Database {
   // Run schema initialization
   initializeSchema(db);
 
+  // Additive migrations: ALTER TABLE ADD COLUMN is a no-op if the column exists
+  // (SQLite errors on duplicate columns, so we catch and ignore).
+  try { db.exec(`ALTER TABLE tasks ADD COLUMN requestor TEXT`); } catch { /* column already exists */ }
+
   return db;
 }
 
@@ -62,7 +66,8 @@ function initializeSchema(db: Database.Database): void {
       updated_at TEXT,
       completed_at TEXT,
       notes TEXT,
-      source_file TEXT
+      source_file TEXT,
+      requestor TEXT
     );
 
     CREATE TABLE IF NOT EXISTS approvals (

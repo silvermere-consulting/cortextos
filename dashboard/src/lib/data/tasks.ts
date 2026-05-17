@@ -191,5 +191,6 @@ function rowToTask(row: Record<string, unknown>): Task {
     completed_at: (row.completed_at as string) ?? undefined,
     notes: (row.notes as string) ?? undefined,
     source_file: (row.source_file as string) ?? undefined,
+    requestor: (row.requestor as string) ?? undefined,
   };
 }

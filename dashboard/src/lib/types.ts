@@ -72,6 +72,7 @@ export interface Task {
   notes?: string;
   source_file?: string;
   outputs?: TaskOutput[];
+  requestor?: string;
 }
 
 // -- Approval Types --

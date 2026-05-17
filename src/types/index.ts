@@ -68,6 +68,7 @@ export interface Task {
    */
   blocks?: string[];
   blocked_by?: string[];
+  requestor?: string;
 }
 
 // Event Types

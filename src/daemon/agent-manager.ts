@@ -207,17 +207,29 @@ export class AgentManager {
     const agentEnvFile = join(agentDir, '.env');
     let telegramApi: TelegramAPI | undefined;
     let chatId: string | undefined;
-    let allowedUserId: string | undefined;
+    let allowedUserIds: Set<number> = new Set();
     let botToken: string | undefined;
 
     if (existsSync(agentEnvFile)) {
       const envContent = readFileSync(agentEnvFile, 'utf-8');
       const botTokenMatch = envContent.match(/^BOT_TOKEN=(.+)$/m);
       const chatIdMatch = envContent.match(/^CHAT_ID=(.+)$/m);
-      const allowedUserMatch = envContent.match(/^ALLOWED_USER=(.+)$/m);
+      // ALLOWED_USERS (plural, comma-separated) takes precedence; ALLOWED_USER (singular) is backward-compat.
+      const allowedUsersMatch = envContent.match(/^ALLOWED_USERS=(.+)$/m);
+      const allowedUserMatch  = envContent.match(/^ALLOWED_USER=(.+)$/m);
       botToken = botTokenMatch?.[1]?.trim();
       chatId = chatIdMatch?.[1]?.trim();
-      allowedUserId = allowedUserMatch?.[1]?.trim() || undefined;
+
+      const rawAllowed = (allowedUsersMatch?.[1] ?? allowedUserMatch?.[1] ?? '').trim();
+      for (const part of rawAllowed.split(',')) {
+        const id = part.trim();
+        if (!id) continue;
+        if (!/^\d+$/.test(id)) {
+          log(`SECURITY: ALLOWED_USER(S) contains non-numeric value "${id}". Telegram user IDs must be numbers. Skipping.`);
+          continue;
+        }
+        allowedUserIds.add(parseInt(id, 10));
+      }
 
       // Validate BOT_TOKEN format: must be numeric_id:alphanumeric_secret
       if (botToken && !/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
@@ -225,25 +237,15 @@ export class AgentManager {
         botToken = undefined;
       }
 
-      // ALLOWED_USER must be a numeric Telegram user ID, not a username
-      if (allowedUserId && !/^\d+$/.test(allowedUserId)) {
-        log(`SECURITY: ALLOWED_USER is not a numeric ID. Telegram user IDs are numbers (e.g. 123456789). Refusing to enable Telegram. Fix the .env file.`);
-        allowedUserId = undefined;
-      }
-
-      // Security: ALLOWED_USER is REQUIRED when BOT_TOKEN is set. Without it,
-      // ANY Telegram user who finds the bot @handle could control the agent.
-      // Fail closed: refuse to start Telegram unless the operator explicitly
-      // whitelists their numeric user ID.
-      if (botToken && !allowedUserId) {
-        log(`SECURITY: BOT_TOKEN is set but ALLOWED_USER is missing. Refusing to enable Telegram. Set ALLOWED_USER to your numeric Telegram user ID in .env, or remove BOT_TOKEN to start the agent without Telegram.`);
+      // Security: at least one allowed user ID is REQUIRED when BOT_TOKEN is set.
+      if (botToken && allowedUserIds.size === 0) {
+        log(`SECURITY: BOT_TOKEN is set but ALLOWED_USER(S) is missing. Refusing to enable Telegram. Set ALLOWED_USER to your numeric Telegram user ID in .env, or remove BOT_TOKEN to start the agent without Telegram.`);
         botToken = undefined;
       }
 
       if (botToken && chatId) {
         telegramApi = new TelegramAPI(botToken);
-        // Don't log sensitive user IDs — just indicate the gate is enabled
-        log(`Telegram configured (chat_id: ****${String(chatId).slice(-4)}, allowed_user: enabled)`);
+        log(`Telegram configured (chat_id: ****${String(chatId).slice(-4)}, allowed_users: ${allowedUserIds.size})`);
       }
     }
 
@@ -258,7 +260,7 @@ export class AgentManager {
       log,
       telegramApi,
       chatId,
-      allowedUserId: allowedUserId ? parseInt(allowedUserId, 10) : undefined,
+      allowedUserIds: allowedUserIds.size > 0 ? allowedUserIds : undefined,
     });
 
     // Send Telegram notification on crashes and session refreshes
@@ -334,14 +336,10 @@ export class AgentManager {
       const poller = new TelegramPoller(telegramApi, stateDir);
 
       poller.onMessage((msg) => {
-        // ALLOWED_USER gate: if configured, ignore messages from other users.
-        // Use numeric comparison to avoid string coercion issues.
-        if (allowedUserId) {
-          const allowedId = parseInt(allowedUserId, 10);
-          if (msg.from?.id !== allowedId) {
-            log(`Ignoring message from unauthorized user (allowed_user gate)`);
-            return;
-          }
+        // ALLOWED_USERS gate: if configured, ignore messages from non-whitelisted users.
+        if (allowedUserIds.size > 0 && !allowedUserIds.has(msg.from?.id ?? -1)) {
+          log(`Ignoring message from unauthorized user ${msg.from?.id} (allowed_users gate)`);
+          return;
         }
 
         const from = stripControlChars(msg.from?.first_name || msg.from?.username || 'Unknown');
@@ -361,13 +359,14 @@ export class AgentManager {
         // Check for media messages (photo, document, voice, audio, video, video_note)
         const isMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
 
+        const fromUserId = msg.from?.id;
         if (isMedia && telegramApi) {
           const downloadDir = join(agentDir, 'telegram-images');
           processMediaMessage(msg, telegramApi, downloadDir).then((media) => {
             if (!media) {
               log('Media processing returned null - falling back to text format');
               const text = stripControlChars(msg.caption || '');
-              const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
+              const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, undefined, undefined, undefined, fromUserId);
               if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
               return;
             }
@@ -404,7 +403,7 @@ export class AgentManager {
           }).catch((err) => {
             log(`Media processing error: ${err} - falling back to text format`);
             const text = stripControlChars(msg.caption || '');
-            const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
+            const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, undefined, undefined, undefined, fromUserId);
             if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
           });
           return;
@@ -425,6 +424,7 @@ export class AgentManager {
           replyToText,
           lastSent ?? undefined,
           recentHistory,
+          fromUserId,
         );
 
         if (checker.isDuplicate(formatted)) {
@@ -443,14 +443,10 @@ export class AgentManager {
       });
 
       poller.onReaction((reaction) => {
-        // ALLOWED_USER gate: same rule as message handler. If configured,
-        // ignore reactions from other users.
-        if (allowedUserId) {
-          const allowedId = parseInt(allowedUserId, 10);
-          if (reaction.user?.id !== allowedId) {
-            log('Ignoring reaction from unauthorized user (allowed_user gate)');
-            return;
-          }
+        // ALLOWED_USERS gate: same rule as message handler.
+        if (allowedUserIds.size > 0 && !allowedUserIds.has(reaction.user?.id ?? -1)) {
+          log(`Ignoring reaction from unauthorized user ${reaction.user?.id} (allowed_users gate)`);
+          return;
         }
 
         const from = stripControlChars(reaction.user?.first_name || reaction.user?.username || 'Unknown');

@@ -33,7 +33,7 @@ export class FastChecker {
   private frameworkRoot: string;
   private telegramApi?: TelegramAPI;
   private chatId?: string;
-  private allowedUserId?: number;
+  private allowedUserIds?: Set<number>;
 
   // External Telegram handler (set by daemon)
   private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
@@ -63,7 +63,7 @@ export class FastChecker {
     agent: AgentProcess,
     paths: BusPaths,
     frameworkRoot: string,
-    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserId?: number } = {},
+    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserIds?: Set<number> } = {},
   ) {
     this.agent = agent;
     this.paths = paths;
@@ -72,7 +72,7 @@ export class FastChecker {
     this.log = options.log || ((msg) => console.log(`[fast-checker/${agent.name}] ${msg}`));
     this.telegramApi = options.telegramApi;
     this.chatId = options.chatId;
-    this.allowedUserId = options.allowedUserId;
+    this.allowedUserIds = options.allowedUserIds;
 
     // Initialize persistent dedup
     this.dedupFilePath = join(paths.stateDir, '.message-dedup-hashes');
@@ -248,6 +248,7 @@ Reply using: cortextos bus send-message ${msg.from} normal '<your reply>' ${msg.
     replyToText?: string,
     lastSentText?: string,
     recentHistory?: string,
+    fromUserId?: number,
   ): string {
     let replyCx = '';
     if (replyToText) {
@@ -271,7 +272,8 @@ Reply using: cortextos bus send-message ${msg.from} normal '<your reply>' ${msg.
     const body = isSlashCommand
       ? text.trim()
       : `\`\`\`\n${text}\n\`\`\``;
-    return `=== TELEGRAM from [USER: ${from}] (chat_id:${chatId}) ===
+    const userIdSuffix = fromUserId !== undefined ? ` (user_id:${fromUserId})` : '';
+    return `=== TELEGRAM from [USER: ${from}]${userIdSuffix} (chat_id:${chatId}) ===
 ${replyCx}${historyCx}${body}
 ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
@@ -470,9 +472,9 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // SECURITY: callbacks must come from the whitelisted user. Identical
     // check to handleCallback — approval clicks are as sensitive as
     // permission clicks and the same gate applies.
-    if (this.allowedUserId !== undefined) {
+    if (this.allowedUserIds !== undefined) {
       const fromUserId = query.from?.id;
-      if (fromUserId !== this.allowedUserId) {
+      if (fromUserId === undefined || !this.allowedUserIds.has(fromUserId)) {
         this.log(`SECURITY: activity-channel callback from unauthorized user ${fromUserId} - rejecting`);
         try { await activityApi.answerCallbackQuery(callbackQueryId, 'Not authorized'); } catch { /* ignore */ }
         return;
@@ -554,9 +556,9 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
     // SECURITY: callbacks must come from the whitelisted user. Without this,
     // anyone who sees a button (forwarded message, group, etc.) could click it.
-    if (this.allowedUserId !== undefined) {
+    if (this.allowedUserIds !== undefined) {
       const fromUserId = query.from?.id;
-      if (fromUserId !== this.allowedUserId) {
+      if (fromUserId === undefined || !this.allowedUserIds.has(fromUserId)) {
         this.log(`SECURITY: callback from unauthorized user ${fromUserId} - rejecting`);
         return;
       }
