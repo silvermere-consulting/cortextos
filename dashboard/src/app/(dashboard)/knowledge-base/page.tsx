@@ -18,18 +18,19 @@ function getKnowledgeContent(org: string): string {
 
 export const dynamic = 'force-dynamic';
 
-export default function KnowledgeBasePage({
+export default async function KnowledgeBasePage({
   searchParams,
 }: {
-  searchParams: { org?: string; doc?: string };
+  searchParams: Promise<{ org?: string; doc?: string }>;
 }) {
+  const { org: orgParam, doc } = await searchParams;
   const orgs = getOrgs();
 
   // Use org from URL param (set by topbar org selector) if valid.
   // Fall back to the first org that has active agents, then to orgs[0].
   // Skip 'all' — KB viewer always needs a specific org.
-  let org = (searchParams.org && searchParams.org !== 'all' && orgs.includes(searchParams.org))
-    ? searchParams.org
+  let org = (orgParam && orgParam !== 'all' && orgs.includes(orgParam))
+    ? orgParam
     : orgs.find(o => getAgentsForOrg(o).length > 0) ?? orgs[0] ?? '';
 
   const agentCount = org ? getAgentsForOrg(org).length : 0;
@@ -39,7 +40,7 @@ export default function KnowledgeBasePage({
     : '';
 
   // ?doc=<url-encoded-path> opens the doc viewer immediately on load.
-  const initialDoc = searchParams.doc || '';
+  const initialDoc = doc || '';
 
   return (
     <div className="space-y-6">
