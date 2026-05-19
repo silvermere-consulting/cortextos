@@ -161,7 +161,7 @@ export function getFleetHealth(org: string): FleetHealth | null {
   let totalPending = 0;
   const perAgentMessages: Record<string, { sent: number; received: number }> = {};
   const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
+  todayStart.setUTCHours(0, 0, 0, 0);
   const todayMs = todayStart.getTime();
 
   // Received = messages in this agent's processed dir today
@@ -216,8 +216,12 @@ export function getFleetHealth(org: string): FleetHealth | null {
 // ---------------------------------------------------------------------------
 // Fallback: build fleet health from live heartbeat files when no report exists
 function getFleetHealthFromHeartbeats(org: string): FleetHealth | null {
-  const CTX_FRAMEWORK_ROOT = process.env.CTX_FRAMEWORK_ROOT ?? path.join(path.dirname(CTX_ROOT), '..');
-  const agentsDir = path.join(CTX_FRAMEWORK_ROOT, 'orgs', org, 'agents');
+  // Mirror config.ts resolution: CTX_FRAMEWORK_ROOT env var, then cwd/..
+  // (avoids importing from @/lib/config to prevent turbopack chunk issues)
+  const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT
+    ?? process.env.CTX_PROJECT_ROOT
+    ?? path.resolve(process.cwd(), '..');
+  const agentsDir = path.join(frameworkRoot, 'orgs', org, 'agents');
   if (!fs.existsSync(agentsDir)) return null;
 
   const agents: FleetHealthAgent[] = [];
@@ -249,9 +253,55 @@ function getFleetHealthFromHeartbeats(org: string): FleetHealth | null {
 
   if (agents.length === 0) return null;
 
+  // Count message bus activity from processed/inbox directories (same logic as snapshot branch)
+  const orgAgentNames = new Set(agents.map(a => a.name));
+  let deliveredToday = 0;
+  let totalPending = 0;
+  const perAgentMessages: Record<string, { sent: number; received: number }> = {};
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const todayMs = todayStart.getTime();
+
+  const processedDir = path.join(CTX_ROOT, 'processed');
+  if (fs.existsSync(processedDir)) {
+    for (const ad of fs.readdirSync(processedDir, { withFileTypes: true })) {
+      if (!ad.isDirectory() || !orgAgentNames.has(ad.name)) continue;
+      const agentName = ad.name;
+      if (!perAgentMessages[agentName]) perAgentMessages[agentName] = { sent: 0, received: 0 };
+      try {
+        for (const f of fs.readdirSync(path.join(processedDir, agentName))) {
+          try {
+            if (fs.statSync(path.join(processedDir, agentName, f)).mtimeMs >= todayMs) {
+              deliveredToday++;
+              perAgentMessages[agentName].received++;
+              const senderMatch = f.match(/from-([a-z0-9_-]+)-/);
+              if (senderMatch && orgAgentNames.has(senderMatch[1])) {
+                const sender = senderMatch[1];
+                if (!perAgentMessages[sender]) perAgentMessages[sender] = { sent: 0, received: 0 };
+                perAgentMessages[sender].sent++;
+              }
+            }
+          } catch { /* skip */ }
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  const inboxDir = path.join(CTX_ROOT, 'inbox');
+  if (fs.existsSync(inboxDir)) {
+    for (const ad of fs.readdirSync(inboxDir, { withFileTypes: true })) {
+      if (!ad.isDirectory()) continue;
+      try { totalPending += fs.readdirSync(path.join(inboxDir, ad.name)).length; } catch { /* skip */ }
+    }
+  }
+
+  const perAgent: AgentMessageCount[] = Object.entries(perAgentMessages)
+    .map(([name, counts]) => ({ name, ...counts }))
+    .sort((a, b) => (b.sent + b.received) - (a.sent + a.received));
+
   return {
     agents,
-    messageBus: { totalToday: 0, pending: 0, perAgent: [] },
+    messageBus: { totalToday: deliveredToday, pending: totalPending, perAgent },
     fleetStability: 100,
     staleCount: agents.filter(a => a.isStale).length,
     errorCount: 0,

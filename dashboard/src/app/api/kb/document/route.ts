@@ -29,15 +29,15 @@ export async function GET(request: NextRequest) {
   // Resolve to absolute, normalised path (prevents traversal via ../)
   const resolved = path.resolve(filePath);
 
-  // Allowlist: only serve files under CTX_ROOT or frameworkRoot/orgs/
+  // Allowlist: only serve files under CTX_ROOT, frameworkRoot (whole repo), or ~/.cortextos
   const ctxRoot = path.resolve(getCTXRoot());
-  const frameworkOrgs = path.resolve(path.join(getFrameworkRoot(), 'orgs'));
+  const frameworkRoot = path.resolve(getFrameworkRoot());
   const homeDir = os.homedir();
   const cortextosRoot = path.resolve(path.join(homeDir, '.cortextos'));
 
   const allowed =
     resolved.startsWith(ctxRoot + path.sep) ||
-    resolved.startsWith(frameworkOrgs + path.sep) ||
+    resolved.startsWith(frameworkRoot + path.sep) ||
     resolved.startsWith(cortextosRoot + path.sep);
 
   if (!allowed) {
