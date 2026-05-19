@@ -92,12 +92,7 @@ export function getLatestSnapshot(org: string): LatestSnapshot | null {
 
 export function getFleetHealth(org: string): FleetHealth | null {
   const snapshot = getLatestSnapshot(org);
-  if (!snapshot?.health) {
-    // Fallback: build fleet health from live heartbeat files
-    return getFleetHealthFromHeartbeats(org);
-  }
-
-  const healthData = snapshot.health as {
+  const healthData = snapshot?.health as {
     agents?: Record<string, {
       agent: string;
       heartbeat_age_min: number;
@@ -109,6 +104,11 @@ export function getFleetHealth(org: string): FleetHealth | null {
     }>;
     message_bus?: { inbox: number; inflight: number; processed: number };
   };
+
+  // If the snapshot has no agent data, fall back to live heartbeat files
+  if (!healthData?.agents) {
+    return getFleetHealthFromHeartbeats(org);
+  }
 
   const agents: FleetHealthAgent[] = [];
   let totalStability = 0;

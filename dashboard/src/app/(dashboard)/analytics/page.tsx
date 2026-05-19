@@ -14,7 +14,7 @@ import { CostTracking } from '@/components/analytics/cost-tracking';
 import { GoalProgress } from '@/components/analytics/goal-progress';
 import { FleetHealth as FleetStability } from '@/components/analytics/fleet-health';
 import { FleetHealth } from '@/components/overview/fleet-health';
-import { getFleetHealth, getLatestSnapshot, getPlanUsage, getUsageHistory } from '@/lib/data/reports';
+import { getFleetHealth, getLatestSnapshot } from '@/lib/data/reports';
 
 export default async function AnalyticsPage({
   searchParams,
@@ -30,7 +30,7 @@ export default async function AnalyticsPage({
   syncCostsLazy();
 
   // Fetch all data in parallel
-  const [taskData, agentStats, dailyCosts, dailyCostByModel, monthCost, goalsData, fleetHealth, planUsage, usageHistory] =
+  const [taskData, agentStats, dailyCosts, dailyCostByModel, monthCost, goalsData, fleetHealth] =
     await Promise.all([
       Promise.resolve(getTaskThroughput(30, org || undefined)),
       Promise.resolve(getAgentEffectiveness(org || undefined)),
@@ -39,8 +39,6 @@ export default async function AnalyticsPage({
       Promise.resolve(getCurrentMonthCost()),
       Promise.resolve(org ? getGoals(org) : { bottleneck: '', goals: [] }),
       Promise.resolve(getFleetHealth(org || 'default')),
-      Promise.resolve(getPlanUsage()),
-      Promise.resolve(getUsageHistory(7)),
     ]);
 
   // Project monthly cost: (month-to-date / days elapsed) * days in month
@@ -79,8 +77,6 @@ export default async function AnalyticsPage({
         dailyCostByModel={dailyCostByModel}
         currentMonthCost={monthCost}
         projectedMonthly={projectedMonthly}
-        planUsage={planUsage}
-        usageHistory={usageHistory}
       />
 
       {/* Goal Progress - only show when specific org selected */}
