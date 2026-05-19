@@ -21,7 +21,7 @@ export const dynamic = 'force-dynamic';
 export default function KnowledgeBasePage({
   searchParams,
 }: {
-  searchParams: { org?: string };
+  searchParams: { org?: string; doc?: string };
 }) {
   const orgs = getOrgs();
 
@@ -38,6 +38,9 @@ export default function KnowledgeBasePage({
     ? path.join(getFrameworkRoot(), 'orgs', org, 'knowledge.md')
     : '';
 
+  // ?doc=<url-encoded-path> opens the doc viewer immediately on load.
+  const initialDoc = searchParams.doc || '';
+
   return (
     <div className="space-y-6">
       <div>
@@ -52,6 +55,7 @@ export default function KnowledgeBasePage({
         markdownContent={content}
         filePath={kbPath}
         agentCount={agentCount}
+        initialDoc={initialDoc}
       />
     </div>
   );

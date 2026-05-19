@@ -43,6 +43,7 @@ interface KnowledgeBaseClientProps {
   markdownContent: string;
   filePath: string;
   agentCount: number;
+  initialDoc?: string;
 }
 
 function collectionLabel(name: string): string {
@@ -58,7 +59,7 @@ function shortPath(sourcePath: string): string {
   return parts.slice(-2).join('/');
 }
 
-export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount }: KnowledgeBaseClientProps) {
+export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount, initialDoc }: KnowledgeBaseClientProps) {
   const [query, setQuery] = useState('');
   const [selectedCollection, setSelectedCollection] = useState('all');
   const [results, setResults] = useState<SearchResult[]>([]);
@@ -73,6 +74,11 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount
   const [browseDocuments, setBrowseDocuments] = useState<KbDocument[] | null>(null);
   const [browseLoading, setBrowseLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Open doc viewer immediately when ?doc= is in the URL (deep-link support).
+  useEffect(() => {
+    if (initialDoc) setOpenDocPath(initialDoc);
+  }, [initialDoc]);
 
   useEffect(() => {
     if (!org) { setCollectionsLoading(false); return; }
