@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import type { TelegramUpdate, TelegramMessage, TelegramCallbackQuery, TelegramMessageReaction } from '../types/index.js';
 import { TelegramAPI } from './api.js';
@@ -72,18 +72,62 @@ export class TelegramPoller {
   }
 
   /**
-   * Start the polling loop.
+   * Start the polling loop with exponential backoff on failure.
+   *
+   * Consecutive failures trigger:
+   *   1-9  → comms_status: 'degraded' in comms-liveness.json
+   *   10+  → comms_status: 'dark' + durable comms-dark.marker written to stateDir
+   * On recovery the marker is removed and comms_status resets to 'ok'.
    */
   async start(): Promise<void> {
     this.running = true;
+    let consecutiveFailures = 0;
+    let lastSuccessfulPoll: string | null = null;
+    const BASE_INTERVAL = this.pollInterval;
+    const MAX_INTERVAL = 5 * 60 * 1000;
+    const FAILURE_THRESHOLD = 10;
+    const MARKER_PATH = join(this.stateDir, 'comms-dark.marker');
+    const LIVENESS_PATH = join(this.stateDir, 'comms-liveness.json');
+
     while (this.running) {
+      let sleepMs = BASE_INTERVAL;
       try {
         await this.pollOnce();
+        consecutiveFailures = 0;
+        lastSuccessfulPoll = new Date().toISOString();
+        if (existsSync(MARKER_PATH)) {
+          try { unlinkSync(MARKER_PATH); } catch {}
+        }
+        try {
+          writeFileSync(LIVENESS_PATH, JSON.stringify({
+            last_successful_poll: lastSuccessfulPoll,
+            consecutive_poll_failures: 0,
+            comms_status: 'ok',
+          }), 'utf-8');
+        } catch {}
       } catch (err) {
-        // Log error but continue polling
+        consecutiveFailures++;
         console.error('[telegram-poller] Poll error:', err);
+        sleepMs = Math.min(BASE_INTERVAL * Math.pow(2, consecutiveFailures), MAX_INTERVAL);
+        const commsStatus = consecutiveFailures >= FAILURE_THRESHOLD ? 'dark' : 'degraded';
+        try {
+          writeFileSync(LIVENESS_PATH, JSON.stringify({
+            last_successful_poll: lastSuccessfulPoll,
+            consecutive_poll_failures: consecutiveFailures,
+            comms_status: commsStatus,
+          }), 'utf-8');
+        } catch {}
+        if (consecutiveFailures >= FAILURE_THRESHOLD) {
+          try {
+            writeFileSync(MARKER_PATH, JSON.stringify({
+              since: new Date().toISOString(),
+              consecutive_poll_failures: consecutiveFailures,
+              last_error: err instanceof Error ? err.message : String(err),
+            }), 'utf-8');
+          } catch {}
+        }
       }
-      await sleep(this.pollInterval);
+      await sleep(sleepMs);
     }
   }
 

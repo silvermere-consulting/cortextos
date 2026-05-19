@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync, statSync } from 'fs';
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
@@ -109,9 +109,19 @@ export class FastChecker {
     // Idle-session heartbeat watchdog: fires every 50 min regardless of REPL state
     const HEARTBEAT_INTERVAL_MS = 50 * 60 * 1000;
     const agentName = this.agent.name;
+
+    // Resolve cortextos binary to an absolute path once, to survive environments
+    // where PM2 launches with a PATH that differs from the interactive shell.
+    let cortextosBin = 'cortextos';
+    try {
+      cortextosBin = execFileSync('which', ['cortextos'], { encoding: 'utf-8' }).trim();
+    } catch {
+      // Fall back to bare name; PATH must be correct at PM2 launch.
+    }
+
     this.heartbeatTimer = setInterval(() => {
       const ts = new Date().toISOString();
-      execFile('cortextos', ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`], (err) => {
+      execFile(cortextosBin, ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`], { env: { ...process.env } }, (err) => {
         if (err) this.log(`Heartbeat watchdog error: ${err.message}`);
       });
     }, HEARTBEAT_INTERVAL_MS);

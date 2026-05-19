@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-vi.mock('child_process', () => ({ execFile: vi.fn() }));
+vi.mock('child_process', () => ({ execFile: vi.fn(), execFileSync: vi.fn() }));
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -798,6 +798,7 @@ describe('FastChecker', () => {
       expect(execFile).toHaveBeenCalledWith(
         'cortextos',
         expect.arrayContaining(['bus', 'update-heartbeat', expect.stringContaining('[watchdog] my-agent alive — idle session')]),
+        expect.objectContaining({ env: expect.any(Object) }),
         expect.any(Function),
       );
       checker.stop();
@@ -829,6 +830,7 @@ describe('FastChecker', () => {
       expect(execFile).not.toHaveBeenCalledWith(
         'cortextos',
         expect.arrayContaining([expect.stringContaining('[watchdog]')]),
+        expect.objectContaining({ env: expect.any(Object) }),
         expect.any(Function),
       );
       checker.stop();
