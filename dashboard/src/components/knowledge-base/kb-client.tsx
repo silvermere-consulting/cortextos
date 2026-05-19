@@ -60,6 +60,11 @@ function shortPath(sourcePath: string): string {
 }
 
 export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount, initialDoc }: KnowledgeBaseClientProps) {
+  // Suppress hydration mismatches: this component is fully interactive and
+  // fetches all data client-side. Server and client initial renders must
+  // match, so we return a neutral skeleton until after the first client
+  // paint. Deep-link ?doc= handling (useEffect) also only runs after mount.
+  const [mounted, setMounted] = useState(false);
   const [query, setQuery] = useState('');
   const [selectedCollection, setSelectedCollection] = useState('all');
   const [results, setResults] = useState<SearchResult[]>([]);
@@ -79,6 +84,8 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount
   useEffect(() => {
     if (initialDoc) setOpenDocPath(initialDoc);
   }, [initialDoc]);
+
+  useEffect(() => { setMounted(true); }, []);
 
   useEffect(() => {
     if (!org) { setCollectionsLoading(false); return; }
@@ -171,6 +178,10 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount
       </span>
     );
   };
+
+  if (!mounted) {
+    return <div className="h-64 rounded-lg bg-muted/30 animate-pulse" />;
+  }
 
   // Org with no agents is a folder-only/shell org — show a clear notice instead of
   // empty search/collection tabs that give no guidance.
