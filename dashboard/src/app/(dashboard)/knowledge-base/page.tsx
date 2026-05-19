@@ -1,4 +1,4 @@
-import { getOrgs, getFrameworkRoot } from '@/lib/config';
+import { getOrgs, getFrameworkRoot, getAgentsForOrg } from '@/lib/config';
 import { KnowledgeBaseClient } from '@/components/knowledge-base/kb-client';
 import fs from 'fs';
 import path from 'path';
@@ -18,9 +18,21 @@ function getKnowledgeContent(org: string): string {
 
 export const dynamic = 'force-dynamic';
 
-export default function KnowledgeBasePage() {
+export default function KnowledgeBasePage({
+  searchParams,
+}: {
+  searchParams: { org?: string };
+}) {
   const orgs = getOrgs();
-  const org = orgs[0] ?? '';
+
+  // Use org from URL param (set by topbar org selector) if valid.
+  // Fall back to the first org that has active agents, then to orgs[0].
+  // Skip 'all' — KB viewer always needs a specific org.
+  let org = (searchParams.org && searchParams.org !== 'all' && orgs.includes(searchParams.org))
+    ? searchParams.org
+    : orgs.find(o => getAgentsForOrg(o).length > 0) ?? orgs[0] ?? '';
+
+  const agentCount = org ? getAgentsForOrg(org).length : 0;
   const content = org ? getKnowledgeContent(org) : '';
   const kbPath = org
     ? path.join(getFrameworkRoot(), 'orgs', org, 'knowledge.md')
@@ -39,6 +51,7 @@ export default function KnowledgeBasePage() {
         org={org}
         markdownContent={content}
         filePath={kbPath}
+        agentCount={agentCount}
       />
     </div>
   );

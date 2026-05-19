@@ -42,6 +42,7 @@ interface KnowledgeBaseClientProps {
   org: string;
   markdownContent: string;
   filePath: string;
+  agentCount: number;
 }
 
 function collectionLabel(name: string): string {
@@ -57,7 +58,7 @@ function shortPath(sourcePath: string): string {
   return parts.slice(-2).join('/');
 }
 
-export function KnowledgeBaseClient({ org, markdownContent, filePath }: KnowledgeBaseClientProps) {
+export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount }: KnowledgeBaseClientProps) {
   const [query, setQuery] = useState('');
   const [selectedCollection, setSelectedCollection] = useState('all');
   const [results, setResults] = useState<SearchResult[]>([]);
@@ -164,6 +165,28 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
       </span>
     );
   };
+
+  // Org with no agents is a folder-only/shell org — show a clear notice instead of
+  // empty search/collection tabs that give no guidance.
+  if (!org || agentCount === 0) {
+    return (
+      <Card className="border-dashed">
+        <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+          <div className="rounded-full bg-muted p-3 mb-3">
+            <IconDatabase size={22} className="text-muted-foreground/50" />
+          </div>
+          <h3 className="text-sm font-medium mb-1">
+            {org ? `No agents in ${org}` : 'No org selected'}
+          </h3>
+          <p className="text-xs text-muted-foreground max-w-sm">
+            {org
+              ? <><span className="font-mono bg-muted px-1 rounded">{org}</span> has no configured agents. Select an active org from the top bar to browse its knowledge base.</>
+              : 'Select an org from the top bar to browse its knowledge base.'}
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
 
   return (
     <>
