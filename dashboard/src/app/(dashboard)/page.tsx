@@ -13,6 +13,8 @@ import { TodaysProgress } from '@/components/overview/todays-progress';
 import { LiveActivity } from '@/components/overview/live-activity';
 import { MetricCards } from '@/components/overview/metric-cards';
 import { AgentStatusGrid } from '@/components/overview/agent-status-grid';
+import { ActiveProjects } from '@/components/overview/active-projects';
+import { getActiveProjects } from '@/lib/data/projects';
 
 export const dynamic = 'force-dynamic';
 
@@ -39,6 +41,7 @@ export default async function OverviewPage({
     milestones,
     agents,
     heartbeatsList,
+    activeProjects,
   ] = await Promise.all([
     Promise.resolve(getPendingCount(org || undefined)),
     Promise.resolve(getTasks({ status: 'blocked', org: org || undefined })),
@@ -50,6 +53,7 @@ export default async function OverviewPage({
     Promise.resolve(getMilestones(org || undefined)),
     discoverAgents(org || undefined),
     getAllHeartbeats(),
+    Promise.resolve(getActiveProjects(org || undefined)),
   ]);
 
   // Convert heartbeats array to lookup map
@@ -132,6 +136,9 @@ export default async function OverviewPage({
           />
         </div>
       </div>
+
+      {/* Active Projects */}
+      <ActiveProjects projects={activeProjects} />
 
     </div>
   );

@@ -24,8 +24,10 @@ export function OrgSelector({ orgs, currentOrg, onOrgChange }: OrgSelectorProps)
     if (!value) return;
     onOrgChange(value);
 
-    // Update URL so server-rendered pages re-fetch with the org filter
+    // Update URL so server-rendered pages re-fetch with the org filter.
+    // Always strip ?doc= on org change — a doc open in one org is not valid in another.
     const params = new URLSearchParams(searchParams.toString());
+    params.delete('doc');
     if (value === 'all') {
       params.delete('org');
     } else {

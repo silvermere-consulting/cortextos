@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -81,11 +81,38 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Open doc viewer immediately when ?doc= is in the URL (deep-link support).
+  // Uses direct setState — URL already contains ?doc= from the server render, no pushState needed.
   useEffect(() => {
     if (initialDoc) setOpenDocPath(initialDoc);
   }, [initialDoc]);
 
   useEffect(() => { setMounted(true); }, []);
+
+  // Push a new history entry when a doc opens; use replaceState on close so
+  // the × button doesn't leave a stale KB-with-no-doc entry (DTNAV-4.1/4.2).
+  const openDoc = useCallback((docPath: string) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set('doc', docPath);
+    window.history.pushState(null, '', url.toString());
+    setOpenDocPath(docPath);
+  }, []);
+
+  const closeDoc = useCallback(() => {
+    const url = new URL(window.location.href);
+    url.searchParams.delete('doc');
+    window.history.replaceState(null, '', url.toString());
+    setOpenDocPath(null);
+  }, []);
+
+  // Sync doc state when browser back/forward is pressed (DTNAV-4.1 AC-2).
+  useEffect(() => {
+    const handler = () => {
+      const params = new URLSearchParams(window.location.search);
+      setOpenDocPath(params.get('doc') || null);
+    };
+    window.addEventListener('popstate', handler);
+    return () => window.removeEventListener('popstate', handler);
+  }, []);
 
   useEffect(() => {
     if (!org) { setCollectionsLoading(false); return; }
@@ -340,7 +367,7 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount
                 <Card
                   key={i}
                   className={`transition-colors ${canOpen ? 'hover:bg-muted/30 cursor-pointer' : 'hover:bg-muted/20'}`}
-                  onClick={canOpen ? () => setOpenDocPath(srcPath) : undefined}
+                  onClick={canOpen ? () => openDoc(srcPath) : undefined}
                 >
                   <CardContent className="py-3 space-y-2">
                     <div className="flex items-center gap-2 flex-wrap">
@@ -429,7 +456,7 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount
                   <Card
                     key={doc.source}
                     className="hover:bg-muted/30 transition-colors cursor-pointer"
-                    onClick={() => setOpenDocPath(doc.source)}
+                    onClick={() => openDoc(doc.source)}
                   >
                     <CardContent className="py-2.5 flex items-center gap-2.5">
                       <IconFileText size={14} className="text-muted-foreground shrink-0" />
@@ -511,7 +538,8 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath, agentCount
       <KbDocViewer
         filePath={openDocPath}
         org={org}
-        onClose={() => setOpenDocPath(null)}
+        onClose={closeDoc}
+        onOpenDoc={openDoc}
       />
     )}
     </>

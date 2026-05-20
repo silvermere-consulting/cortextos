@@ -8,6 +8,7 @@ interface KbDocViewerProps {
   filePath: string;
   org: string;
   onClose: () => void;
+  onOpenDoc?: (path: string) => void;
 }
 
 function shortPath(p: string): string {
@@ -16,7 +17,7 @@ function shortPath(p: string): string {
   return parts.length > 4 ? '…/' + parts.slice(-3).join('/') : p;
 }
 
-export function KbDocViewer({ filePath, org, onClose }: KbDocViewerProps) {
+export function KbDocViewer({ filePath, org, onClose, onOpenDoc }: KbDocViewerProps) {
   const [content, setContent] = useState<string | null>(null);
   const [filename, setFilename] = useState('');
   const [ext, setExt] = useState('');
@@ -55,6 +56,26 @@ export function KbDocViewer({ filePath, org, onClose }: KbDocViewerProps) {
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [onClose]);
+
+  // Intercept clicks on KB deep-links inside the rendered doc (DTNAV-2.1).
+  // Links matching /knowledge-base?...&doc=<path> are routed through onOpenDoc
+  // so the history stack is updated correctly instead of performing a full navigation.
+  const handleContentClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (!onOpenDoc) return;
+    const anchor = (e.target as HTMLElement).closest('a');
+    if (!anchor) return;
+    const href = anchor.getAttribute('href') || '';
+    try {
+      const url = new URL(href, window.location.origin);
+      if (url.pathname === '/knowledge-base') {
+        const docPath = url.searchParams.get('doc');
+        if (docPath) {
+          e.preventDefault();
+          onOpenDoc(docPath);
+        }
+      }
+    } catch { /* not a valid URL — let the browser handle it */ }
+  }, [onOpenDoc]);
 
   const isMarkdown = ext === 'md' || ext === 'markdown' || ext === 'txt';
 
@@ -103,7 +124,7 @@ export function KbDocViewer({ filePath, org, onClose }: KbDocViewerProps) {
           )}
 
           {!loading && !error && content !== null && (
-            <div className="p-5">
+            <div className="p-5" onClick={handleContentClick}>
               {isMarkdown ? (
                 <div className="prose prose-sm dark:prose-invert max-w-none">
                   {renderMarkdown(content)}
