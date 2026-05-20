@@ -88,28 +88,27 @@ const html = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <title>${meta.project || path.basename(resolvedInput, path.extname(resolvedInput))}</title>
-<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;900&display=swap" rel="stylesheet">
 <style>
-  /* Silvermere palette
-     Primary Gold:  #B8860B  — headings, gold rules, key accents
-     Accent Gold:   #D4AF37  — lighter gold, thead
-     Background:    #FFFFFF
-     Body text:     #1A1A1A
-     Muted bg:      #F8F7F4  — table rows, meta block
-     Muted fg:      #666666  — labels, captions
-     Border:        #E5E0D8  — all rules and borders
-     Font:          Sora (Google Fonts) / system sans-serif fallback
+  /* Silvermere brand palette (from silvermereadvisory.com)
+     Primary Navy:  #0B234A  — headings, brand header, strong accents
+     Accent Gold:   #D4AF37  — rules, thead, blockquote, gold highlights
+     Warm Stone:    #B4AD9A  — secondary text, muted labels
+     Background:    #FBF9F8  — warm white
+     Body text:     #242424  — near-black
+     Font:          Roboto (weights 300 + 900) / system sans-serif fallback
   */
 
   /* Base */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+    font-weight: 300;
     font-size: 10.5pt;
     line-height: 1.65;
-    color: #1A1A1A;
-    background: #fff;
+    color: #242424;
+    background: #FBF9F8;
     padding: 0;
     margin: 0;
   }
@@ -126,16 +125,16 @@ const html = `<!DOCTYPE html>
     display: flex;
     align-items: center;
     justify-content: space-between;
-    border-bottom: 2px solid #B8860B;
+    border-bottom: 2px solid #D4AF37;
     padding-bottom: 8px;
     margin-bottom: 28px;
   }
   .brand-name {
-    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Roboto', 'Helvetica Neue', Arial, sans-serif;
     font-size: 7pt;
-    font-weight: 700;
-    color: #B8860B;
-    letter-spacing: 0.18em;
+    font-weight: 900;
+    color: #0B234A;
+    letter-spacing: 0.22em;
     text-transform: uppercase;
   }
   .brand-rule-dot {
@@ -147,12 +146,12 @@ const html = `<!DOCTYPE html>
 
   /* Front matter meta block */
   .meta-block {
-    border-top: 1px solid #E5E0D8;
-    border-bottom: 1px solid #E5E0D8;
-    background: #F8F7F4;
+    border-top: 1px solid #D4AF37;
+    border-bottom: 1px solid rgba(180,173,154,0.4);
+    background: rgba(180,173,154,0.08);
     padding: 10px 12px;
     margin-bottom: 28px;
-    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Roboto', 'Helvetica Neue', Arial, sans-serif;
     font-size: 8.5pt;
     border-radius: 2px;
   }
@@ -162,52 +161,53 @@ const html = `<!DOCTYPE html>
     padding: 2px 0;
   }
   .meta-key {
-    font-weight: 600;
-    color: #666666;
+    font-weight: 900;
+    color: #B4AD9A;
     min-width: 72px;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.08em;
     font-size: 7pt;
   }
   .meta-val {
-    color: #1A1A1A;
+    color: #242424;
+    font-weight: 300;
   }
 
   /* Headings */
   h1 {
-    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Roboto', 'Helvetica Neue', Arial, sans-serif;
     font-size: 20pt;
-    font-weight: 700;
+    font-weight: 900;
     line-height: 1.2;
     margin-bottom: 6px;
-    color: #1A1A1A;
-    letter-spacing: -0.02em;
+    color: #0B234A;
+    letter-spacing: -0.01em;
   }
   h2 {
-    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Roboto', 'Helvetica Neue', Arial, sans-serif;
     font-size: 13pt;
-    font-weight: 700;
+    font-weight: 900;
     margin-top: 28px;
     margin-bottom: 8px;
-    color: #1A1A1A;
-    border-bottom: 1.5px solid #B8860B;
+    color: #0B234A;
+    border-bottom: 1.5px solid #D4AF37;
     padding-bottom: 4px;
   }
   h3 {
-    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Roboto', 'Helvetica Neue', Arial, sans-serif;
     font-size: 10.5pt;
-    font-weight: 700;
+    font-weight: 900;
     margin-top: 20px;
     margin-bottom: 5px;
-    color: #1A1A1A;
+    color: #0B234A;
   }
   h4, h5, h6 {
-    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Roboto', 'Helvetica Neue', Arial, sans-serif;
     font-size: 10pt;
-    font-weight: 600;
+    font-weight: 900;
     margin-top: 14px;
     margin-bottom: 4px;
-    color: #B8860B;
+    color: #D4AF37;
   }
 
   /* Paragraphs */
@@ -231,16 +231,16 @@ const html = `<!DOCTYPE html>
   code {
     font-family: 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
     font-size: 8.5pt;
-    background: #F8F7F4;
-    border: 1px solid #E5E0D8;
+    background: rgba(180,173,154,0.12);
+    border: 1px solid rgba(180,173,154,0.4);
     border-radius: 3px;
     padding: 1px 4px;
   }
 
   /* Block code */
   pre {
-    background: #F8F7F4;
-    border: 1px solid #E5E0D8;
+    background: rgba(180,173,154,0.12);
+    border: 1px solid rgba(180,173,154,0.4);
     border-radius: 4px;
     padding: 10px 12px;
     margin: 10px 0;
@@ -260,9 +260,9 @@ const html = `<!DOCTYPE html>
     border-left: 3px solid #D4AF37;
     margin: 12px 0;
     padding: 4px 12px;
-    color: #666666;
+    color: #B4AD9A;
     font-style: italic;
-    background: #F8F7F4;
+    background: rgba(212,175,55,0.04);
   }
 
   /* Tables */
@@ -271,40 +271,41 @@ const html = `<!DOCTYPE html>
     border-collapse: collapse;
     margin: 12px 0;
     font-size: 9.5pt;
-    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Roboto', 'Helvetica Neue', Arial, sans-serif;
     page-break-inside: avoid;
   }
   thead {
-    background: #D4AF37;
+    background: #0B234A;
   }
   th {
-    font-weight: 600;
+    font-weight: 900;
     text-align: left;
     padding: 6px 10px;
-    border: 1px solid #B8860B;
+    border: 1px solid #0B234A;
     font-size: 8.5pt;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: #ffffff;
+    letter-spacing: 0.06em;
+    color: #D4AF37;
   }
   td {
     padding: 6px 10px;
-    border: 1px solid #E5E0D8;
+    border: 1px solid rgba(180,173,154,0.35);
     vertical-align: top;
+    font-weight: 300;
   }
   tr:nth-child(even) td {
-    background: #F8F7F4;
+    background: rgba(180,173,154,0.07);
   }
 
   /* Horizontal rule */
   hr {
     border: none;
-    border-top: 1px solid #E5E0D8;
+    border-top: 1px solid rgba(180,173,154,0.4);
     margin: 20px 0;
   }
 
   /* Strong / em */
-  strong { font-weight: 700; }
+  strong { font-weight: 900; }
   em { font-style: italic; }
 
   /* Checkboxes in task lists */
@@ -312,8 +313,8 @@ const html = `<!DOCTYPE html>
     margin-right: 6px;
   }
 
-  /* Links — gold tint in print */
-  a { color: #B8860B; text-decoration: none; }
+  /* Links — navy in print */
+  a { color: #0B234A; text-decoration: none; }
 
   /* Page breaks */
   h2 { page-break-after: avoid; }
