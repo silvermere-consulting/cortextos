@@ -1,8 +1,15 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { IconX, IconFileText, IconLoader2, IconAlertCircle, IconExternalLink } from '@tabler/icons-react';
+import { IconX, IconFileText, IconLoader2, IconAlertCircle, IconExternalLink, IconDownload } from '@tabler/icons-react';
 import { renderMarkdown } from '@/lib/render-markdown';
+
+const PDF_EXTS = new Set(['pdf']);
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico']);
+
+function getExt(p: string): string {
+  return p.split('.').pop()?.toLowerCase() ?? '';
+}
 
 interface KbDocViewerProps {
   filePath: string;
@@ -24,7 +31,19 @@ export function KbDocViewer({ filePath, org, onClose, onOpenDoc }: KbDocViewerPr
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
+  const fileExt = getExt(filePath);
+  const isBinary = PDF_EXTS.has(fileExt) || IMAGE_EXTS.has(fileExt);
+  const downloadUrl = `/api/kb/document/download?${new URLSearchParams({ path: filePath, org })}`;
+
   const load = useCallback(async () => {
+    // Binary files (PDF, images) are served directly — skip the text fetch
+    if (isBinary) {
+      setFilename(filePath.split('/').pop() ?? filePath);
+      setExt(fileExt);
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     setError('');
     try {
@@ -44,7 +63,7 @@ export function KbDocViewer({ filePath, org, onClose, onOpenDoc }: KbDocViewerPr
     } finally {
       setLoading(false);
     }
-  }, [filePath, org]);
+  }, [filePath, org, isBinary, fileExt]);
 
   useEffect(() => {
     void load();
@@ -77,7 +96,7 @@ export function KbDocViewer({ filePath, org, onClose, onOpenDoc }: KbDocViewerPr
     } catch { /* not a valid URL — let the browser handle it */ }
   }, [onOpenDoc]);
 
-  const isMarkdown = ext === 'md' || ext === 'markdown' || ext === 'txt';
+  const isMarkdown = ext === 'md' || ext === 'markdown';
 
   return (
     <>
@@ -123,7 +142,30 @@ export function KbDocViewer({ filePath, org, onClose, onOpenDoc }: KbDocViewerPr
             </div>
           )}
 
-          {!loading && !error && content !== null && (
+          {!loading && !error && PDF_EXTS.has(fileExt) && (
+            <iframe
+              src={downloadUrl}
+              className="w-full h-full border-0"
+              style={{ minHeight: '70vh' }}
+              title={filename}
+            />
+          )}
+
+          {!loading && !error && IMAGE_EXTS.has(fileExt) && (
+            <div className="p-5 flex flex-col items-center gap-3">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={downloadUrl} alt={filename} className="max-w-full rounded border" />
+              <a
+                href={downloadUrl}
+                download={filename}
+                className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
+              >
+                <IconDownload size={12} /> Download
+              </a>
+            </div>
+          )}
+
+          {!loading && !error && !isBinary && content !== null && (
             <div className="p-5" onClick={handleContentClick}>
               {isMarkdown ? (
                 <div className="prose prose-sm dark:prose-invert max-w-none">
