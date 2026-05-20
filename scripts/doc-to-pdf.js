@@ -88,15 +88,27 @@ const html = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <title>${meta.project || path.basename(resolvedInput, path.extname(resolvedInput))}</title>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
 <style>
+  /* Silvermere palette
+     Primary Gold:  #B8860B  — headings, gold rules, key accents
+     Accent Gold:   #D4AF37  — lighter gold, thead
+     Background:    #FFFFFF
+     Body text:     #1A1A1A
+     Muted bg:      #F8F7F4  — table rows, meta block
+     Muted fg:      #666666  — labels, captions
+     Border:        #E5E0D8  — all rules and borders
+     Font:          Sora (Google Fonts) / system sans-serif fallback
+  */
+
   /* Base */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    font-family: 'Georgia', 'Times New Roman', serif;
+    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
     font-size: 10.5pt;
     line-height: 1.65;
-    color: #111;
+    color: #1A1A1A;
     background: #fff;
     padding: 0;
     margin: 0;
@@ -109,14 +121,40 @@ const html = `<!DOCTYPE html>
     padding: 48px 32px 64px;
   }
 
+  /* Silvermere wordmark header */
+  .brand-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 2px solid #B8860B;
+    padding-bottom: 8px;
+    margin-bottom: 28px;
+  }
+  .brand-name {
+    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
+    font-size: 7pt;
+    font-weight: 700;
+    color: #B8860B;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+  .brand-rule-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #D4AF37;
+  }
+
   /* Front matter meta block */
   .meta-block {
-    border-top: 2px solid #111;
-    border-bottom: 1px solid #ddd;
-    padding: 10px 0;
+    border-top: 1px solid #E5E0D8;
+    border-bottom: 1px solid #E5E0D8;
+    background: #F8F7F4;
+    padding: 10px 12px;
     margin-bottom: 28px;
-    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
     font-size: 8.5pt;
+    border-radius: 2px;
   }
   .meta-row {
     display: flex;
@@ -125,51 +163,51 @@ const html = `<!DOCTYPE html>
   }
   .meta-key {
     font-weight: 600;
-    color: #555;
+    color: #666666;
     min-width: 72px;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
-    font-size: 7.5pt;
+    letter-spacing: 0.06em;
+    font-size: 7pt;
   }
   .meta-val {
-    color: #333;
+    color: #1A1A1A;
   }
 
   /* Headings */
   h1 {
-    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
     font-size: 20pt;
     font-weight: 700;
     line-height: 1.2;
     margin-bottom: 6px;
-    color: #000;
+    color: #1A1A1A;
     letter-spacing: -0.02em;
   }
   h2 {
-    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
     font-size: 13pt;
     font-weight: 700;
     margin-top: 28px;
     margin-bottom: 8px;
-    color: #000;
-    border-bottom: 1px solid #e0e0e0;
+    color: #1A1A1A;
+    border-bottom: 1.5px solid #B8860B;
     padding-bottom: 4px;
   }
   h3 {
-    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
     font-size: 10.5pt;
     font-weight: 700;
     margin-top: 20px;
     margin-bottom: 5px;
-    color: #222;
+    color: #1A1A1A;
   }
   h4, h5, h6 {
-    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
     font-size: 10pt;
     font-weight: 600;
     margin-top: 14px;
     margin-bottom: 4px;
-    color: #333;
+    color: #B8860B;
   }
 
   /* Paragraphs */
@@ -191,18 +229,18 @@ const html = `<!DOCTYPE html>
 
   /* Inline code */
   code {
-    font-family: 'Menlo', 'Consolas', monospace;
+    font-family: 'JetBrains Mono', 'Menlo', 'Consolas', monospace;
     font-size: 8.5pt;
-    background: #f5f5f5;
-    border: 1px solid #e0e0e0;
+    background: #F8F7F4;
+    border: 1px solid #E5E0D8;
     border-radius: 3px;
     padding: 1px 4px;
   }
 
   /* Block code */
   pre {
-    background: #f5f5f5;
-    border: 1px solid #e0e0e0;
+    background: #F8F7F4;
+    border: 1px solid #E5E0D8;
     border-radius: 4px;
     padding: 10px 12px;
     margin: 10px 0;
@@ -219,11 +257,12 @@ const html = `<!DOCTYPE html>
 
   /* Blockquote */
   blockquote {
-    border-left: 3px solid #bbb;
+    border-left: 3px solid #D4AF37;
     margin: 12px 0;
     padding: 4px 12px;
-    color: #555;
+    color: #666666;
     font-style: italic;
+    background: #F8F7F4;
   }
 
   /* Tables */
@@ -232,35 +271,35 @@ const html = `<!DOCTYPE html>
     border-collapse: collapse;
     margin: 12px 0;
     font-size: 9.5pt;
-    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-family: 'Sora', 'Helvetica Neue', Arial, sans-serif;
     page-break-inside: avoid;
   }
   thead {
-    background: #f0f0f0;
+    background: #D4AF37;
   }
   th {
     font-weight: 600;
     text-align: left;
     padding: 6px 10px;
-    border: 1px solid #ccc;
+    border: 1px solid #B8860B;
     font-size: 8.5pt;
     text-transform: uppercase;
-    letter-spacing: 0.03em;
-    color: #333;
+    letter-spacing: 0.04em;
+    color: #ffffff;
   }
   td {
     padding: 6px 10px;
-    border: 1px solid #ddd;
+    border: 1px solid #E5E0D8;
     vertical-align: top;
   }
   tr:nth-child(even) td {
-    background: #fafafa;
+    background: #F8F7F4;
   }
 
   /* Horizontal rule */
   hr {
     border: none;
-    border-top: 1px solid #e0e0e0;
+    border-top: 1px solid #E5E0D8;
     margin: 20px 0;
   }
 
@@ -273,15 +312,14 @@ const html = `<!DOCTYPE html>
     margin-right: 6px;
   }
 
-  /* Links — no underline in print, just colour */
-  a { color: #111; text-decoration: none; }
+  /* Links — gold tint in print */
+  a { color: #B8860B; text-decoration: none; }
 
   /* Page breaks */
   h2 { page-break-after: avoid; }
   h3 { page-break-after: avoid; }
   table { page-break-inside: avoid; }
 
-  /* Footer */
   @page {
     size: A4;
     margin: 18mm 16mm 22mm;
@@ -290,6 +328,10 @@ const html = `<!DOCTYPE html>
 </head>
 <body>
 <div class="page">
+  <div class="brand-header">
+    <span class="brand-name">Silvermere Technology</span>
+    <span class="brand-rule-dot"></span>
+  </div>
   ${metaBlock}
   ${htmlBody}
 </div>
