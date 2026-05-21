@@ -879,10 +879,19 @@ export class AgentManager {
       }
     };
 
+    // Read timezone from per-agent config.json (e.g. "Asia/Dubai").
+    // The daemon process does not inherit CTX_TIMEZONE — it is only set in
+    // agent PTY envs — so falling back to process.env.CTX_TIMEZONE here would
+    // silently use the server system TZ and fire crons at the wrong wall-clock
+    // time (4 h early on Singapore-hosted server with Dubai-configured agents).
+    const agentTimezone = (entry.process['config'] as AgentConfig | undefined)?.timezone
+      ?? process.env.CTX_TIMEZONE;
+
     const scheduler = new CronScheduler({
       agentName,
       onFire,
       logger: (msg) => console.log(`[daemon] ${msg}`),
+      timezone: agentTimezone,
     });
 
     scheduler.start();
