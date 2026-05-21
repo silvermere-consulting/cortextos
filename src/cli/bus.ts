@@ -1874,6 +1874,80 @@ function agentExistsInFramework(agentName: string, frameworkRoot: string): boole
   return false;
 }
 
+/** Find the agent's config.json path by scanning the framework's orgs tree. Returns null if not found. */
+function findAgentConfigPath(agentName: string, frameworkRoot: string): string | null {
+  if (!frameworkRoot) return null;
+  const { existsSync: fsExists, readdirSync: fsReaddir } = require('fs');
+  const { join: pjoin } = require('path');
+  const orgsDir = pjoin(frameworkRoot, 'orgs');
+  if (!fsExists(orgsDir)) return null;
+  try {
+    for (const org of fsReaddir(orgsDir) as string[]) {
+      const configPath = pjoin(orgsDir, org, 'agents', agentName, 'config.json');
+      if (fsExists(configPath)) return configPath;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/** Convert a normalized schedule string back to a config.json crons-array entry. */
+function cronDefToConfigEntry(name: string, schedule: string, prompt: string, desc?: string): Record<string, unknown> {
+  const tokens = schedule.trim().split(/\s+/);
+  const base: Record<string, unknown> = { name, type: 'recurring', prompt };
+  if (tokens.length === 5) {
+    base.cron = schedule;
+  } else {
+    base.interval = schedule;
+  }
+  if (desc) base.description = desc;
+  return base;
+}
+
+/**
+ * Persist a runtime-added cron to config.json so it survives a crons.json wipe and re-migration.
+ * Non-fatal — if config.json is missing or unwritable the add-cron still succeeds.
+ */
+function syncCronToConfig(agentName: string, cron: { name: string; schedule: string; prompt: string; description?: string }, frameworkRoot: string): void {
+  const configPath = findAgentConfigPath(agentName, frameworkRoot);
+  if (!configPath) return;
+  try {
+    const { readFileSync: fsRead } = require('fs');
+    const { atomicWriteSync } = require('../utils/atomic.js');
+    const config = JSON.parse(fsRead(configPath, 'utf-8') as string) as Record<string, unknown>;
+    const entries: Record<string, unknown>[] = Array.isArray(config.crons)
+      ? [...(config.crons as Record<string, unknown>[])]
+      : [];
+    const newEntry = cronDefToConfigEntry(cron.name, cron.schedule, cron.prompt, cron.description);
+    const idx = entries.findIndex((c) => c.name === cron.name);
+    if (idx >= 0) {
+      entries[idx] = newEntry;
+    } else {
+      entries.push(newEntry);
+    }
+    config.crons = entries;
+    atomicWriteSync(configPath, JSON.stringify(config, null, 2));
+  } catch { /* non-fatal */ }
+}
+
+/**
+ * Remove a cron from config.json's crons array when it is deleted at runtime.
+ * Non-fatal — if config.json is missing or unwritable the remove-cron still succeeds.
+ */
+function removeCronFromConfig(agentName: string, cronName: string, frameworkRoot: string): void {
+  const configPath = findAgentConfigPath(agentName, frameworkRoot);
+  if (!configPath) return;
+  try {
+    const { readFileSync: fsRead } = require('fs');
+    const { atomicWriteSync } = require('../utils/atomic.js');
+    const config = JSON.parse(fsRead(configPath, 'utf-8') as string) as Record<string, unknown>;
+    if (!Array.isArray(config.crons)) return;
+    const before = (config.crons as Record<string, unknown>[]).length;
+    config.crons = (config.crons as Record<string, unknown>[]).filter((c) => c.name !== cronName);
+    if ((config.crons as unknown[]).length === before) return; // nothing changed — skip write
+    atomicWriteSync(configPath, JSON.stringify(config, null, 2));
+  } catch { /* non-fatal */ }
+}
+
 /**
  * Format an ISO timestamp for display (shortens to "YYYY-MM-DD HH:mm UTC").
  */
@@ -1934,6 +2008,9 @@ busCommand
       process.exit(1);
     }
 
+    // Persist to config.json so the cron survives a crons.json wipe + re-migration
+    syncCronToConfig(agent, { name: cron.name, schedule: cron.schedule, prompt: cron.prompt, description: cron.description }, env.frameworkRoot);
+
     await signalCronReload(agent, env.instanceId);
     console.log(`Added cron '${name}' for ${agent}`);
   });
@@ -1953,6 +2030,9 @@ busCommand
     }
 
     const env = resolveEnv();
+    // Keep config.json in sync so re-migration doesn't restore a deleted cron
+    removeCronFromConfig(agent, name, env.frameworkRoot);
+
     await signalCronReload(agent, env.instanceId);
     console.log(`Removed cron '${name}' from ${agent}`);
   });
