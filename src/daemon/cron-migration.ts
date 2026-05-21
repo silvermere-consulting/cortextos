@@ -312,10 +312,18 @@ function runMigrationCore(
     log(`Force flag set — cleared migration marker for "${agentName}"`);
   }
 
-  // Idempotency check: already migrated → skip
+  // Idempotency check: already migrated → skip, UNLESS crons.json is empty.
+  // An empty crons.json with a present marker indicates a post-migration wipe —
+  // the marker would otherwise prevent auto-recovery forever.  Delete the marker
+  // and fall through to re-migrate from config.json.
   if (isMigrated(ctxRoot, agentName)) {
-    log(`Skipping migration for "${agentName}" — already migrated`);
-    return { agentName, status: 'skipped-already-migrated' };
+    const liveCrons = readCrons(agentName);
+    if (liveCrons.length > 0) {
+      log(`Skipping migration for "${agentName}" — already migrated`);
+      return { agentName, status: 'skipped-already-migrated' };
+    }
+    deleteMarker(ctxRoot, agentName);
+    log(`crons.json is empty but marker exists for "${agentName}" — re-migrating from config.json`);
   }
 
   // Read config.json — no-op on missing file
