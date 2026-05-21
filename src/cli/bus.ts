@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import { spawnSync, execFileSync } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName } from '../utils/validate.js';
@@ -19,6 +19,7 @@ import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByN
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, syncOAuthFromCredentials, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
+import { atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
@@ -1862,13 +1863,11 @@ function validateSchedule(raw: string): string {
  */
 function agentExistsInFramework(agentName: string, frameworkRoot: string): boolean {
   if (!frameworkRoot) return true; // can't check — allow
-  const { existsSync: fsExists, readdirSync: fsReaddir } = require('fs');
-  const { join: pjoin } = require('path');
-  const orgsDir = pjoin(frameworkRoot, 'orgs');
-  if (!fsExists(orgsDir)) return true; // no orgs dir — allow
+  const orgsDir = join(frameworkRoot, 'orgs');
+  if (!existsSync(orgsDir)) return true; // no orgs dir — allow
   try {
-    for (const org of fsReaddir(orgsDir)) {
-      if (fsExists(pjoin(orgsDir, org, 'agents', agentName))) return true;
+    for (const org of readdirSync(orgsDir)) {
+      if (existsSync(join(orgsDir, org, 'agents', agentName))) return true;
     }
   } catch { /* ignore */ }
   return false;
@@ -1877,14 +1876,12 @@ function agentExistsInFramework(agentName: string, frameworkRoot: string): boole
 /** Find the agent's config.json path by scanning the framework's orgs tree. Returns null if not found. */
 function findAgentConfigPath(agentName: string, frameworkRoot: string): string | null {
   if (!frameworkRoot) return null;
-  const { existsSync: fsExists, readdirSync: fsReaddir } = require('fs');
-  const { join: pjoin } = require('path');
-  const orgsDir = pjoin(frameworkRoot, 'orgs');
-  if (!fsExists(orgsDir)) return null;
+  const orgsDir = join(frameworkRoot, 'orgs');
+  if (!existsSync(orgsDir)) return null;
   try {
-    for (const org of fsReaddir(orgsDir) as string[]) {
-      const configPath = pjoin(orgsDir, org, 'agents', agentName, 'config.json');
-      if (fsExists(configPath)) return configPath;
+    for (const org of readdirSync(orgsDir) as string[]) {
+      const configPath = join(orgsDir, org, 'agents', agentName, 'config.json');
+      if (existsSync(configPath)) return configPath;
     }
   } catch { /* ignore */ }
   return null;
@@ -1911,9 +1908,7 @@ function syncCronToConfig(agentName: string, cron: { name: string; schedule: str
   const configPath = findAgentConfigPath(agentName, frameworkRoot);
   if (!configPath) return;
   try {
-    const { readFileSync: fsRead } = require('fs');
-    const { atomicWriteSync } = require('../utils/atomic.js');
-    const config = JSON.parse(fsRead(configPath, 'utf-8') as string) as Record<string, unknown>;
+    const config = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
     const entries: Record<string, unknown>[] = Array.isArray(config.crons)
       ? [...(config.crons as Record<string, unknown>[])]
       : [];
@@ -1937,9 +1932,7 @@ function removeCronFromConfig(agentName: string, cronName: string, frameworkRoot
   const configPath = findAgentConfigPath(agentName, frameworkRoot);
   if (!configPath) return;
   try {
-    const { readFileSync: fsRead } = require('fs');
-    const { atomicWriteSync } = require('../utils/atomic.js');
-    const config = JSON.parse(fsRead(configPath, 'utf-8') as string) as Record<string, unknown>;
+    const config = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
     if (!Array.isArray(config.crons)) return;
     const before = (config.crons as Record<string, unknown>[]).length;
     config.crons = (config.crons as Record<string, unknown>[]).filter((c) => c.name !== cronName);
