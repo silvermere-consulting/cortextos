@@ -2,13 +2,16 @@
 """Bertha outbound email helper.
 
 Sends from bertha@silvermere.tech via Hostinger SMTP. Always CCs
-steven.barker@silvermereconsulting.com regardless of other recipients.
+steven.barker@silvermereconsulting.com regardless of other recipients,
+UNLESS --no-cc is passed (for system/automated sends like backups that
+must not clutter Steven's inbox).
 
 Usage:
   send-email.py --to recipient@example.com --subject "Hello" --body "Message text"
   send-email.py --to a@b.com --subject "S" --body-file /path/to/body.txt
   send-email.py --to a@b.com --subject "S" --body "Hi" --attach /path/file.pdf
   send-email.py --to a@b.com --subject "S" --body "Hi" --cc c@d.com --cc e@f.com
+  send-email.py --to bertha@silvermere.tech --subject "[BACKUP]..." --body "..." --attach zip --no-cc
 
 Credentials are read from:
   /home/cortext/cortextos/orgs/silvermere-tech/secrets.env
@@ -78,6 +81,8 @@ def main():
                         help="File to attach (repeatable)")
     parser.add_argument("--cc", action="append", default=[], metavar="EMAIL",
                         help="Additional CC address (repeatable); standing CC is always added")
+    parser.add_argument("--no-cc", action="store_true",
+                        help="Skip the standing CC (for system/automated sends only — never use for human comms)")
     args = parser.parse_args()
 
     try:
@@ -102,9 +107,11 @@ def main():
     else:
         body = args.body
 
-    # Standing CC is always added and cannot be removed
+    # Standing CC is always added for human-facing comms.
+    # --no-cc bypasses it for system/automated sends (backups, cron jobs).
     cc_set = set(args.cc)
-    cc_set.add(STANDING_CC)
+    if not args.no_cc:
+        cc_set.add(STANDING_CC)
     cc_list = sorted(cc_set)
 
     for path in args.attach:
