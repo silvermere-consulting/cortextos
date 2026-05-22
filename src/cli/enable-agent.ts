@@ -1,6 +1,6 @@
 import { Command } from 'commander';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
+import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI, formatValidateError } from '../telegram/api.js';
@@ -112,6 +112,16 @@ export function writeDisableMarker(instanceId: string, agent: string, reason: st
   } catch { /* don't block disable on marker-write failure */ }
 }
 
+function syncConfigEnabled(agentDir: string, enabled: boolean): void {
+  try {
+    const configPath = join(agentDir, 'config.json');
+    if (!existsSync(configPath)) return;
+    const config = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+    config.enabled = enabled;
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+  } catch { /* non-fatal */ }
+}
+
 function writeEnabledAgents(instanceId: string, agents: Record<string, any>): void {
   const path = getEnabledAgentsPath(instanceId);
   const dir = join(homedir(), '.cortextos', instanceId, 'config');
@@ -135,7 +145,6 @@ export const enableAgentCommand = new Command('enable')
       const orgsDir = join(projectRoot, 'orgs');
       if (existsSync(orgsDir)) {
         try {
-          const { readdirSync } = require('fs');
           const orgs = readdirSync(orgsDir, { withFileTypes: true })
             .filter((d: any) => d.isDirectory())
             .map((d: any) => d.name);
@@ -227,6 +236,7 @@ export const enableAgentCommand = new Command('enable')
       ...(options.org ? { org: options.org } : {}),
     };
     writeEnabledAgents(options.instance, agents);
+    syncConfigEnabled(dirname(agentEnvPath), true);
 
     // Create per-agent state directories
     const ctxRoot = join(homedir(), '.cortextos', options.instance);
@@ -267,6 +277,16 @@ export const disableAgentCommand = new Command('disable')
       agents[agent].enabled = false;
     }
     writeEnabledAgents(options.instance, agents);
+
+    // Sync enabled:false to config.json so the two files don't drift
+    const projectRoot = discoverProjectRoot();
+    const savedOrg: string | undefined = agents[agent]?.org ? String(agents[agent].org) : undefined;
+    const agentDirCandidates = savedOrg
+      ? [join(projectRoot, 'orgs', savedOrg, 'agents', agent), join(projectRoot, 'agents', agent)]
+      : [join(projectRoot, 'agents', agent)];
+    for (const candidate of agentDirCandidates) {
+      if (existsSync(candidate)) { syncConfigEnabled(candidate, false); break; }
+    }
 
     // Try to stop via daemon IPC
     const ipc = new IPCClient(options.instance);
