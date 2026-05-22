@@ -34,13 +34,17 @@ interface CronsFile {
 /**
  * Resolve the absolute path to an agent's crons.json.
  *
- * Uses CTX_ROOT env var when available (production), otherwise falls back to
- * a path relative to process.cwd() so tests can supply their own root via
- * process.env.CTX_ROOT pointing to a tempdir.
+ * Uses the explicit `ctxRoot` arg when provided (callers that manage their
+ * own state root, e.g. cron-migration), then falls back to the CTX_ROOT env
+ * var (production), then process.cwd() (last resort).
+ *
+ * The explicit param closes the path-divergence bug in runMigrationCore where
+ * isMigrated/writeMarker used the ctxRoot param but writeCrons/readCrons read
+ * process.env.CTX_ROOT — causing live-path writes when the two differed.
  */
-function cronsFilePath(agentName: string): string {
-  const ctxRoot = process.env.CTX_ROOT ?? process.cwd();
-  return join(ctxRoot, CRONS_DIRECTORY, agentName, CRONS_FILENAME);
+function cronsFilePath(agentName: string, ctxRoot?: string): string {
+  const root = ctxRoot ?? process.env.CTX_ROOT ?? process.cwd();
+  return join(root, CRONS_DIRECTORY, agentName, CRONS_FILENAME);
 }
 
 /**
@@ -127,8 +131,8 @@ export interface CronsReadResult {
  * distinguish "legitimately empty" from "catastrophic corruption" (see
  * {@link CronsReadResult}).
  */
-export function readCronsWithStatus(agentName: string): CronsReadResult {
-  const filePath = cronsFilePath(agentName);
+export function readCronsWithStatus(agentName: string, ctxRoot?: string): CronsReadResult {
+  const filePath = cronsFilePath(agentName, ctxRoot);
   if (!existsSync(filePath)) {
     return { crons: [], corrupt: false };
   }
@@ -182,8 +186,8 @@ export function readCronsWithStatus(agentName: string): CronsReadResult {
  *          NOTE: this loses the corrupt-vs-legitimately-empty distinction —
  *          use {@link readCronsWithStatus} when that matters.
  */
-export function readCrons(agentName: string): CronDefinition[] {
-  return readCronsWithStatus(agentName).crons;
+export function readCrons(agentName: string, ctxRoot?: string): CronDefinition[] {
+  return readCronsWithStatus(agentName, ctxRoot).crons;
 }
 
 /**
@@ -194,8 +198,8 @@ export function readCrons(agentName: string): CronDefinition[] {
  * preserved as `crons.json.bak` before the new file is written.  This enables
  * automatic recovery in `readCrons()` on parse failure.
  */
-export function writeCrons(agentName: string, crons: CronDefinition[]): void {
-  const filePath = cronsFilePath(agentName);
+export function writeCrons(agentName: string, crons: CronDefinition[], ctxRoot?: string): void {
+  const filePath = cronsFilePath(agentName, ctxRoot);
   const envelope: CronsFile = {
     updated_at: new Date().toISOString(),
     crons,

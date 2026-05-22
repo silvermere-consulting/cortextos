@@ -317,7 +317,7 @@ function runMigrationCore(
   // the marker would otherwise prevent auto-recovery forever.  Delete the marker
   // and fall through to re-migrate from config.json.
   if (isMigrated(ctxRoot, agentName)) {
-    const liveCrons = readCrons(agentName);
+    const liveCrons = readCrons(agentName, ctxRoot);
     if (liveCrons.length > 0) {
       log(`Skipping migration for "${agentName}" — already migrated`);
       return { agentName, status: 'skipped-already-migrated' };
@@ -329,7 +329,7 @@ function runMigrationCore(
   // Read config.json — no-op on missing file
   if (!existsSync(configJsonPath)) {
     log(`No config.json found for "${agentName}" at ${configJsonPath} — writing empty crons.json + marker`);
-    writeCrons(agentName, []);
+    writeCrons(agentName, [], ctxRoot);
     writeMarker(ctxRoot, agentName);
     return { agentName, status: 'no-config' };
   }
@@ -344,7 +344,7 @@ function runMigrationCore(
       `WARNING: failed to parse config.json for "${agentName}" — writing empty crons.json + marker. ` +
         `Error: ${err instanceof Error ? err.message : String(err)}`,
     );
-    writeCrons(agentName, []);
+    writeCrons(agentName, [], ctxRoot);
     writeMarker(ctxRoot, agentName);
     return { agentName, status: 'no-crons' };
   }
@@ -362,7 +362,7 @@ function runMigrationCore(
 
   if (configCrons.length === 0) {
     log(`No crons array in config.json for "${agentName}" — writing empty crons.json + marker`);
-    writeCrons(agentName, []);
+    writeCrons(agentName, [], ctxRoot);
     writeMarker(ctxRoot, agentName);
     return { agentName, status: 'no-crons' };
   }
@@ -383,7 +383,7 @@ function runMigrationCore(
   }
 
   // Write crons.json atomically and set marker
-  writeCrons(agentName, converted);
+  writeCrons(agentName, converted, ctxRoot);
   writeMarker(ctxRoot, agentName);
 
   log(
