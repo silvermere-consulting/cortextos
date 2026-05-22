@@ -150,7 +150,7 @@ describe('checkUsageApi', () => {
       text: async () => 'Unauthorized',
     });
 
-    await expect(checkUsageApi(tmpDir, { force: true })).rejects.toThrow('401');
+    await expect(checkUsageApi(tmpDir, { force: true, account: 'primary' })).rejects.toThrow('401');
   });
 
   it('uses Bearer token from active account', async () => {

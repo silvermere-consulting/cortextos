@@ -700,7 +700,7 @@ describe('Scenario 4: Support troubleshooting missing crons', () => {
     expect(isMigrated(tmpRoot, agent)).toBe(true);
   });
 
-  it('4e: stale .migrated marker without crons.json — force re-migration recovers crons', () => {
+  it('4e: stale .migrated marker without crons.json — auto-recovery re-migrates without --force', () => {
     const agent = 'stale-marker-agent';
 
     // Simulate: marker exists but crons.json was deleted (stale marker scenario)
@@ -710,10 +710,9 @@ describe('Scenario 4: Support troubleshooting missing crons', () => {
 
     // crons.json is missing
     expect(existsSync(cronsJsonPath(agent))).toBe(false);
-    // But isMigrated returns true (stale marker fools it)
+    // isMigrated returns true (stale marker)
     expect(isMigrated(tmpRoot, agent)).toBe(true);
 
-    // Without force: migration skipped (stale marker blocks it)
     const agentDir = join(tmpRoot, 'orgs', 'lifeos', 'agents', agent);
     mkdirSync(agentDir, { recursive: true });
     const configJsonPath = join(agentDir, 'config.json');
@@ -721,12 +720,10 @@ describe('Scenario 4: Support troubleshooting missing crons', () => {
       crons: [{ name: 'hb', type: 'recurring', interval: '1h', prompt: 'Heartbeat.' }],
     }), 'utf-8');
 
+    // Marker-trap recovery: missing crons.json + existing marker triggers auto-re-migration
+    // (no --force needed — the empty/missing state is the recovery signal)
     const r1 = migrateCronsForAgent(agent, configJsonPath, tmpRoot, { log: () => {} });
-    expect(r1.status).toBe('skipped-already-migrated');
-
-    // With --force: marker removed, migration runs, crons.json created
-    const r2 = migrateCronsForAgent(agent, configJsonPath, tmpRoot, { force: true, log: () => {} });
-    expect(r2.status).toBe('migrated');
+    expect(r1.status).toBe('migrated');
     expect(existsSync(cronsJsonPath(agent))).toBe(true);
     expect(readCrons(agent)).toHaveLength(1);
   });

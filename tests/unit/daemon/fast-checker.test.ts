@@ -105,7 +105,7 @@ describe('FastChecker', () => {
       const activityApi = createMockTelegramApi();
       const checker = new FastChecker(agent, paths, '/tmp/framework', {
         telegramApi: activityApi,
-        allowedUserId: 42,
+        allowedUserIds: new Set([42]),
       });
 
       const query = createCallbackQuery(`appr_allow_${approvalId}`, {
@@ -138,7 +138,7 @@ describe('FastChecker', () => {
       const activityApi = createMockTelegramApi();
       const checker = new FastChecker(agent, paths, '/tmp/framework', {
         telegramApi: activityApi,
-        allowedUserId: 42,
+        allowedUserIds: new Set([42]),
       });
 
       const query = createCallbackQuery(`appr_deny_${approvalId}`, {
@@ -163,7 +163,7 @@ describe('FastChecker', () => {
       const activityApi = createMockTelegramApi();
       const checker = new FastChecker(agent, paths, '/tmp/framework', {
         telegramApi: activityApi,
-        allowedUserId: 42,
+        allowedUserIds: new Set([42]),
       });
 
       const query = createCallbackQuery(`appr_allow_${approvalId}`, {
@@ -184,7 +184,7 @@ describe('FastChecker', () => {
       const activityApi = createMockTelegramApi();
       const checker = new FastChecker(agent, paths, '/tmp/framework', {
         telegramApi: activityApi,
-        allowedUserId: 42,
+        allowedUserIds: new Set([42]),
       });
 
       const query = createCallbackQuery('appr_allow_approval_1_ghost', {
@@ -208,7 +208,7 @@ describe('FastChecker', () => {
       const activityApi = createMockTelegramApi();
       const checker = new FastChecker(agent, paths, '/tmp/framework', {
         telegramApi: activityApi,
-        allowedUserId: 42,
+        allowedUserIds: new Set([42]),
       });
 
       // The activity-channel poller only ever posts appr_* buttons, but
