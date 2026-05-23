@@ -21,6 +21,12 @@
       "type": "recurring",
       "interval": "4h",
       "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, and work on your highest priority task."
+    },
+    {
+      "name": "daily-restart",
+      "prompt": "Daily scheduled hard restart to clear context and rotate session. Run: cortextos bus hard-restart --reason 'daily scheduled restart'",
+      "schedule": "0 4 * * *",
+      "enabled": true
     }
   ],
   "model": "{{model}}",

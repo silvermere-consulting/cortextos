@@ -25,7 +25,7 @@
       "name": "check-approvals",
       "type": "recurring",
       "interval": "2h",
-      "prompt": "Check for pending approvals and human tasks. (1) cortextos bus list-approvals --format json — for any pending approval older than 1h, send user a Telegram reminder. (2) cortextos bus list-tasks --project human-tasks --status pending — for any [HUMAN] task pending >4h, send user a Telegram reminder with the task title and what's blocked. ACK any approval/human-task inbox messages."
+      "prompt": "Check for pending approvals and human tasks. (1) cortextos bus list-approvals --format json \u2014 for any pending approval older than 1h, send user a Telegram reminder. (2) cortextos bus list-tasks --project human-tasks --status pending \u2014 for any [HUMAN] task pending >4h, send user a Telegram reminder with the task title and what's blocked. ACK any approval/human-task inbox messages."
     },
     {
       "name": "morning-review",
@@ -44,9 +44,17 @@
       "type": "recurring",
       "cron": "0 8 * * 0",
       "prompt": "Read .claude/skills/weekly-review/SKILL.md and run the full weekly review. Review all agent outputs, evaluate performance, plan next week."
+    },
+    {
+      "name": "daily-restart",
+      "prompt": "Daily scheduled hard restart to clear context and rotate session. Run: cortextos bus hard-restart --reason 'daily scheduled restart'",
+      "schedule": "0 4 * * *",
+      "enabled": true
     }
   ],
   "ecosystem": {
-    "local_version_control": { "enabled": true }
+    "local_version_control": {
+      "enabled": true
+    }
   }
 }
