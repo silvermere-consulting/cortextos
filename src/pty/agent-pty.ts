@@ -157,6 +157,17 @@ export class AgentPTY {
     // don't send the key sequence multiple times.
     let bypassAccepted = false;
 
+    // Detect the bypass-permissions warning across known wording variants
+    // (audit 2026-05-22 row #4 — engineer hung ~10min after a model-change
+    // restart because the prompt rendered late/with different text and the
+    // old detector missed it).
+    const detectsBypassPrompt = (buffer: string): boolean => {
+      const cleaned = buffer.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+      return /No,?\s*exit/i.test(cleaned) ||
+             /Yes,?\s*I\s*accept/i.test(cleaned) ||
+             /Bypass\s*Permissions/i.test(cleaned);
+    };
+
     // Set up output capture
     this.pty.onData((data: string) => {
       this.outputBuffer.push(data);
@@ -165,13 +176,10 @@ export class AgentPTY {
       // The prompt defaults to option 1 "No, exit" — we must press Down then Enter
       // to reach option 2 "Yes, I accept". Using onData (not setTimeout) because
       // the agent exits in under 2s if nothing responds.
-      if (!bypassAccepted && this.pty) {
-        const cleaned = data.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
-        if (cleaned.includes('No,exit') || cleaned.includes('No, exit')) {
-          bypassAccepted = true;
-          // Small delay so the PTY finishes rendering before we send input
-          setTimeout(() => { this.pty?.write('\x1b[B\r'); }, 100);
-        }
+      if (!bypassAccepted && this.pty && detectsBypassPrompt(data)) {
+        bypassAccepted = true;
+        // Small delay so the PTY finishes rendering before we send input
+        setTimeout(() => { this.pty?.write('\x1b[B\r'); }, 100);
       }
     });
 
@@ -186,16 +194,20 @@ export class AgentPTY {
 
     // Claude Code shows a "trust this folder?" prompt on first run in a new directory.
     // Auto-accept by sending Enter after the prompt appears.
-    // The prompt takes ~3-5s to render; we send Enter at 5s and 8s for reliability.
     //
     // Claude Code also shows a "Bypass Permissions mode" warning on first run with
     // --dangerously-skip-permissions. That prompt defaults to option 1 "No, exit",
     // so we must press Down (\x1b[B) to reach option 2 "Yes, I accept" before Enter.
+    //
+    // Audit 2026-05-22 row #4: model-change restart tripped this halt because the
+    // old 2s/5s/8s schedule fired before the prompt rendered (first-use of a new
+    // model adds latency). Retry schedule widened to cover ~60s; detection
+    // updated to match any of {No, exit / Yes, I accept / Bypass Permissions}.
     const acceptPrompt = () => {
       if (!this.pty) return;
       const recent = this.outputBuffer.getRecent();
       const cleaned = recent.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
-      if (cleaned.includes('No,exit') || cleaned.includes('No, exit')) {
+      if (detectsBypassPrompt(recent)) {
         // Bypass permissions prompt: "No, exit" is option 1 (default highlight).
         // Press Down to move to "Yes, I accept", then Enter to confirm.
         this.pty.write('\x1b[B\r');
@@ -203,9 +215,9 @@ export class AgentPTY {
         this.pty.write('\r');
       }
     };
-    setTimeout(acceptPrompt, 2000);
-    setTimeout(acceptPrompt, 5000);
-    setTimeout(acceptPrompt, 8000);
+    for (const ms of [2000, 5000, 8000, 12000, 18000, 25000, 35000, 50000]) {
+      setTimeout(acceptPrompt, ms);
+    }
   }
 
   /**
