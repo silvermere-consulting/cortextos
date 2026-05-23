@@ -1,0 +1,15 @@
+{
+  "updated_at": "2026-05-22T08:00:00.000Z",
+  "crons": [
+    {
+      "name": "heartbeat",
+      "schedule": "1h",
+      "prompt": "TEST HEARTBEAT"
+    },
+    {
+      "name": "nightly-test",
+      "schedule": "0 2 * * *",
+      "prompt": "TEST NIGHTLY"
+    }
+  ]
+}
