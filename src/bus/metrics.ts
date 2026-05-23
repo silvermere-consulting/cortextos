@@ -16,6 +16,14 @@ export interface AgentMetrics {
   tasks_pending: number;
   tasks_in_progress: number;
   errors_today: number;
+  /**
+   * Real compaction count — number of `metric/compaction_started` events
+   * emitted by hook-compact-telegram on PreCompact for this agent today.
+   * Replaces the audit-retired log-grep proxy which counted occurrences of
+   * the literal word "compact" in stdout and drifted arbitrarily (~1700 vs
+   * reality ~0). See utils audit-doc row #2.
+   */
+  compactions_today: number;
   heartbeat_stale: boolean;
 }
 
@@ -98,6 +106,22 @@ function isErrorEvent(line: string): boolean {
   return evt.severity === 'error' || evt.severity === 'critical';
 }
 
+/**
+ * Decide whether a JSONL event line is a compaction-started event from the
+ * PreCompact hook. Counts only ground-truth fires — the previous log-grep
+ * proxy counted the status-line UI text "compact" and drifted by orders of
+ * magnitude. See audit doc row #2.
+ */
+function isCompactionEvent(line: string): boolean {
+  let evt: { category?: unknown; event?: unknown };
+  try {
+    evt = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  return evt.category === 'metric' && evt.event === 'compaction_started';
+}
+
 export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
   const timestamp = new Date().toISOString();
   const today = timestamp.split('T')[0];
@@ -163,6 +187,7 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
     // `"category":"error"` inside a metadata payload, and only count
     // events where severity is genuinely error-level.
     let errorsToday = 0;
+    let compactionsToday = 0;
     const eventPaths = [
       join(ctxRoot, 'analytics', 'events', agent, `${today}.jsonl`),
     ];
@@ -173,7 +198,10 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       if (existsSync(eventFile)) {
         try {
           const lines = readFileSync(eventFile, 'utf-8').split('\n').filter(Boolean);
-          errorsToday += lines.filter(line => isErrorEvent(line)).length;
+          for (const line of lines) {
+            if (isErrorEvent(line)) errorsToday++;
+            if (isCompactionEvent(line)) compactionsToday++;
+          }
         } catch { /* skip */ }
       }
     }
@@ -197,6 +225,7 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       tasks_pending: pending,
       tasks_in_progress: inProgress,
       errors_today: errorsToday,
+      compactions_today: compactionsToday,
       heartbeat_stale: heartbeatStale,
     };
   }

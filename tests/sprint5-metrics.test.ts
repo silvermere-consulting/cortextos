@@ -129,6 +129,48 @@ describe('Sprint 5: Observability & Metrics', () => {
       expect(report.agents.bot1.errors_today).toBe(2);
     });
 
+    it('counts compaction events from event logs (ground-truth, replaces grep proxy)', () => {
+      // Audit doc row #2: the old "context packed ~1700 times today" figure
+      // came from a log-grep that counted the literal word "compact" in the
+      // status-line UI text. This test verifies the real count: hook-fired
+      // metric/compaction_started events from the day's event JSONL.
+      writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), JSON.stringify({ bot1: { enabled: true } }), 'utf-8');
+      mkdirSync(join(ctxRoot, 'state', 'bot1'), { recursive: true });
+
+      const today = new Date().toISOString().split('T')[0];
+      const eventDir = join(ctxRoot, 'analytics', 'events', 'bot1');
+      mkdirSync(eventDir, { recursive: true });
+      writeFileSync(join(eventDir, `${today}.jsonl`), [
+        '{"category":"metric","event":"compaction_started","severity":"info","metadata":{"used_percentage":91}}',
+        '{"category":"heartbeat","event":"agent_heartbeat","severity":"info"}',
+        '{"category":"metric","event":"compaction_started","severity":"info","metadata":{"used_percentage":94}}',
+        '{"category":"metric","event":"compaction_started","severity":"info"}',
+        // Decoys: category=metric but not compaction; and event=compaction_started
+        // under a non-metric category (should NOT count).
+        '{"category":"metric","event":"usage_sample","severity":"info"}',
+        '{"category":"action","event":"compaction_started","severity":"info"}',
+      ].join('\n'), 'utf-8');
+
+      const report = collectMetrics(ctxRoot);
+      expect(report.agents.bot1.compactions_today).toBe(3);
+    });
+
+    it('compactions_today is 0 when the day has no compaction events', () => {
+      writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), JSON.stringify({ bot1: { enabled: true } }), 'utf-8');
+      mkdirSync(join(ctxRoot, 'state', 'bot1'), { recursive: true });
+
+      const today = new Date().toISOString().split('T')[0];
+      const eventDir = join(ctxRoot, 'analytics', 'events', 'bot1');
+      mkdirSync(eventDir, { recursive: true });
+      writeFileSync(join(eventDir, `${today}.jsonl`), [
+        '{"category":"heartbeat","event":"agent_heartbeat","severity":"info"}',
+        '{"category":"task","event":"task_completed","severity":"info"}',
+      ].join('\n'), 'utf-8');
+
+      const report = collectMetrics(ctxRoot);
+      expect(report.agents.bot1.compactions_today).toBe(0);
+    });
+
     it('does NOT count info-severity events even when category=error (Frank false-positive case)', () => {
       writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), JSON.stringify({ bot1: { enabled: true } }), 'utf-8');
       mkdirSync(join(ctxRoot, 'state', 'bot1'), { recursive: true });
