@@ -2,6 +2,28 @@ import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import type { Heartbeat, BusPaths } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { readCrons } from './crons.js';
+
+/**
+ * Look up the agent's `heartbeat` cron schedule string from crons.json so we
+ * can stamp `loop_interval` on every heartbeat write. Returns '' if there is
+ * no heartbeat cron or the schedule isn't an interval expression — the
+ * staleness calculator (utils/heartbeat-staleness.ts) handles that case via
+ * its fallback.
+ *
+ * Resolves the audit's writer-false-STALE finding: relying on callers to pass
+ * --loop-interval left the field empty for any agent whose heartbeat cron
+ * fired without it.
+ */
+function resolveLoopInterval(agentName: string): string {
+  try {
+    const crons = readCrons(agentName);
+    const heartbeatCron = crons.find(c => c.name === 'heartbeat');
+    return heartbeatCron?.schedule ?? '';
+  } catch {
+    return '';
+  }
+}
 
 /**
  * Update heartbeat for the current agent.
@@ -27,7 +49,7 @@ export function updateHeartbeat(
     current_task: options?.currentTask ?? '',
     mode,
     last_heartbeat: ts,
-    loop_interval: options?.loopInterval ?? '',
+    loop_interval: options?.loopInterval ?? resolveLoopInterval(agentName),
   };
 
   atomicWriteSync(

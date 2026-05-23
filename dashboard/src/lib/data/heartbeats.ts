@@ -7,8 +7,33 @@ import { CTX_ROOT, getHeartbeatPath } from '@/lib/config';
 import type { Heartbeat, HealthStatus, AgentHealth, HealthSummary } from '@/lib/types';
 
 // Default staleness thresholds (minutes)
-const STALE_THRESHOLD_MIN = 300; // 5 hours
+const STALE_THRESHOLD_MIN = 300; // 5 hours — fallback only, used when loop_interval is empty/unparseable
 const DOWN_THRESHOLD_MIN = 1440; // 24 hours
+
+// --- Per-agent-interval-aware staleness ---
+// Mirrors src/utils/heartbeat-staleness.ts (intentionally duplicated — the
+// dashboard package can't easily share modules with bus src/). If you change
+// the algorithm here, update the canonical source too.
+const STALENESS_MULTIPLIER = 2;
+
+function parseIntervalMs(interval: string | undefined | null): number | null {
+  if (!interval) return null;
+  const m = interval.trim().match(/^(\d+)\s*([smhd])$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  switch (m[2].toLowerCase()) {
+    case 's': return n * 1000;
+    case 'm': return n * 60 * 1000;
+    case 'h': return n * 60 * 60 * 1000;
+    case 'd': return n * 24 * 60 * 60 * 1000;
+    default: return null;
+  }
+}
+
+function stalenessThresholdMin(loopInterval: string | undefined | null): number {
+  const ms = parseIntervalMs(loopInterval);
+  return ms !== null ? (ms * STALENESS_MULTIPLIER) / (60 * 1000) : STALE_THRESHOLD_MIN;
+}
 
 /**
  * Get heartbeat for a single agent. Returns null if not found.
@@ -82,10 +107,13 @@ export function computeHealth(
 
 /**
  * Check whether an agent heartbeat is healthy (not stale).
+ * If thresholdMinutes is passed explicitly (e.g. from the settings-tab UI
+ * override) it is honoured as a flat cap; otherwise the per-heartbeat
+ * loop_interval drives the threshold (> 2 × interval).
  */
 export function isAgentHealthy(
   heartbeat: Heartbeat,
-  thresholdMinutes: number = STALE_THRESHOLD_MIN
+  thresholdMinutes?: number
 ): boolean {
   if (!heartbeat.last_heartbeat) return false;
 
@@ -93,11 +121,14 @@ export function isAgentHealthy(
   const now = Date.now();
   const diffMinutes = (now - lastBeat) / (1000 * 60);
 
-  return diffMinutes <= thresholdMinutes;
+  const threshold = thresholdMinutes ?? stalenessThresholdMin(heartbeat.loop_interval);
+  return diffMinutes <= threshold;
 }
 
 /**
  * Get detailed health status (healthy / stale / down).
+ * Healthy threshold = per-agent (2 × loop_interval, fallback 5h).
+ * Down threshold = flat 24h (orders of magnitude beyond any agent's cadence).
  */
 export function getHealthStatus(heartbeat: Heartbeat): HealthStatus {
   if (!heartbeat.last_heartbeat) return 'down';
@@ -105,8 +136,9 @@ export function getHealthStatus(heartbeat: Heartbeat): HealthStatus {
   const lastBeat = new Date(heartbeat.last_heartbeat).getTime();
   const now = Date.now();
   const diffMinutes = (now - lastBeat) / (1000 * 60);
+  const staleThreshold = stalenessThresholdMin(heartbeat.loop_interval);
 
-  if (diffMinutes <= STALE_THRESHOLD_MIN) return 'healthy';
+  if (diffMinutes <= staleThreshold) return 'healthy';
   if (diffMinutes <= DOWN_THRESHOLD_MIN) return 'stale';
   return 'down';
 }

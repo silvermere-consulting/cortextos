@@ -16,6 +16,7 @@ import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
+import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, syncOAuthFromCredentials, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
@@ -503,7 +504,8 @@ busCommand
     }
 
     for (const hb of heartbeats) {
-      const stale = new Date(hb.last_heartbeat) < new Date(Date.now() - 2 * 60 * 60 * 1000);
+      // Per-agent-interval-aware staleness — see utils/heartbeat-staleness.ts.
+      const stale = isHeartbeatStale(hb.last_heartbeat, hb.loop_interval);
       const staleFlag = stale ? ' [STALE]' : '';
       const label = hb.display_name ? `${hb.display_name} (${hb.agent})` : hb.agent;
       console.log(`${label} (${hb.org}) — ${hb.status}${staleFlag} — last seen ${hb.last_heartbeat}`);
