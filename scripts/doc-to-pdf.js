@@ -83,6 +83,13 @@ const metaLines = ['Date', 'Author', 'Purpose', 'Status']
   .join('');
 const metaBlock = metaLines ? `<div class="meta-block">${metaLines}</div>` : '';
 
+// brand_mode: default (or omitted) = Silvermere wordmark + gold rule; "soft" = suppress both
+const brandMode = (meta.brand_mode || meta.brandMode || 'default').toLowerCase();
+const brandHeader = brandMode === 'soft' ? '' : `<div class="brand-header">
+    <span class="brand-name">Silvermere Technology</span>
+    <span class="brand-rule-dot"></span>
+  </div>`;
+
 const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -329,10 +336,7 @@ const html = `<!DOCTYPE html>
 </head>
 <body>
 <div class="page">
-  <div class="brand-header">
-    <span class="brand-name">Silvermere Technology</span>
-    <span class="brand-rule-dot"></span>
-  </div>
+  ${brandHeader}
   ${metaBlock}
   ${htmlBody}
 </div>
