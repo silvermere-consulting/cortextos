@@ -144,9 +144,9 @@ echo "$EXISTING" | jq \
 
 ### Step 10: Configure heartbeat
 
-My heartbeat cron runs every 4 hours and includes a system health check (Step 3 — checks all agent heartbeats). Confirm with the user:
+My heartbeat cron runs every 1 hour and includes a system health check (Step 3 — checks all agent heartbeats). Confirm with the user:
 
-> "My heartbeat runs every 4 hours and checks all agent health on each cycle. I flag agents silent for more than 5 hours and alert the orchestrator if something is unresponsive for 8+ hours. Does that cadence work for you?"
+> "My heartbeat runs every 1 hour and checks all agent health on each cycle. I flag and alert the orchestrator if any agent is silent for more than 3 hours. Does that cadence work for you?"
 
 If the user wants more frequent monitoring (e.g., every 2 hours), update the heartbeat cron via the bus:
 ```bash
@@ -239,7 +239,7 @@ cortextos bus add-cron $CTX_AGENT_NAME nightly-metrics 24h Run cortextos bus col
 Do NOT use `/loop` for these crons — persistent crons survive restarts automatically.
 
 **Ask about additional crons:**
-> "I have a heartbeat cycle every 4 hours and nightly metrics collection. Want me to add any other recurring checks? For example: daily reports, integration health checks, custom monitoring."
+> "I have a heartbeat cycle every 1 hour and nightly metrics collection. Want me to add any other recurring checks? For example: daily reports, integration health checks, custom monitoring."
 
 For each additional cron the user requests:
 ```bash

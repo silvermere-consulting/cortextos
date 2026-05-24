@@ -41,7 +41,7 @@ export interface Heartbeat {
   current_task?: string;
   mode?: string;
   last_heartbeat?: string; // ISO timestamp
-  loop_interval?: number;
+  loop_interval?: string;
   uptime_seconds?: number;
 }
 

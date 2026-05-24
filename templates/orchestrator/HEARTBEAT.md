@@ -1,6 +1,6 @@
 # Heartbeat Checklist - EXECUTE EVERY STEP. SKIP NOTHING.
 
-This runs on your heartbeat cron (every 4 hours). Execute EVERY step in order.
+This runs on your heartbeat cron (every 1 hour). Execute EVERY step in order.
 Skipping steps = broken system. The dashboard monitors your compliance.
 
 ## Step 1: Update heartbeat (DO THIS FIRST)
@@ -52,7 +52,7 @@ cortextos bus list-approvals --format json 2>/dev/null
 cortextos bus list-tasks --project human-tasks --status pending 2>/dev/null
 ```
 
-For each agent: if heartbeat is older than 5 hours, send an alert to that agent and flag in memory.
+For each agent: if heartbeat is older than 3 hours, send an alert to that agent and flag in memory.
 
 For any pending approval older than 4 hours: ping the user via Telegram.
 For any [HUMAN] task pending longer than 4 hours: ping the user via Telegram.

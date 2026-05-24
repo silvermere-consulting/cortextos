@@ -186,7 +186,7 @@ Before moving on to knowledge base setup, check if the user is migrating from an
 After workflows and tools are configured:
 
 12. **Confirm heartbeat cadence:**
-    > "My heartbeat runs every 4 hours and flags in-progress tasks with no updates after 2 hours. Does that work, or do you want a longer window for your type of work?"
+    > "My heartbeat runs every 1 hour and flags in-progress tasks with no updates after 2 hours. Does that work, or do you want a longer window for your type of work?"
 
     If the user wants a different heartbeat interval, update the heartbeat cron interval:
     ```bash

@@ -1,6 +1,6 @@
 # Heartbeat Checklist - EXECUTE EVERY STEP. SKIP NOTHING.
 
-This runs on your heartbeat cron (every 4 hours). Execute EVERY step in order.
+This runs on your heartbeat cron (every 1 hour). Execute EVERY step in order.
 Skipping steps = broken system. The dashboard monitors your compliance.
 
 ## Step 1: Update heartbeat (DO THIS FIRST)
@@ -37,22 +37,22 @@ Target: 0 un-ACK'd messages after this step.
 Full reference: `.claude/skills/agent-management/SKILL.md`
 
 ```bash
-# Check all agent heartbeats — flag any silent for >5 hours
+# Check all agent heartbeats — flag any silent for >3 hours
 cortextos bus read-all-heartbeats
 
 # Check for agents with no recent activity
 cortextos bus list-tasks --status in_progress 2>/dev/null | head -20
 ```
 
-For each agent: if heartbeat is older than 5 hours, send a message to that agent:
+For each agent: if heartbeat is older than 3 hours, send a message to that agent:
 ```bash
-cortextos bus send-message <agent_name> normal "Heartbeat check: are you running? Last heartbeat was more than 5 hours ago."
+cortextos bus send-message <agent_name> normal "Heartbeat check: are you running? Last heartbeat was more than 3 hours ago."
 ```
 
-If an agent is unresponsive for >8 hours, notify the orchestrator and log the issue:
+If an agent is unresponsive for >3 hours, notify the orchestrator and log the issue:
 ```bash
-cortextos bus send-message $CTX_ORCHESTRATOR_AGENT normal "Agent <name> appears unresponsive — last heartbeat >8h ago. May need restart."
-cortextos bus log-event action agent_unresponsive warning --meta '{"agent":"<name>","hours_silent":8}'
+cortextos bus send-message $CTX_ORCHESTRATOR_AGENT normal "Agent <name> appears unresponsive — last heartbeat >3h ago. May need restart."
+cortextos bus log-event action agent_unresponsive warning --meta '{"agent":"<name>","hours_silent":3}'
 ```
 
 ## Step 3b: Check own task queue + stale task detection

@@ -71,7 +71,7 @@ Send via Telegram:
 > - Every morning I send you a briefing covering overnight agent work, today's priorities, and tasks dispatched to your team
 > - Every evening I send a day summary and propose overnight work for your agents
 > - I cascade your daily focus to every agent each morning - that means I write their goals based on what you tell me you want done
-> - I monitor all agents every 4 hours and alert you if anything is stalled, blocked, or broken
+> - I monitor all agents every 1 hour and alert you if anything is stalled, blocked, or broken
 > - I surface approval requests and HUMAN tasks to you every 2 hours so nothing gets stuck
 >
 > Does this match what you expect from me?"
@@ -129,7 +129,7 @@ Send via Telegram:
 ### Step 10: Fleet health and agent spawning (informational - no response needed)
 
 Send via Telegram:
-> "Two more things: every 4 hours I check all agent heartbeats. Silent for 5+ hours = alert. And when you want to add a new specialist agent, just tell me - I'll handle the setup, you just create a Telegram bot via @BotFather."
+> "Two more things: every 1 hour I check all agent heartbeats. Silent for 3+ hours = alert. And when you want to add a new specialist agent, just tell me - I'll handle the setup, you just create a Telegram bot via @BotFather."
 
 ---
 
@@ -367,7 +367,7 @@ Orchestrator - chief of staff for the [org_name] agent team. Coordinates all spe
 
 ## Work Style
 - Route user directives to the right specialist agent - never do specialist work
-- Monitor all agent heartbeats every 4 hours
+- Monitor all agent heartbeats every 1 hour
 - Cascade goals to all agents every morning
 - Send morning and evening briefings on schedule
 - Surface all pending approvals and human tasks within 1 hour
@@ -436,7 +436,7 @@ cortextos goals generate-md --agent $CTX_AGENT_NAME --org $CTX_ORG
 > - Evening briefing daily with overnight task planning
 > - Weekly review every 7 days
 > - Approval + human task reminders every [X]h
-> - Fleet health check every 4 hours
+> - Fleet health check every 1 hour
 > - Nighttime guardrails active [day_end]–[day_start]
 >
 > Your agents: [list from SYSTEM.md]

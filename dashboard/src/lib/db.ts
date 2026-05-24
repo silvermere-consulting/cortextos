@@ -105,7 +105,7 @@ function initializeSchema(db: Database.Database): void {
       current_task TEXT,
       mode TEXT,
       last_heartbeat TEXT,
-      loop_interval INTEGER,
+      loop_interval TEXT,
       uptime_seconds INTEGER
     );
 

@@ -2161,6 +2161,15 @@ busCommand
     }
 
     const env = resolveEnv();
+
+    // Persist the updated cron to config.json so the change survives a crons.json
+    // wipe + re-migration. Mirrors the add-cron sync path; without this, runtime
+    // updates drift from config.json and a marker-file reset restores the old value.
+    const updated = getCronByName(agent, name);
+    if (updated) {
+      syncCronToConfig(agent, { name: updated.name, schedule: updated.schedule, prompt: updated.prompt, description: updated.description }, env.frameworkRoot);
+    }
+
     await signalCronReload(agent, env.instanceId);
     console.log(`Updated cron '${name}' for ${agent}`);
   });

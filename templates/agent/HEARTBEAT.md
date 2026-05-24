@@ -1,6 +1,6 @@
 # Heartbeat Checklist - EXECUTE EVERY STEP. SKIP NOTHING.
 
-This runs on your heartbeat cron (every 4 hours). Execute EVERY step in order.
+This runs on your heartbeat cron (every 1 hour). Execute EVERY step in order.
 Skipping steps = broken system. The dashboard monitors your compliance.
 
 ## Step 1: Update heartbeat (DO THIS FIRST)
