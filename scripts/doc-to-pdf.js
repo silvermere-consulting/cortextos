@@ -90,6 +90,10 @@ const brandHeader = brandMode === 'soft' ? '' : `<div class="brand-header">
     <span class="brand-rule-dot"></span>
   </div>`;
 
+// orientation: "landscape" flips the PDF page to A4 landscape with tighter margins.
+// Default (or omitted) = portrait, unchanged from prior behaviour.
+const isLandscape = (meta.orientation || meta.layout || 'portrait').toLowerCase() === 'landscape';
+
 const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -353,8 +357,11 @@ const html = `<!DOCTYPE html>
   await page.pdf({
     path: outputPath,
     format: 'A4',
+    landscape: isLandscape,
     printBackground: true,
-    margin: { top: '18mm', right: '16mm', bottom: '22mm', left: '16mm' },
+    margin: isLandscape
+      ? { top: '10mm', right: '10mm', bottom: '10mm', left: '10mm' }
+      : { top: '18mm', right: '16mm', bottom: '22mm', left: '16mm' },
   });
   await browser.close();
   console.log(`PDF written to: ${outputPath}`);
