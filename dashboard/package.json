@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev -H 0.0.0.0",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -H 0.0.0.0 -p 3000",
     "lint": "eslint",
     "test": "vitest run --root .. dashboard/src",
     "test:codex": "vitest run --root .. dashboard/src/lib/__tests__/cost-parser-codex.test.ts"
