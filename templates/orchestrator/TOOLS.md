@@ -61,6 +61,19 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 | `recall-facts [--days 3]` | Recall session facts extracted at compaction (cross-session memory) |
 | `tui-stream [--session <name>] [--telegram] [--dry-run]` | Stream TUI tool activity to event log and Telegram |
 
+### Crons — full docs: `.claude/skills/cron-management/SKILL.md`
+
+> **Schedules are interpreted in the agent's local timezone (`CTX_TIMEZONE`), not UTC.** A cron of `0 2 * * *` fires at 02:00 *agent-local time*. Use `get-cron-log` to verify actual fire times if a cron looks off.
+
+| Command | What it does |
+|---|---|
+| `list-crons <agent>` | List scheduled crons + next-fire times |
+| `add-cron <agent> <name> <interval-or-cron-expr> "<prompt>"` | Add a recurring cron |
+| `update-cron <agent> <name> --schedule <expr>` | Change schedule/prompt |
+| `remove-cron <agent> <name>` | Remove a cron |
+| `get-cron-log <agent>` | Show actual fire history |
+| `test-cron-fire <agent> <name>` | Fire immediately to verify wiring |
+
 ### Approvals — full docs: `.claude/skills/approvals/SKILL.md`
 | Command | What it does |
 |---|---|
