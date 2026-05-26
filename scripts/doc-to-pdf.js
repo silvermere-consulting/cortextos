@@ -51,7 +51,8 @@ if (!fs.existsSync(resolvedInput)) {
   process.exit(1);
 }
 
-const outputPath = process.argv[3]
+const explicitOutput = !!process.argv[3];
+let outputPath = explicitOutput
   ? path.resolve(process.argv[3])
   : resolvedInput.replace(/\.(md|markdown|txt)$/i, '.pdf');
 
@@ -72,6 +73,20 @@ function stripFrontMatter(src) {
 
 const { meta, body } = stripFrontMatter(markdown);
 const htmlBody = marked.parse(body);
+
+// Project-code prefix from frontmatter — prepend "<code>-" to the auto-computed output
+// filename when `project_code:` is set, the user did NOT pass an explicit output path, and
+// the basename does not already start with the prefix (idempotent). See
+// orgs/silvermere-tech/docs/wow-project-codes.md for the approved codes.
+if (meta.project_code && !explicitOutput) {
+  const code = meta.project_code.replace(/^['"]|['"]$/g, '');
+  const dir = path.dirname(outputPath);
+  const base = path.basename(outputPath);
+  const prefix = `${code}-`;
+  if (code && !base.startsWith(prefix)) {
+    outputPath = path.join(dir, prefix + base);
+  }
+}
 
 // Build a subtitle block from front matter fields (Date, Author, Purpose)
 const metaLines = ['Date', 'Author', 'Purpose', 'Status']
