@@ -98,12 +98,17 @@ const metaLines = ['Date', 'Author', 'Purpose', 'Status']
   .join('');
 const metaBlock = metaLines ? `<div class="meta-block">${metaLines}</div>` : '';
 
-// brand_mode: default (or omitted) = Silvermere wordmark + gold rule; "soft" = suppress both
-const brandMode = (meta.brand_mode || meta.brandMode || 'default').toLowerCase();
-const brandHeader = brandMode === 'soft' ? '' : `<div class="brand-header">
+// brand_mode: "silvermere" = Silvermere wordmark + gold rule; default (or omitted / "soft") = no wordmark.
+// Defaulting to "soft" (no branding) so this script is org-agnostic out of the box. Authors who want
+// the Silvermere wordmark explicitly add `brand_mode: silvermere` to their PDF frontmatter.
+// Backward-compat: the legacy "default" value is treated as "silvermere" so existing docs that relied
+// on the implicit-Silvermere behaviour keep rendering with the wordmark.
+const brandModeRaw = (meta.brand_mode || meta.brandMode || 'soft').toLowerCase();
+const brandMode = brandModeRaw === 'default' ? 'silvermere' : brandModeRaw;
+const brandHeader = brandMode === 'silvermere' ? `<div class="brand-header">
     <span class="brand-name">Silvermere Technology</span>
     <span class="brand-rule-dot"></span>
-  </div>`;
+  </div>` : '';
 
 // orientation: "landscape" flips the PDF page to A4 landscape with tighter margins.
 // Default (or omitted) = portrait, unchanged from prior behaviour.

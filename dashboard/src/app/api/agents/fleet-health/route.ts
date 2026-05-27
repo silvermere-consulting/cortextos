@@ -285,8 +285,23 @@ async function readOrInit<T>(filePath: string, defaultVal: T, dateKey?: string):
   }
 }
 
+// Resolve the Claude session-project directory for an agent without hardcoding the org name.
+// JSONL session dirs follow the pattern `-home-cortext-cortextos-orgs-<org>-agents-<name>`.
+// We scan ~/.claude/projects for the first dir matching this agent and return its absolute path.
+async function findClaudeProjectDirForAgent(agentName: string): Promise<string | null> {
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
+  try {
+    const entries = await fs.readdir(projectsDir);
+    const match = entries.find(e => e.endsWith(`-agents-${agentName}`));
+    return match ? path.join(projectsDir, match) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function getLatestJsonlForAgent(agentName: string): Promise<string | null> {
-  const dir = path.join(os.homedir(), '.claude', 'projects', `-home-cortext-cortextos-orgs-silvermere-tech-agents-${agentName}`);
+  const dir = await findClaudeProjectDirForAgent(agentName);
+  if (!dir) return null;
   let files: string[];
   try {
     files = (await fs.readdir(dir)).filter(f => f.endsWith('.jsonl'));
@@ -362,8 +377,28 @@ async function scanAgentTokens(
   return { tokens, newCursor: { filePath: latestFile, lineCount: lines.length } };
 }
 
+// Find the org that owns a given agent by scanning orgs/<org>/agents/<agentName>/.
+// Returns the first org dir that contains the agent. Caches results within a single request scope
+// via the simple closure pattern (Node module instance lives across requests in dev; minor cost
+// to re-scan on each call vs adding a stale-cache risk — re-scan is cheap, kept simple).
+async function findOrgForAgent(agentName: string): Promise<string | null> {
+  const orgsDir = path.join(CTX_ROOT, 'orgs');
+  try {
+    const orgs = await fs.readdir(orgsDir);
+    for (const org of orgs) {
+      try {
+        await fs.access(path.join(orgsDir, org, 'agents', agentName));
+        return org;
+      } catch { /* keep searching */ }
+    }
+  } catch { /* orgs/ unreadable */ }
+  return null;
+}
+
 async function countTasksToday(agentName: string, today: string): Promise<number> {
-  const auditDir = path.join(CTX_ROOT, 'orgs', 'silvermere-tech', 'tasks', 'audit');
+  const org = await findOrgForAgent(agentName);
+  if (!org) return 0;
+  const auditDir = path.join(CTX_ROOT, 'orgs', org, 'tasks', 'audit');
   let files: string[];
   try { files = (await fs.readdir(auditDir)).filter(f => f.endsWith('.jsonl')); }
   catch { return 0; }
