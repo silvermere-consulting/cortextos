@@ -493,11 +493,58 @@ def file_id(path, chunk_idx=None):
         return f"{h}_chunk{chunk_idx}"
     return h
 
+
+def compute_hash(payload):
+    """sha256 of bytes or UTF-8 of a string. Used for content-aware skip."""
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8", errors="replace")
+    return hashlib.sha256(payload).hexdigest()
+
 # ---------------------------------------------------------------------------
 # Ingest logic
 # ---------------------------------------------------------------------------
+def should_skip(collection, doc_id, content_hash_value):
+    """Decide whether to skip an embed call for this doc_id.
+
+    Returns True (skip) only when the record already exists AND its stored
+    content_hash matches the incoming content_hash. With --force, never skips.
+
+    Backward-compat: if an existing record lacks content_hash metadata
+    (entries embedded before this fix shipped), we treat it as "still fresh"
+    AND opportunistically backfill the hash via collection.update — no embed
+    call, just a metadata patch. Future ingests of changed content will then
+    detect a hash mismatch correctly.
+    """
+    if args_force:
+        return False
+
+    existing = collection.get(ids=[doc_id], include=["metadatas"])
+    if not (existing and existing.get("ids")):
+        return False  # no record yet — embed needed
+
+    metas = existing.get("metadatas") or [None]
+    stored_meta = metas[0] or {}
+    stored_hash = stored_meta.get("content_hash")
+
+    if stored_hash == content_hash_value:
+        return True  # same content already embedded
+
+    if stored_hash is None:
+        # Opportunistic backfill: stamp the hash so future runs use real check.
+        stored_meta["content_hash"] = content_hash_value
+        try:
+            collection.update(ids=[doc_id], metadatas=[stored_meta])
+        except Exception:
+            # If chromadb version lacks update, swallow — backfill is best-effort.
+            pass
+        return True
+
+    return False  # hash differs — content changed, re-embed
+
+
 def already_exists(collection, doc_id):
-    """Check if a document ID already exists in the collection. Respects --force flag."""
+    """Legacy path-only skip check. Retained for any external callers; the
+    in-tree ingest_* functions all migrated to should_skip(). Respects --force."""
     if args_force:
         return False
     existing = collection.get(ids=[doc_id])
@@ -521,7 +568,8 @@ def ingest_text_file(client, config, collection, file_path):
     count = 0
     for i, chunk in enumerate(chunks):
         doc_id = file_id(file_path, i)
-        if already_exists(collection, doc_id):
+        chunk_hash = compute_hash(chunk)
+        if should_skip(collection, doc_id, chunk_hash):
             continue
 
         embedding = embed_content(client, config, chunk)
@@ -536,6 +584,7 @@ def ingest_text_file(client, config, collection, file_path):
                 "total_chunks": len(chunks),
                 "filename": file_path.name,
                 "file_ext": file_path.suffix.lower(),
+                "content_hash": chunk_hash,
                 "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }],
         )
@@ -549,8 +598,11 @@ def ingest_image(client, config, collection, file_path):
     file_path = Path(file_path)
     doc_id = file_id(file_path)
 
-    if already_exists(collection, doc_id):
-        print(f"  SKIP (exists): {file_path}")
+    with open(file_path, "rb") as _f:
+        file_hash = compute_hash(_f.read())
+
+    if should_skip(collection, doc_id, file_hash):
+        print(f"  SKIP (exists, unchanged): {file_path}")
         return 0
 
     print(f"  Generating description for {file_path.name}...")
@@ -573,6 +625,7 @@ def ingest_image(client, config, collection, file_path):
             "filename": file_path.name,
             "file_ext": file_path.suffix.lower(),
             "mime_type": mime,
+            "content_hash": file_hash,
             "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }],
     )
@@ -619,10 +672,15 @@ def ingest_video(client, config, collection, file_path):
     count = 0
     for chunk in chunks:
         doc_id = file_id(file_path, chunk["index"])
-        if already_exists(collection, doc_id):
+        chunk_path = Path(chunk["path"])
+        # Hash the chunk file bytes — if the source video changes, ffmpeg
+        # produces different chunk bytes and we re-process.
+        chunk_hash = compute_hash(chunk_path.read_bytes()) if chunk_path.exists() else compute_hash(
+            f"{file_path}:{chunk['index']}"
+        )
+        if should_skip(collection, doc_id, chunk_hash):
             continue
 
-        chunk_path = Path(chunk["path"])
         chunk_size_mb = chunk_path.stat().st_size / (1024 * 1024) if chunk_path.exists() else 0
 
         print(f"  Chunk {chunk['index'] + 1}/{total_chunks} "
@@ -691,6 +749,7 @@ def ingest_video(client, config, collection, file_path):
                 "filename": file_path.name,
                 "file_ext": file_path.suffix.lower(),
                 "duration_seconds": duration,
+                "content_hash": chunk_hash,
                 "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }],
         )
@@ -711,8 +770,10 @@ def ingest_audio(client, config, collection, file_path):
     if duration <= max_chunk:
         # Short enough to process as one piece
         doc_id = file_id(file_path)
-        if already_exists(collection, doc_id):
-            print(f"  SKIP (exists): {file_path}")
+        with open(file_path, "rb") as _f:
+            file_hash = compute_hash(_f.read())
+        if should_skip(collection, doc_id, file_hash):
+            print(f"  SKIP (exists, unchanged): {file_path}")
             return 0
 
         print(f"  Transcribing {file_path.name}...")
@@ -733,6 +794,7 @@ def ingest_audio(client, config, collection, file_path):
                 "filename": file_path.name,
                 "file_ext": file_path.suffix.lower(),
                 "duration_seconds": duration,
+                "content_hash": file_hash,
                 "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }],
         )
@@ -747,7 +809,11 @@ def ingest_audio(client, config, collection, file_path):
 
         for chunk in chunks:
             doc_id = file_id(file_path, chunk["index"])
-            if already_exists(collection, doc_id):
+            chunk_path_obj = Path(chunk["path"])
+            chunk_hash = compute_hash(chunk_path_obj.read_bytes()) if chunk_path_obj.exists() else compute_hash(
+                f"{file_path}:{chunk['index']}"
+            )
+            if should_skip(collection, doc_id, chunk_hash):
                 continue
 
             print(f"  Transcribing chunk {chunk['index'] + 1}/{total_chunks}...")
@@ -781,6 +847,7 @@ def ingest_audio(client, config, collection, file_path):
                     "chunk_path": chunk["path"],
                     "filename": file_path.name,
                     "file_ext": file_path.suffix.lower(),
+                    "content_hash": chunk_hash,
                     "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 }],
             )
@@ -795,6 +862,15 @@ def ingest_pdf(client, config, collection, file_path):
 
     with open(file_path, "rb") as f:
         data = f.read()
+
+    file_hash = compute_hash(data)
+
+    # Cheap early exit: if page-0 already has this content_hash, the PDF is
+    # unchanged. Skips the (expensive) Gemini extraction call entirely.
+    page0_id = file_id(file_path, 0)
+    if should_skip(collection, page0_id, file_hash):
+        print(f"  SKIP (unchanged PDF): {file_path}")
+        return 0
 
     # Estimate page count (rough: ~3KB per page for typical PDFs, but varies wildly)
     # We'll ask Gemini to process the whole thing and get structured output
@@ -846,7 +922,7 @@ def ingest_pdf(client, config, collection, file_path):
         if not page_content.strip():
             continue
         doc_id = file_id(file_path, i)
-        if already_exists(collection, doc_id):
+        if should_skip(collection, doc_id, file_hash):
             continue
 
         embedding = embed_content(client, config, page_content)
@@ -862,6 +938,7 @@ def ingest_pdf(client, config, collection, file_path):
                 "page_number": i + 1,
                 "filename": file_path.name,
                 "file_ext": ".pdf",
+                "content_hash": file_hash,
                 "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }],
         )
@@ -986,7 +1063,8 @@ def ingest_office_doc(client, config, collection, file_path):
         if not section.strip():
             continue
         doc_id = file_id(file_path, i)
-        if already_exists(collection, doc_id):
+        section_hash = compute_hash(section)
+        if should_skip(collection, doc_id, section_hash):
             continue
 
         embedding = embed_content(client, config, section)
@@ -997,6 +1075,7 @@ def ingest_office_doc(client, config, collection, file_path):
             "total_chunks": len(sections),
             "filename": file_path.name,
             "file_ext": ext,
+            "content_hash": section_hash,
             "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         if type_name == "slides":
@@ -1482,6 +1561,53 @@ def cmd_delete(args):
     print(f"Deleted {len(ids_to_delete)} chunk(s) from '{collection_name}' for: {source_path}")
 
 
+def cmd_backfill_hashes(args):
+    """Backfill content_hash metadata on existing collection records using
+    the documents already stored in chromadb — ZERO embed calls. Idempotent:
+    re-runs skip records that already have a content_hash."""
+    collection_name = args.collection
+    if not collection_name:
+        config = load_config()
+        collection_name = config.get("default_collection", "default")
+
+    collection = get_chroma_collection(collection_name)
+    all_records = collection.get(include=["documents", "metadatas"])
+    ids = all_records.get("ids") or []
+    documents = all_records.get("documents") or []
+    metadatas = all_records.get("metadatas") or []
+
+    update_ids = []
+    update_metas = []
+    skipped = 0
+
+    for i, doc_id in enumerate(ids):
+        meta = (metadatas[i] if i < len(metadatas) else None) or {}
+        if meta.get("content_hash"):
+            skipped += 1
+            continue
+        doc = documents[i] if i < len(documents) else ""
+        if doc is None:
+            doc = ""
+        meta["content_hash"] = compute_hash(doc)
+        update_ids.append(doc_id)
+        update_metas.append(meta)
+
+    if update_ids:
+        # chromadb.update accepts arrays; do it in batches to be safe on
+        # collections with tens of thousands of records.
+        batch = 500
+        for start in range(0, len(update_ids), batch):
+            collection.update(
+                ids=update_ids[start:start + batch],
+                metadatas=update_metas[start:start + batch],
+            )
+
+    print(
+        f"Backfill complete on '{collection_name}': "
+        f"{len(update_ids)} record(s) backfilled, {skipped} already had content_hash."
+    )
+
+
 def cmd_reset(args):
     if not args.confirm:
         print("ERROR: Pass --confirm to reset the knowledge base.")
@@ -1547,6 +1673,13 @@ def main():
     p_delete.add_argument("path", help="Source file path to delete")
     p_delete.add_argument("--collection", "-c", help="Collection name")
 
+    # backfill-hashes
+    p_backfill = sub.add_parser(
+        "backfill-hashes",
+        help="Stamp content_hash on existing records using stored documents (no embed calls).",
+    )
+    p_backfill.add_argument("--collection", "-c", help="Collection name (default: from config)")
+
     # reset
     p_reset = sub.add_parser("reset", help="Reset the entire knowledge base")
     p_reset.add_argument("--confirm", action="store_true", help="Confirm reset")
@@ -1571,6 +1704,7 @@ def main():
         "delete": cmd_delete,
         "reset": cmd_reset,
         "usage": cmd_usage,
+        "backfill-hashes": cmd_backfill_hashes,
     }
 
     commands[args.command](args)
