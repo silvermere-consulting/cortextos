@@ -183,9 +183,7 @@ export function TodayPageClient({ digest, currentOrg, currentRange }: { digest: 
                       <li key={d.absPath} className="text-sm flex items-center justify-between gap-3">
                         <a
                           className="text-amber-700 dark:text-amber-300 hover:underline truncate"
-                          href={`/api/kb/document?path=${encodeURIComponent(d.absPath)}`}
-                          target="_blank"
-                          rel="noreferrer"
+                          href={`/knowledge-base?org=${encodeURIComponent(d.org)}&doc=${encodeURIComponent(d.absPath)}`}
                         >
                           {d.filename}
                         </a>
