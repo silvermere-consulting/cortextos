@@ -143,12 +143,34 @@ export function KbDocViewer({ filePath, org, onClose, onOpenDoc }: KbDocViewerPr
           )}
 
           {!loading && !error && PDF_EXTS.has(fileExt) && (
-            <iframe
-              src={downloadUrl}
-              className="w-full h-full border-0"
-              style={{ minHeight: '70vh' }}
-              title={filename}
-            />
+            <div className="flex flex-col gap-2">
+              {/* Mobile Safari + many iOS browsers won't render PDF inline in
+                  an iframe. Always show open + download buttons above the
+                  iframe so the document is reachable on every device. */}
+              <div className="flex flex-wrap gap-2 px-5 pt-4">
+                <a
+                  href={downloadUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-300"
+                >
+                  <IconExternalLink size={13} /> Open PDF
+                </a>
+                <a
+                  href={downloadUrl}
+                  download={filename}
+                  className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-muted"
+                >
+                  <IconDownload size={13} /> Download
+                </a>
+              </div>
+              <iframe
+                src={downloadUrl}
+                className="w-full border-0"
+                style={{ minHeight: '70vh' }}
+                title={filename}
+              />
+            </div>
           )}
 
           {!loading && !error && IMAGE_EXTS.has(fileExt) && (
