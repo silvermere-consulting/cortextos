@@ -98,17 +98,46 @@ const metaLines = ['Date', 'Author', 'Purpose', 'Status']
   .join('');
 const metaBlock = metaLines ? `<div class="meta-block">${metaLines}</div>` : '';
 
-// brand_mode: "silvermere" = Silvermere wordmark + gold rule; default (or omitted / "soft") = no wordmark.
+// brand_mode: "silvermere" = Silvermere Advisory logo (group brand) + gold rule;
+// default (or omitted / "soft") = no wordmark.
+// Steven framing (2026-05-29): Silvermere Advisory is the PARENT brand; Silvermere Technology
+// is the operating arm. Every Silvermere PDF, regardless of which arm authored it, carries
+// the Advisory logo as the group brand anchor. Per-arm differentiation (if ever needed) lives
+// in the document body or meta block, not the brand header.
 // Defaulting to "soft" (no branding) so this script is org-agnostic out of the box. Authors who want
-// the Silvermere wordmark explicitly add `brand_mode: silvermere` to their PDF frontmatter.
+// the Silvermere group brand explicitly add `brand_mode: silvermere` to their PDF frontmatter.
 // Backward-compat: the legacy "default" value is treated as "silvermere" so existing docs that relied
-// on the implicit-Silvermere behaviour keep rendering with the wordmark.
+// on the implicit-Silvermere behaviour keep rendering with the brand header.
 const brandModeRaw = (meta.brand_mode || meta.brandMode || 'soft').toLowerCase();
 const brandMode = brandModeRaw === 'default' ? 'silvermere' : brandModeRaw;
-const brandHeader = brandMode === 'silvermere' ? `<div class="brand-header">
-    <span class="brand-name">Silvermere Technology</span>
+// Inline the Silvermere Advisory logo as base64 so the rendered PDF is self-contained
+// (no external image requests during render). Prefer the transparent-background PNG; fall
+// back to the source JPG, then a text wordmark if neither file exists.
+const SILVERMERE_LOGO_DIR = path.join(__dirname, '..', 'orgs', 'silvermere-tech', 'brand');
+const SILVERMERE_LOGO_CANDIDATES = [
+  { file: 'silvermere-advisory-logo.png', mime: 'image/png' },
+  { file: 'silvermere-advisory-logo.jpg', mime: 'image/jpeg' },
+];
+let brandLogoSrc = '';
+for (const { file, mime } of SILVERMERE_LOGO_CANDIDATES) {
+  const p = path.join(SILVERMERE_LOGO_DIR, file);
+  try {
+    if (fs.existsSync(p)) {
+      const buf = fs.readFileSync(p);
+      brandLogoSrc = `data:${mime};base64,${buf.toString('base64')}`;
+      break;
+    }
+  } catch { /* try next */ }
+}
+
+const brandHeader = brandMode === 'silvermere'
+  ? `<div class="brand-header">
+    ${brandLogoSrc
+      ? `<img class="brand-logo" src="${brandLogoSrc}" alt="Silvermere Advisory" />`
+      : `<span class="brand-name">Silvermere Advisory</span>`}
     <span class="brand-rule-dot"></span>
-  </div>` : '';
+  </div>`
+  : '';
 
 // orientation: "landscape" flips the PDF page to A4 landscape with tighter margins.
 // Default (or omitted) = portrait, unchanged from prior behaviour.
@@ -151,14 +180,19 @@ const html = `<!DOCTYPE html>
     padding: 48px 32px 64px;
   }
 
-  /* Silvermere wordmark header */
+  /* Silvermere brand header (logo + gold rule) */
   .brand-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     border-bottom: 2px solid #D4AF37;
-    padding-bottom: 8px;
+    padding-bottom: 10px;
     margin-bottom: 28px;
+  }
+  .brand-logo {
+    height: 42px;
+    width: auto;
+    display: block;
   }
   .brand-name {
     font-family: 'Roboto', 'Helvetica Neue', Arial, sans-serif;
