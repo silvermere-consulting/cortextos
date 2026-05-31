@@ -122,13 +122,14 @@ export function queryKnowledgeBase(
     org: string;
     agent?: string;
     scope?: 'shared' | 'private' | 'all';
+    collection?: string;
     topK?: number;
     threshold?: number;
     frameworkRoot: string;
     instanceId: string;
   },
 ): KBQueryResponse {
-  const { agent, scope = 'all', topK = 5, threshold = 0.5, frameworkRoot, instanceId } = options;
+  const { agent, scope = 'all', collection: collectionOverride, topK = 5, threshold = 0.5, frameworkRoot, instanceId } = options;
   // Normalize once at the top so every downstream path join, env var, and
   // ChromaDB collection name uses the canonical filesystem casing. Without
   // this, `shared-acmecorp` and `shared-AcmeCorp` become two
@@ -155,19 +156,25 @@ export function queryKnowledgeBase(
   const pythonPath = getVenvPython(frameworkRoot);
   const mmragPath = join(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
 
-  // Determine which collections to query based on scope
+  // Determine which collections to query. If --collection is explicitly set,
+  // it overrides scope-derived names entirely — this is the escape hatch for
+  // non-default collections like memory-{agent}.
   const collections: string[] = [];
-  switch (scope) {
-    case 'shared':
-      collections.push(`shared-${org}`);
-      break;
-    case 'private':
-      collections.push(agent ? `agent-${agent}` : `shared-${org}`);
-      break;
-    case 'all':
-      collections.push(`shared-${org}`);
-      if (agent) collections.push(`agent-${agent}`);
-      break;
+  if (collectionOverride) {
+    collections.push(collectionOverride);
+  } else {
+    switch (scope) {
+      case 'shared':
+        collections.push(`shared-${org}`);
+        break;
+      case 'private':
+        collections.push(agent ? `agent-${agent}` : `shared-${org}`);
+        break;
+      case 'all':
+        collections.push(`shared-${org}`);
+        if (agent) collections.push(`agent-${agent}`);
+        break;
+    }
   }
 
   const runQuery = (col: string): string | null => {
@@ -247,12 +254,13 @@ export function ingestKnowledgeBase(
     org: string;
     agent?: string;
     scope?: 'shared' | 'private';
+    collection?: string;
     force?: boolean;
     frameworkRoot: string;
     instanceId: string;
   },
 ): void {
-  const { agent, scope = 'shared', force, frameworkRoot, instanceId } = options;
+  const { agent, scope = 'shared', collection: collectionOverride, force, frameworkRoot, instanceId } = options;
   // Normalize once (see queryKnowledgeBase for rationale).
   const org = normalizeOrgName(frameworkRoot, options.org);
 
@@ -277,9 +285,12 @@ export function ingestKnowledgeBase(
   const pythonPath = getVenvPython(frameworkRoot);
   const mmragPath = join(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
 
-  // Determine collection name (same logic as kb-ingest.sh)
+  // Determine collection name. Explicit --collection wins; otherwise derive
+  // from scope (same logic as the original kb-ingest.sh shim).
   let collection: string;
-  if (scope === 'private') {
+  if (collectionOverride) {
+    collection = collectionOverride;
+  } else if (scope === 'private') {
     if (!agent) throw new Error('--agent or CTX_AGENT_NAME required for --scope private');
     collection = `agent-${agent}`;
   } else {
