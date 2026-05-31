@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -327,14 +327,71 @@ export function ingestKnowledgeBase(
       : KB_INGEST_TIMEOUT_DEFAULT_MS,
   );
 
-  execFileSync(pythonPath, args, {
+  // Switched from execFileSync(stdio:inherit) to spawnSync with captured
+  // stdout/stderr so we can detect a Gemini-quota 429 and skip gracefully
+  // instead of letting every heartbeat dump a noisy non-zero-exit stack.
+  // Output is still forwarded verbatim — the only behaviour change is on
+  // quota-exhausted failure.
+  const result = spawnSync(pythonPath, args, {
     encoding: 'utf-8',
     timeout: ingestTimeoutMs,
     env,
-    stdio: 'inherit',
   });
 
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+
+  if (result.status !== 0) {
+    const combined = `${result.stdout || ''}\n${result.stderr || ''}`;
+    if (isGeminiQuotaExhausted(combined)) {
+      // Quota-exhausted is operationally expected — Gemini free-tier resets
+      // daily, so the next heartbeat will likely succeed. Skip clean, emit a
+      // structured event so analyst dashboards can count quota-skip rate,
+      // and exit without throwing. Crucially: do NOT retry — a retry burns
+      // another embed call from a quota we already know is empty.
+      console.warn(
+        `[kb] Gemini embedding quota exhausted — skipping ingest into ${collection}. ` +
+        `Will retry on next cycle when the quota resets.`,
+      );
+      emitQuotaSkipEvent(frameworkRoot, { collection, scope, agent: agent || null });
+      return;
+    }
+    // Non-quota failure — preserve the original throw semantics so the CLI
+    // surfaces the error the same way it always has.
+    throw new Error(`mmrag ingest exited with status ${result.status}`);
+  }
+
   console.log(`\nIngest complete → collection: ${collection}`);
+}
+
+/**
+ * Detect the Gemini `429 RESOURCE_EXHAUSTED` quota error in mmrag.py's
+ * combined stdout+stderr. The error format is documented as:
+ *
+ *   ERROR: 429 RESOURCE_EXHAUSTED. {...quota details...}
+ *
+ * We match on BOTH `429` and `RESOURCE_EXHAUSTED` to avoid false positives
+ * from a transient HTTP 429 of a different shape (unlikely, but tight).
+ */
+function isGeminiQuotaExhausted(output: string): boolean {
+  return /\b429\b/.test(output) && /RESOURCE_EXHAUSTED/.test(output);
+}
+
+/**
+ * Best-effort emit of a `kb/quota_skip` event so the heartbeat-skip rate is
+ * observable in the dashboard activity feed. Never throws — quota-skip is
+ * already a soft event and we should not turn it into a hard failure if the
+ * event-log surface is unhappy.
+ */
+function emitQuotaSkipEvent(frameworkRoot: string, meta: { collection: string; scope: string; agent: string | null }): void {
+  try {
+    const cliPath = join(frameworkRoot, 'dist', 'cli.js');
+    if (!existsSync(cliPath)) return;
+    execFileSync(process.execPath, [cliPath, 'bus', 'log-event', 'kb', 'quota_skip', 'warn', '--meta', JSON.stringify(meta)], {
+      timeout: 5_000,
+      stdio: 'pipe',
+    });
+  } catch { /* best-effort */ }
 }
 
 /**
