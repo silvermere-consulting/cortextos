@@ -338,6 +338,72 @@ export function ingestKnowledgeBase(
 }
 
 /**
+ * Delete a document from the knowledge base by source path.
+ *
+ * Mirrors ingestKnowledgeBase's options/collection-resolution shape so the
+ * CLI surface stays consistent — caller passes the same flags they would
+ * for an ingest, plus the source path to remove. All chunks whose
+ * `source` metadata matches the resolved absolute path are dropped.
+ */
+export function deleteKnowledgeBase(
+  paths: string[],
+  options: {
+    org: string;
+    agent?: string;
+    scope?: 'shared' | 'private';
+    collection?: string;
+    frameworkRoot: string;
+    instanceId: string;
+  },
+): void {
+  const { agent, scope = 'shared', collection: collectionOverride, frameworkRoot, instanceId } = options;
+  const org = normalizeOrgName(frameworkRoot, options.org);
+
+  const env = buildKBEnv(frameworkRoot, org, instanceId, agent);
+
+  // Same kbConfigured guard as ingest — operator-friendly fail-soft when the
+  // KB hasn't been set up for this org yet.
+  if (!kbConfigured(env)) {
+    console.warn(
+      `[kb] Knowledge base not configured for org ${org}. Skipping delete — ` +
+      `run setup to enable.`,
+    );
+    return;
+  }
+
+  const pythonPath = getVenvPython(frameworkRoot);
+  const mmragPath = join(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
+
+  let collection: string;
+  if (collectionOverride) {
+    collection = collectionOverride;
+  } else if (scope === 'private') {
+    if (!agent) throw new Error('--agent or CTX_AGENT_NAME required for --scope private');
+    collection = `agent-${agent}`;
+  } else {
+    collection = `shared-${org}`;
+  }
+
+  if (paths.length === 0) {
+    console.warn('[kb] No paths supplied to delete. Nothing to do.');
+    return;
+  }
+
+  // mmrag.py delete is single-path per invocation. Loop so the bus surface
+  // supports the same `<paths...>` variadic as kb-ingest.
+  for (const p of paths) {
+    console.log(`Deleting from collection ${collection}: ${p}`);
+    const args = [mmragPath, 'delete', p, '--collection', collection];
+    execFileSync(pythonPath, args, {
+      encoding: 'utf-8',
+      timeout: 60_000,
+      env,
+      stdio: 'inherit',
+    });
+  }
+}
+
+/**
  * Ensure the knowledge base directories exist for an org.
  *
  * `frameworkRoot` is required so the org name can be normalized to its
