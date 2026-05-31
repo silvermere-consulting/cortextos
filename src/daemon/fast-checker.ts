@@ -259,6 +259,7 @@ Reply using: cortextos bus send-message ${msg.from} normal '<your reply>' ${msg.
     lastSentText?: string,
     recentHistory?: string,
     fromUserId?: number,
+    messageId?: number,
   ): string {
     let replyCx = '';
     if (replyToText) {
@@ -283,9 +284,16 @@ Reply using: cortextos bus send-message ${msg.from} normal '<your reply>' ${msg.
       ? text.trim()
       : `\`\`\`\n${text}\n\`\`\``;
     const userIdSuffix = fromUserId !== undefined ? ` (user_id:${fromUserId})` : '';
-    return `=== TELEGRAM from [USER: ${from}]${userIdSuffix} (chat_id:${chatId}) ===
+    const msgIdSuffix = messageId !== undefined ? ` (msg_id:${messageId})` : '';
+    // When we know the originating Telegram message_id, suggest the
+    // --reply-to flag so the agent's response threads under the user's
+    // message in the Telegram client UI.
+    const replyHint = messageId !== undefined
+      ? `Reply using: cortextos bus send-telegram ${chatId} '<your reply>' --reply-to ${messageId}`
+      : `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`;
+    return `=== TELEGRAM from [USER: ${from}]${userIdSuffix}${msgIdSuffix} (chat_id:${chatId}) ===
 ${replyCx}${historyCx}${body}
-${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+${lastSentCtx}${replyHint}
 
 `;
   }
@@ -330,14 +338,19 @@ ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     chatId: string | number,
     caption: string,
     imagePath: string,
+    messageId?: number,
   ): string {
-    return `=== TELEGRAM PHOTO from ${from} (chat_id:${chatId}) ===
+    const msgIdSuffix = messageId !== undefined ? ` (msg_id:${messageId})` : '';
+    const replyHint = messageId !== undefined
+      ? `Reply using: cortextos bus send-telegram ${chatId} '<your reply>' --reply-to ${messageId}`
+      : `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`;
+    return `=== TELEGRAM PHOTO from ${from}${msgIdSuffix} (chat_id:${chatId}) ===
 caption:
 \`\`\`
 ${caption}
 \`\`\`
 local_file: ${imagePath}
-Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+${replyHint}
 
 `;
   }
@@ -352,15 +365,20 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     caption: string,
     filePath: string,
     fileName: string,
+    messageId?: number,
   ): string {
-    return `=== TELEGRAM DOCUMENT from ${from} (chat_id:${chatId}) ===
+    const msgIdSuffix = messageId !== undefined ? ` (msg_id:${messageId})` : '';
+    const replyHint = messageId !== undefined
+      ? `Reply using: cortextos bus send-telegram ${chatId} '<your reply>' --reply-to ${messageId}`
+      : `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`;
+    return `=== TELEGRAM DOCUMENT from ${from}${msgIdSuffix} (chat_id:${chatId}) ===
 caption:
 \`\`\`
 ${caption}
 \`\`\`
 local_file: ${filePath}
 file_name: ${fileName}
-Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+${replyHint}
 
 `;
   }
@@ -380,15 +398,20 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     filePath: string,
     duration: number | undefined,
     transcript?: string,
+    messageId?: number,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
     const transcriptBlock = transcript && transcript.trim()
       ? `transcript:\n\`\`\`\n${transcript.trim()}\n\`\`\`\n`
       : '';
-    return `=== TELEGRAM VOICE from ${from} (chat_id:${chatId}) ===
+    const msgIdSuffix = messageId !== undefined ? ` (msg_id:${messageId})` : '';
+    const replyHint = messageId !== undefined
+      ? `Reply using: cortextos bus send-telegram ${chatId} '<your reply>' --reply-to ${messageId}`
+      : `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`;
+    return `=== TELEGRAM VOICE from ${from}${msgIdSuffix} (chat_id:${chatId}) ===
 duration: ${dur}s
 local_file: ${filePath}
-${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+${transcriptBlock}${replyHint}
 
 `;
   }
@@ -404,9 +427,14 @@ ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your repl
     filePath: string,
     fileName: string,
     duration: number | undefined,
+    messageId?: number,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
-    return `=== TELEGRAM VIDEO from ${from} (chat_id:${chatId}) ===
+    const msgIdSuffix = messageId !== undefined ? ` (msg_id:${messageId})` : '';
+    const replyHint = messageId !== undefined
+      ? `Reply using: cortextos bus send-telegram ${chatId} '<your reply>' --reply-to ${messageId}`
+      : `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`;
+    return `=== TELEGRAM VIDEO from ${from}${msgIdSuffix} (chat_id:${chatId}) ===
 caption:
 \`\`\`
 ${caption}
@@ -414,7 +442,7 @@ ${caption}
 duration: ${dur}s
 local_file: ${filePath}
 file_name: ${fileName}
-Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+${replyHint}
 
 `;
   }

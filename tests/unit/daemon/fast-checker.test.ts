@@ -384,6 +384,23 @@ describe('FastChecker', () => {
       const result = FastChecker.formatTelegramTextMessage('alice', '999', 'Hello', '/opt/cortextos');
       expect(result).toContain("send-telegram 999 '<your reply>'");
     });
+
+    it('emits msg_id in header and --reply-to in hint when messageId is provided', () => {
+      const result = FastChecker.formatTelegramTextMessage(
+        'alice', '999', 'Hello', '/opt/cortextos',
+        undefined, undefined, undefined,
+        42 /* fromUserId */,
+        12345 /* messageId */,
+      );
+      expect(result).toContain('=== TELEGRAM from [USER: alice] (user_id:42) (msg_id:12345) (chat_id:999) ===');
+      expect(result).toContain("send-telegram 999 '<your reply>' --reply-to 12345");
+    });
+
+    it('omits msg_id suffix and --reply-to when messageId is undefined', () => {
+      const result = FastChecker.formatTelegramTextMessage('alice', '999', 'Hello', '/opt/cortextos');
+      expect(result).not.toContain('msg_id:');
+      expect(result).not.toContain('--reply-to');
+    });
   });
 
   describe('readLastSent', () => {
@@ -719,6 +736,12 @@ describe('FastChecker', () => {
       expect(result).toContain('=== TELEGRAM PHOTO from Alice (chat_id:999) ===');
       expect(result).toContain('local_file: /tmp/photo.jpg');
     });
+
+    it('includes msg_id and --reply-to when messageId is provided', () => {
+      const result = FastChecker.formatTelegramPhotoMessage('Alice', '999', '', '/tmp/photo.jpg', 7777);
+      expect(result).toContain('=== TELEGRAM PHOTO from Alice (msg_id:7777) (chat_id:999) ===');
+      expect(result).toContain("send-telegram 999 '<your reply>' --reply-to 7777");
+    });
   });
 
   describe('formatTelegramDocumentMessage', () => {
@@ -737,6 +760,14 @@ describe('FastChecker', () => {
       expect(result).toContain('local_file: /tmp/telegram-images/report.pdf');
       expect(result).toContain('file_name: report.pdf');
       expect(result).toContain("cortextos bus send-telegram 123456789 '<your reply>'");
+    });
+
+    it('includes msg_id and --reply-to when messageId is provided', () => {
+      const result = FastChecker.formatTelegramDocumentMessage(
+        'Alice', '999', 'cap', '/tmp/f.pdf', 'f.pdf', 4242,
+      );
+      expect(result).toContain('=== TELEGRAM DOCUMENT from Alice (msg_id:4242) (chat_id:999) ===');
+      expect(result).toContain("send-telegram 999 '<your reply>' --reply-to 4242");
     });
   });
 
@@ -782,6 +813,14 @@ describe('FastChecker', () => {
 
       expect(noArg).not.toContain('transcript:');
       expect(empty).not.toContain('transcript:');
+    });
+
+    it('includes msg_id and --reply-to when messageId is provided', () => {
+      const result = FastChecker.formatTelegramVoiceMessage(
+        'Alice', '999', '/tmp/voice.ogg', 5, undefined, 909090,
+      );
+      expect(result).toContain('=== TELEGRAM VOICE from Alice (msg_id:909090) (chat_id:999) ===');
+      expect(result).toContain("send-telegram 999 '<your reply>' --reply-to 909090");
     });
   });
 

@@ -1059,7 +1059,20 @@ busCommand
         } catch { /* non-fatal */ }
       }
 
-      console.log('Message sent');
+      // Emit the sent message_id to stdout so callers can capture it for
+      // threading: `MID=$(cortextos bus send-telegram ...)` then
+      // `--reply-to $MID` on a follow-up. Matches the cortextos bus
+      // send-message convention (which prints the msg_id on stdout).
+      //
+      // When Telegram doesn't return a numeric id (rare — e.g. a future API
+      // shape we didn't anticipate), fall back to the legacy "Message sent"
+      // line on stdout so the caller still gets *something* and humans
+      // reading the output know the call succeeded.
+      if (sentMessageId > 0) {
+        console.log(sentMessageId);
+      } else {
+        console.log('Message sent');
+      }
     } catch (err: any) {
       console.error(`Failed to send: ${err.message || err}`);
       process.exit(1);
