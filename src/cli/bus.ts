@@ -18,7 +18,7 @@ import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-stat
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
-import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
+import { queryKnowledgeBase, ingestKnowledgeBase, deleteKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, syncOAuthFromCredentials, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
@@ -1203,6 +1203,32 @@ busCommand
       scope: (opts.scope as 'shared' | 'private') || 'shared',
       collection: opts.collection,
       force: opts.force,
+      frameworkRoot: env.frameworkRoot || process.cwd(),
+      instanceId: env.instanceId,
+    });
+  });
+
+busCommand
+  .command('kb-delete')
+  .description('Delete a document from the knowledge base by source path')
+  .argument('<paths...>', 'Source file paths to delete (one or more)')
+  .option('--org <org>', 'Organization name')
+  .option('--agent <name>', 'Agent name (for private scope)')
+  .option('--scope <s>', 'Scope: shared or private', 'shared')
+  .option('--collection <name>', 'Override auto-derived collection name (e.g. memory-{agent})')
+  .action((paths: string[], opts: { org?: string; agent?: string; scope?: string; collection?: string }) => {
+    const env = resolveEnv();
+    const org = opts.org || env.org;
+    if (!org) {
+      console.error('ERROR: --org or CTX_ORG required');
+      process.exit(1);
+    }
+
+    deleteKnowledgeBase(paths, {
+      org,
+      agent: opts.agent || env.agentName,
+      scope: (opts.scope as 'shared' | 'private') || 'shared',
+      collection: opts.collection,
       frameworkRoot: env.frameworkRoot || process.cwd(),
       instanceId: env.instanceId,
     });
