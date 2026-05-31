@@ -20,14 +20,18 @@ vi.mock('fs', async () => {
   };
 });
 
-// Mock execFileSync so we can assert whether it was called (and optionally
-// simulate a successful python response).
+// Mock execFileSync + spawnSync so we can assert whether they were called
+// (and optionally simulate python output). queryKnowledgeBase uses execFileSync
+// directly; ingestKnowledgeBase switched to spawnSync so it can detect a
+// Gemini-quota 429 in stdout/stderr and skip gracefully instead of throwing.
 const execFileSyncMock = vi.fn();
+const spawnSyncMock = vi.fn();
 vi.mock('child_process', async () => {
   const actual = await vi.importActual<typeof import('child_process')>('child_process');
   return {
     ...actual,
     execFileSync: (...args: unknown[]) => execFileSyncMock(...args),
+    spawnSync: (...args: unknown[]) => spawnSyncMock(...args),
   };
 });
 
@@ -71,6 +75,10 @@ beforeEach(() => {
   fsMocks.readFileSync.mockReset().mockReturnValue('');
   fsMocks.mkdirSync.mockReset();
   execFileSyncMock.mockReset();
+  spawnSyncMock.mockReset();
+  // Default spawnSync behaviour: success with no output, mirrors the python
+  // happy path so tests that don't care about quota-skip don't have to set it.
+  spawnSyncMock.mockReturnValue({ status: 0, stdout: '', stderr: '' });
 
   warnLog = [];
   logLog = [];
@@ -111,7 +119,7 @@ function mockConfiguredKb(): void {
 }
 
 describe('ingestKnowledgeBase — graceful missing-config', () => {
-  it('missing config: warn + return cleanly, execFileSync NEVER called', () => {
+  it('missing config: warn + return cleanly, neither python spawn called', () => {
     mockMissingKbConfig();
 
     // Must NOT throw. Previously this path threw an unhandled execFileSync
@@ -121,25 +129,87 @@ describe('ingestKnowledgeBase — graceful missing-config', () => {
     ).not.toThrow();
 
     expect(execFileSyncMock).not.toHaveBeenCalled();
+    expect(spawnSyncMock).not.toHaveBeenCalled();
     // Warn must include the org name AND an actionable hint ("run setup").
     expect(warnLog.some((m) => m.includes('TestOrg') && /run setup/i.test(m))).toBe(true);
     // Warn must carry the [kb] prefix so operators can filter log lines.
     expect(warnLog.some((m) => m.includes('[kb]'))).toBe(true);
   });
 
-  it('config present: execFileSync IS called with the mmrag ingest args', () => {
+  it('config present: spawnSync IS called with the mmrag ingest args', () => {
     mockConfiguredKb();
-    execFileSyncMock.mockReturnValue('');
+    spawnSyncMock.mockReturnValue({ status: 0, stdout: '', stderr: '' });
 
     ingestKnowledgeBase(['/some/file.md'], baseOptions);
 
-    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
-    // First positional arg is the python path, second is the argv array.
-    const [pythonPath, argv] = execFileSyncMock.mock.calls[0] as [string, string[], object];
+    expect(spawnSyncMock).toHaveBeenCalledTimes(1);
+    const [pythonPath, argv] = spawnSyncMock.mock.calls[0] as [string, string[], object];
     expect(String(pythonPath)).toMatch(/python/);
     expect(argv).toEqual(expect.arrayContaining(['ingest', '/some/file.md']));
     // Happy path emits no [kb] warning.
     expect(warnLog.filter((m) => m.includes('[kb]'))).toHaveLength(0);
+  });
+});
+
+describe('ingestKnowledgeBase — Gemini quota-exhausted skip (E2)', () => {
+  it('429 RESOURCE_EXHAUSTED in stderr → warn + return cleanly (no throw, no retry)', () => {
+    mockConfiguredKb();
+    // Mirror the exact mmrag.py error shape observed in the field:
+    //   ERROR: 429 RESOURCE_EXHAUSTED. {...}
+    spawnSyncMock.mockReturnValue({
+      status: 1,
+      stdout: 'Ingesting: MEMORY.md\n',
+      stderr: "  ERROR: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota'}}",
+    });
+
+    expect(() =>
+      ingestKnowledgeBase(['/MEMORY.md'], baseOptions),
+    ).not.toThrow();
+
+    expect(spawnSyncMock).toHaveBeenCalledTimes(1);
+    // The skip warning is operator-facing — must name the collection AND
+    // mention quota so it's obvious why the ingest was skipped.
+    const quotaWarns = warnLog.filter((m) => m.includes('[kb]') && /quota exhausted/i.test(m));
+    expect(quotaWarns.length).toBeGreaterThanOrEqual(1);
+    expect(quotaWarns[0]).toMatch(/agent-TestAgent|shared-TestOrg/);
+  });
+
+  it('429 RESOURCE_EXHAUSTED in stdout (not stderr) → also detected', () => {
+    mockConfiguredKb();
+    // Some mmrag paths print the error to stdout; the detector should not
+    // care which stream the message came from.
+    spawnSyncMock.mockReturnValue({
+      status: 1,
+      stdout: 'ERROR: 429 RESOURCE_EXHAUSTED quota exceeded',
+      stderr: '',
+    });
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).not.toThrow();
+    expect(warnLog.some((m) => m.includes('[kb]') && /quota exhausted/i.test(m))).toBe(true);
+  });
+
+  it('non-quota failure (status != 0, no 429/RESOURCE_EXHAUSTED) → throws as before', () => {
+    mockConfiguredKb();
+    spawnSyncMock.mockReturnValue({
+      status: 1,
+      stdout: '',
+      stderr: 'ERROR: connection refused to chromadb',
+    });
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/exited with status 1/);
+    // The quota skip warning must NOT fire on unrelated failures.
+    expect(warnLog.filter((m) => m.includes('[kb]') && /quota/i.test(m))).toHaveLength(0);
+  });
+
+  it('detector requires BOTH 429 AND RESOURCE_EXHAUSTED (not just 429)', () => {
+    mockConfiguredKb();
+    // A bare 429 without RESOURCE_EXHAUSTED is some OTHER kind of throttle
+    // (e.g. transient rate limit, not quota-day-exhaustion). It should be a
+    // real failure — retry semantics belong to the caller / next cycle.
+    spawnSyncMock.mockReturnValue({
+      status: 1,
+      stdout: '',
+      stderr: 'HTTP 429 Too Many Requests',
+    });
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/exited with status 1/);
   });
 });
 
