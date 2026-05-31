@@ -1272,6 +1272,244 @@ busCommand
   });
 
 // ---------------------------------------------------------------------------
+// Foundry — RBAC-gated org service surface.
+// Resolves <service> <operation> against orgs/{org}/projects/foundry/services/registry.json,
+// issues a 60-second Bearer token via the org's foundry RBAC lib, and POSTs
+// (or GETs) the operation. Framework stays org-agnostic — all foundry paths
+// are derived from CTX_ORG + CTX_FRAMEWORK_ROOT or overridable via flags.
+// ---------------------------------------------------------------------------
+
+// Parse loose CLI flags (--key value or --key=value) into a JSON body. Used
+// to give `cortextos bus foundry domain-check check --names "VELA,KEEL"` an
+// ergonomic body-build path without forcing operators to hand-write JSON.
+//
+// Coercions on the value side:
+//   - "true"/"false" → boolean
+//   - "null"         → null
+//   - matches /^-?\d+(\.\d+)?$/ → number
+//   - "a,b,c"        → ["a","b","c"]
+//   - everything else stays a string
+// `--body <json>` always wins and short-circuits flag parsing.
+function buildFoundryBodyFromFlags(rest: string[]): { body: any; bodyArg?: string } {
+  // Find an explicit --body / --body=... first.
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--body' && rest[i + 1]) {
+      try { return { body: JSON.parse(rest[i + 1]), bodyArg: rest[i + 1] }; }
+      catch { throw new Error(`--body value is not valid JSON: ${rest[i + 1]}`); }
+    }
+    if (a.startsWith('--body=')) {
+      const raw = a.slice('--body='.length);
+      try { return { body: JSON.parse(raw), bodyArg: raw }; }
+      catch { throw new Error(`--body value is not valid JSON: ${raw}`); }
+    }
+  }
+  // Fallback: collect --key=value / --key value pairs.
+  const body: Record<string, unknown> = {};
+  for (let i = 0; i < rest.length; i++) {
+    let key: string | null = null;
+    let val: string | null = null;
+    const a = rest[i];
+    if (a.startsWith('--')) {
+      if (a.includes('=')) {
+        const eq = a.indexOf('=');
+        key = a.slice(2, eq);
+        val = a.slice(eq + 1);
+      } else {
+        key = a.slice(2);
+        val = rest[i + 1] && !rest[i + 1].startsWith('--') ? rest[++i] : '';
+      }
+      if (!key) continue;
+      // Coerce
+      let coerced: unknown = val;
+      if (val === 'true') coerced = true;
+      else if (val === 'false') coerced = false;
+      else if (val === 'null') coerced = null;
+      else if (val !== '' && /^-?\d+(\.\d+)?$/.test(val)) coerced = Number(val);
+      else if (val.includes(',') && !val.startsWith('{') && !val.startsWith('[')) {
+        coerced = val.split(',').map((s) => s.trim()).filter(Boolean);
+      }
+      body[key] = coerced;
+    }
+  }
+  return { body };
+}
+
+busCommand
+  .command('foundry')
+  .description('Call a Foundry service operation through the RBAC gate')
+  .allowUnknownOption()  // Pass --names / --tlds / etc. through to args[] for the body builder.
+  .argument('<service>', 'Service name (must exist in registry.json — e.g. ping, domain-check)')
+  .argument('<operation>', 'Operation name (must exist in service.operations — e.g. ping, check)')
+  .argument('[args...]', 'Either `--body <json>` for an exact body, or loose --key=value pairs that are JSON-encoded together (string, number, bool, null, csv→array)')
+  .option('--org <org>', 'Override CTX_ORG (defaults to the calling agent\'s org)')
+  .option('--agent <name>', 'Override CTX_AGENT_NAME (defaults to the calling agent)')
+  .option('--registry <path>', 'Override the registry path (default: orgs/{org}/projects/foundry/services/registry.json)')
+  .option('--ttl <seconds>', 'Token TTL in seconds (default 60). Tokens are issued per-call and never persisted.', '60')
+  .option('--timeout <ms>', 'Request timeout in milliseconds (default 30000)', '30000')
+  .option('--json', 'Output the full HTTP response as JSON (default: status code + parsed body)')
+  .action(async (service: string, operation: string, args: string[], opts: { org?: string; agent?: string; registry?: string; ttl?: string; timeout?: string; json?: boolean }) => {
+    const env = resolveEnv();
+    const org = opts.org || env.org;
+    if (!org) {
+      console.error('ERROR: --org or CTX_ORG required');
+      process.exit(1);
+    }
+    const agent = opts.agent || env.agentName;
+    if (!agent) {
+      console.error('ERROR: --agent or CTX_AGENT_NAME required (need a caller identity for the Bearer token)');
+      process.exit(1);
+    }
+
+    const frameworkRoot = env.frameworkRoot || process.cwd();
+    const { existsSync, readFileSync } = require('fs');
+    const { join: pjoin } = require('path');
+
+    // Resolve registry.json
+    const registryPath = opts.registry || pjoin(frameworkRoot, 'orgs', org, 'projects', 'foundry', 'services', 'registry.json');
+    if (!existsSync(registryPath)) {
+      console.error(`ERROR: foundry registry not found at ${registryPath}\n` +
+        `Hint: this org may not have a foundry deployment. Set --registry to point at a registry.json or create one under orgs/${org}/projects/foundry/services/.`);
+      process.exit(1);
+    }
+    let registry: any;
+    try {
+      registry = JSON.parse(readFileSync(registryPath, 'utf-8'));
+    } catch (e: any) {
+      console.error(`ERROR: failed to parse ${registryPath}: ${e.message}`);
+      process.exit(1);
+    }
+    const svc = registry.services && registry.services[service];
+    if (!svc) {
+      const known = Object.keys(registry.services || {}).join(', ') || '(none)';
+      console.error(`ERROR: unknown service "${service}". Known: ${known}`);
+      process.exit(1);
+    }
+    const op = svc.operations && svc.operations[operation];
+    if (!op) {
+      const known = Object.keys(svc.operations || {}).join(', ') || '(none)';
+      console.error(`ERROR: unknown operation "${operation}" on service "${service}". Known: ${known}`);
+      process.exit(1);
+    }
+
+    // Resolve the foundry RBAC lib for this org. Loaded dynamically because
+    // the framework code stays generic — different orgs may have different
+    // foundry deployments (or none at all).
+    const rbacLibPath = pjoin(frameworkRoot, 'orgs', org, 'projects', 'foundry', 'lib', 'rbac');
+    if (!existsSync(rbacLibPath)) {
+      console.error(`ERROR: foundry RBAC lib not found at ${rbacLibPath}`);
+      process.exit(1);
+    }
+    let rbac: any;
+    try {
+      rbac = require(rbacLibPath);
+    } catch (e: any) {
+      console.error(`ERROR: failed to load foundry RBAC lib: ${e.message}`);
+      process.exit(1);
+    }
+
+    // FOUNDRY_TOKEN_SECRET must be in env for token issuance. Surface a clear
+    // error rather than letting the lib fail with a generic message.
+    if (!process.env.FOUNDRY_TOKEN_SECRET) {
+      // Try to load from orgs/{org}/secrets.env (same pattern as kb-collections)
+      const secretsPath = pjoin(frameworkRoot, 'orgs', org, 'secrets.env');
+      if (existsSync(secretsPath)) {
+        for (const line of readFileSync(secretsPath, 'utf-8').split('\n')) {
+          const t = line.trim();
+          if (!t || t.startsWith('#')) continue;
+          const idx = t.indexOf('=');
+          if (idx > 0 && t.slice(0, idx) === 'FOUNDRY_TOKEN_SECRET') {
+            let v = t.slice(idx + 1);
+            if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+            process.env.FOUNDRY_TOKEN_SECRET = v;
+            break;
+          }
+        }
+      }
+    }
+    if (!process.env.FOUNDRY_TOKEN_SECRET) {
+      console.error(`ERROR: FOUNDRY_TOKEN_SECRET not set in env (or orgs/${org}/secrets.env). Cannot issue token.`);
+      process.exit(1);
+    }
+
+    // Issue a short-lived token for this caller. The whole point: tokens are
+    // per-call and disposable — never persisted, never reused.
+    const ttl = Math.max(1, Math.min(parseInt(opts.ttl || '60', 10), 3600));
+    let token: string;
+    try {
+      token = rbac.issueAgentToken({ caller_id: agent, tenant_id: org, ttl_seconds: ttl });
+    } catch (e: any) {
+      console.error(`ERROR: token issuance failed: ${e.message}`);
+      process.exit(1);
+    }
+
+    // Build the body (POST/PUT/PATCH only)
+    const method = (op.method || 'POST').toUpperCase();
+    const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'DELETE';
+    let body: any = undefined;
+    if (hasBody) {
+      try {
+        const parsed = buildFoundryBodyFromFlags(args);
+        body = parsed.body;
+      } catch (e: any) {
+        console.error(`ERROR: ${e.message}`);
+        process.exit(1);
+      }
+    }
+
+    // Send the request
+    const url = `${svc.url.replace(/\/$/, '')}${op.path}`;
+    const headers: Record<string, string> = {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/json',
+    };
+    if (hasBody) headers['Content-Type'] = 'application/json';
+
+    const timeoutMs = Math.max(100, parseInt(opts.timeout || '30000', 10));
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+
+    let response: Response;
+    let text: string;
+    try {
+      response = await fetch(url, {
+        method,
+        headers,
+        body: hasBody ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      text = await response.text();
+    } catch (e: any) {
+      clearTimeout(t);
+      if (e.name === 'AbortError') {
+        console.error(`ERROR: request timed out after ${timeoutMs}ms calling ${url}`);
+        process.exit(1);
+      }
+      console.error(`ERROR: request failed: ${e.message}`);
+      process.exit(1);
+    } finally {
+      clearTimeout(t);
+    }
+
+    let parsed: any = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch { /* keep null */ }
+
+    if (opts.json) {
+      console.log(JSON.stringify({
+        status: response.status,
+        ok: response.ok,
+        body: parsed !== null ? parsed : text,
+      }, null, 2));
+    } else {
+      // Default: print parsed body (or raw text) and exit non-zero on HTTP error
+      if (parsed !== null) console.log(JSON.stringify(parsed, null, 2));
+      else if (text) console.log(text);
+    }
+
+    if (!response.ok) process.exit(2);
+  });
+
+// ---------------------------------------------------------------------------
 // Hook subcommands — cross-platform replacements for hook-*.sh bash scripts
 // These are invoked by Claude Code settings.json hooks on all platforms.
 // ---------------------------------------------------------------------------
