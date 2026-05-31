@@ -137,15 +137,19 @@ describe('Sprint 1: Template Completeness', () => {
       }
     });
 
-    it('has config.json with 5 orchestrator crons', () => {
+    it('has config.json with 6 orchestrator crons', () => {
+      // daily-restart was added fleet-wide via 3830d31 (templates: grandparent-fix
+      // daily-restart cron). Every agent template now ships with it by default,
+      // bringing the orchestrator count from 5 → 6.
       const config = JSON.parse(readFileSync(join(orchDir, 'config.json'), 'utf-8'));
-      expect(config.crons.length).toBe(5);
+      expect(config.crons.length).toBe(6);
       const cronNames = config.crons.map((c: any) => c.name);
       expect(cronNames).toContain('heartbeat');
       expect(cronNames).toContain('check-approvals');
       expect(cronNames).toContain('morning-review');
       expect(cronNames).toContain('evening-review');
       expect(cronNames).toContain('weekly-review');
+      expect(cronNames).toContain('daily-restart');
     });
 
     it('goals.json exists with all expected fields', () => {
@@ -215,15 +219,19 @@ describe('Sprint 1: Template Completeness', () => {
       }
     });
 
-    it('has config.json with 5 analyst crons + ecosystem config', () => {
+    it('has config.json with 6 analyst crons + ecosystem config', () => {
+      // daily-restart was added fleet-wide via 3830d31 (templates: grandparent-fix
+      // daily-restart cron). Every agent template now ships with it by default,
+      // bringing the analyst count from 5 → 6.
       const config = JSON.parse(readFileSync(join(analystDir, 'config.json'), 'utf-8'));
-      expect(config.crons.length).toBe(5);
+      expect(config.crons.length).toBe(6);
       const cronNames = config.crons.map((c: any) => c.name);
       expect(cronNames).toContain('heartbeat');
       expect(cronNames).toContain('nightly-metrics');
       expect(cronNames).toContain('auto-commit');
       expect(cronNames).toContain('check-upstream');
       expect(cronNames).toContain('catalog-browse');
+      expect(cronNames).toContain('daily-restart');
       expect(config.ecosystem).toBeDefined();
       expect(config.ecosystem.local_version_control).toBeDefined();
     });
