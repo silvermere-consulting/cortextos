@@ -1123,10 +1123,11 @@ busCommand
   .option('--org <org>', 'Organization name')
   .option('--agent <name>', 'Agent name (for private scope)')
   .option('--scope <s>', 'Scope: shared, private, or all', 'all')
+  .option('--collection <name>', 'Override auto-derived collection name (e.g. memory-{agent})')
   .option('--top-k <n>', 'Number of results', '5')
   .option('--threshold <f>', 'Minimum similarity score (0-1)', '0.5')
   .option('--json', 'Output raw JSON')
-  .action((question: string, opts: { org?: string; agent?: string; scope?: string; topK?: string; threshold?: string; json?: boolean }) => {
+  .action((question: string, opts: { org?: string; agent?: string; scope?: string; collection?: string; topK?: string; threshold?: string; json?: boolean }) => {
     const env = resolveEnv();
     const org = opts.org || env.org;
     if (!org) {
@@ -1141,6 +1142,7 @@ busCommand
         org,
         agent: opts.agent || env.agentName,
         scope: (opts.scope as 'shared' | 'private' | 'all') || 'all',
+        collection: opts.collection,
         topK: parseInt(opts.topK || '5', 10),
         threshold: parseFloat(opts.threshold || '0.5'),
         frameworkRoot: env.frameworkRoot || process.cwd(),
@@ -1174,8 +1176,9 @@ busCommand
   .option('--org <org>', 'Organization name')
   .option('--agent <name>', 'Agent name (for private scope)')
   .option('--scope <s>', 'Scope: shared or private', 'shared')
+  .option('--collection <name>', 'Override auto-derived collection name (e.g. memory-{agent})')
   .option('--force', 'Re-ingest even if already indexed')
-  .action((paths: string[], opts: { org?: string; agent?: string; scope?: string; force?: boolean }) => {
+  .action((paths: string[], opts: { org?: string; agent?: string; scope?: string; collection?: string; force?: boolean }) => {
     const env = resolveEnv();
     const org = opts.org || env.org;
     if (!org) {
@@ -1189,6 +1192,7 @@ busCommand
       org,
       agent: opts.agent || env.agentName,
       scope: (opts.scope as 'shared' | 'private') || 'shared',
+      collection: opts.collection,
       force: opts.force,
       frameworkRoot: env.frameworkRoot || process.cwd(),
       instanceId: env.instanceId,
