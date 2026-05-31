@@ -980,8 +980,9 @@ busCommand
   .argument('<message>', 'Message text (supports Telegram Markdown unless --plain-text is set)')
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
+  .option('--reply-to <message_id>', 'Send as a reply to an existing Telegram message_id (threads the new message under it in the client UI)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; replyTo?: string; plainText?: boolean }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
@@ -1013,17 +1014,31 @@ busCommand
     }
 
     const api = new TelegramAPI(botToken);
+    // Parse --reply-to once: Telegram expects an integer message_id. A
+    // non-numeric value (e.g. an agent-message msg_id by mistake) silently
+    // becomes 0 and the API drops it — better to ignore and warn than to
+    // send a request with a clearly-broken reply_to.
+    let replyToMessageId: number | undefined;
+    if (opts.replyTo) {
+      const parsed = Number(opts.replyTo);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        replyToMessageId = parsed;
+      } else {
+        console.warn(`[telegram] --reply-to value "${opts.replyTo}" is not a positive integer; ignoring`);
+      }
+    }
     try {
       let sentMessageId = 0;
       if (opts.image) {
-        const result = await api.sendPhoto(chatId, opts.image, message);
+        const result = await api.sendPhoto(chatId, opts.image, message, undefined, replyToMessageId);
         sentMessageId = result?.result?.message_id ?? 0;
       } else if (opts.file) {
-        const result = await api.sendDocument(chatId, opts.file, message);
+        const result = await api.sendDocument(chatId, opts.file, message, undefined, replyToMessageId);
         sentMessageId = result?.result?.message_id ?? 0;
       } else {
         const result = await api.sendMessage(chatId, message, undefined, {
           parseMode: opts.plainText ? null : 'HTML',
+          replyToMessageId,
         });
         sentMessageId = result?.result?.message_id ?? 0;
       }

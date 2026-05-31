@@ -187,6 +187,7 @@ export class TelegramAPI {
     opts?: {
       parseMode?: 'HTML' | null;
       onParseFallback?: (reason: string) => void;
+      replyToMessageId?: number;
     },
   ): Promise<any> {
     const plainText = opts?.parseMode === null;
@@ -205,6 +206,7 @@ export class TelegramAPI {
         chunk,
         plainText ? null : 'HTML',
         isLastChunk ? replyMarkup : undefined,
+        opts?.replyToMessageId,
       );
     }
     return lastResult;
@@ -218,11 +220,13 @@ export class TelegramAPI {
     text: string,
     parseMode: 'HTML' | null,
     replyMarkup: object | undefined,
+    replyToMessageId?: number,
   ): Promise<any> {
     const basePayload: Record<string, unknown> = {
       chat_id: chatId,
       text,
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      ...(replyToMessageId ? { reply_to_message_id: replyToMessageId } : {}),
     };
 
     const payload =
@@ -258,6 +262,7 @@ export class TelegramAPI {
     imagePath: string,
     caption?: string,
     replyMarkup?: object,
+    replyToMessageId?: number,
   ): Promise<any> {
     if (!existsSync(imagePath)) {
       throw new Error(`Image file not found: ${imagePath}`);
@@ -277,6 +282,9 @@ export class TelegramAPI {
     }
     if (replyMarkup) {
       formData.append('reply_markup', JSON.stringify(replyMarkup));
+    }
+    if (replyToMessageId) {
+      formData.append('reply_to_message_id', String(replyToMessageId));
     }
 
     try {
@@ -310,6 +318,7 @@ export class TelegramAPI {
     filePath: string,
     caption?: string,
     replyMarkup?: object,
+    replyToMessageId?: number,
   ): Promise<any> {
     if (!existsSync(filePath)) {
       throw new Error(`File not found: ${filePath}`);
@@ -328,6 +337,9 @@ export class TelegramAPI {
     }
     if (replyMarkup) {
       formData.append('reply_markup', JSON.stringify(replyMarkup));
+    }
+    if (replyToMessageId) {
+      formData.append('reply_to_message_id', String(replyToMessageId));
     }
 
     try {
