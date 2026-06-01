@@ -1203,6 +1203,14 @@ def cmd_ingest(args):
         print(f"  Errors: {errors}")
     print(_tracker.summary_line())
 
+    if errors:
+        # Non-zero exit so the bus knowledge-base.ts wrapper can detect
+        # per-file failures (e.g. Gemini 429 RESOURCE_EXHAUSTED on one file
+        # of a multi-file ingest) and emit the kb/quota_skip structured event.
+        # Without this, an "errors=N" summary printed alongside exit 0 silently
+        # absorbs quota failures and the detector never fires.
+        sys.exit(1)
+
 
 def deduplicate_results(results, similarity_ratio=0.85):
     """Remove near-duplicate results based on content overlap."""

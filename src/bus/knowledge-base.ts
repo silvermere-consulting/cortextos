@@ -387,7 +387,11 @@ function emitQuotaSkipEvent(frameworkRoot: string, meta: { collection: string; s
   try {
     const cliPath = join(frameworkRoot, 'dist', 'cli.js');
     if (!existsSync(cliPath)) return;
-    execFileSync(process.execPath, [cliPath, 'bus', 'log-event', 'kb', 'quota_skip', 'warn', '--meta', JSON.stringify(meta)], {
+    // Category MUST be one of the validate.ts VALID_CATEGORIES — kb is not in
+    // that list, so an earlier "log-event kb quota_skip" silently failed (the
+    // outer try/catch swallowed the validation throw). Use category=action with
+    // event=kb_quota_skip so dashboards can still group by event name.
+    execFileSync(process.execPath, [cliPath, 'bus', 'log-event', 'action', 'kb_quota_skip', 'warning', '--meta', JSON.stringify(meta)], {
       timeout: 5_000,
       stdio: 'pipe',
     });
