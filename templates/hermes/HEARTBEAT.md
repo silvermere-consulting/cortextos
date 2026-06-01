@@ -3,6 +3,16 @@
 This runs on your heartbeat cron (every 1 hour). Execute EVERY step in order.
 Skipping steps = broken system.
 
+## Step 0.5: Read MEMORY.md (UNCONDITIONAL)
+
+```
+Read ./MEMORY.md
+```
+
+Mid-session bankings to MEMORY.md (during this active session by you OR other agents) live on disk but do NOT enter your active context until cold-boot, /compact, or explicit re-read. This step closes that gap. Costs ~2k tokens per cycle; closes the fleet-wide silent-stale-context failure mode caught 2026-06-01.
+
+For agents with MEMORY.md >500 lines: tail-only variant tracked as v3 follow-up.
+
 ## Step 1: Update heartbeat (DO THIS FIRST)
 
 ```bash

@@ -5,6 +5,16 @@ Skipping steps = broken system. The dashboard monitors your compliance.
 
 > **Cron schedules are interpreted in the agent's local timezone (`CTX_TIMEZONE`), not UTC.** A cron of `0 2 * * *` fires at 02:00 *agent-local time* (e.g. 22:00 UTC for an Asia/Dubai agent). To confirm actual fire times, run `cortextos bus get-cron-log $CTX_AGENT_NAME`.
 
+## Step 0.5: Read MEMORY.md (UNCONDITIONAL)
+
+```
+Read ./MEMORY.md
+```
+
+Mid-session bankings to MEMORY.md (during this active session by you OR other agents) live on disk but do NOT enter your active context until cold-boot, /compact, or explicit re-read. This step closes that gap. Costs ~2k tokens per cycle; closes the fleet-wide silent-stale-context failure mode caught 2026-06-01.
+
+For agents with MEMORY.md >500 lines: tail-only variant tracked as v3 follow-up.
+
 ## Step 1: Update heartbeat (DO THIS FIRST)
 
 ```bash
