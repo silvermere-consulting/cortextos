@@ -175,9 +175,9 @@ const html = `<!DOCTYPE html>
 
   /* Page layout */
   .page {
-    max-width: 680px;
+    max-width: ${isLandscape ? '1040px' : '680px'};
     margin: 0 auto;
-    padding: 48px 32px 64px;
+    padding: ${isLandscape ? '20px 24px 28px' : '48px 32px 64px'};
   }
 
   /* Silvermere brand header (logo + gold rule) */
@@ -387,8 +387,8 @@ const html = `<!DOCTYPE html>
   table { page-break-inside: avoid; }
 
   @page {
-    size: A4;
-    margin: 18mm 16mm 22mm;
+    size: A4${isLandscape ? ' landscape' : ''};
+    margin: ${isLandscape ? '10mm' : '18mm 16mm 22mm'};
   }
 </style>
 </head>
