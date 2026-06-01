@@ -690,10 +690,18 @@ busCommand
   .command('auto-commit')
   .description('Stage safe files for commit (never pushes)')
   .option('--dry-run', 'Show what would be staged without modifying git')
-  .action((opts: { dryRun?: boolean }) => {
+  .option('--no-agent-filter', 'Disable agent-dir path-filter (stage ALL safe files repo-wide)')
+  .action((opts: { dryRun?: boolean; agentFilter?: boolean }) => {
     const env = resolveEnv();
     const projectDir = env.projectRoot || env.frameworkRoot || process.cwd();
-    const report = autoCommit(projectDir, opts.dryRun ?? false);
+    // Default: filter to the agent's own dir so a scheduled auto-commit cannot
+    // claim authorship of cross-agent or framework-level orphans. Disable with
+    // --no-agent-filter for repo-wide staging (e.g. manual one-off commits).
+    let agentPathPrefix: string | undefined;
+    if (opts.agentFilter !== false && env.agentName && env.org) {
+      agentPathPrefix = `orgs/${env.org}/agents/${env.agentName}/`;
+    }
+    const report = autoCommit(projectDir, opts.dryRun ?? false, agentPathPrefix);
     console.log(JSON.stringify(report));
   });
 

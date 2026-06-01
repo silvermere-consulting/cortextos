@@ -95,9 +95,17 @@ export function hardRestart(paths: BusPaths, agentName: string, reason?: string)
 /**
  * Auto-commit safe files in a project directory.
  * Filters out dangerous files (credentials, env, large, binary).
+ *
+ * When `agentPathPrefix` is provided (e.g. `orgs/silvermere-tech/agents/engineer/`),
+ * only files under that prefix are staged. Files outside the prefix go to
+ * `blocked` with reason `outside_agent_dir` — they stay visible as orphans
+ * for the responsible agent to commit consciously. This prevents one agent's
+ * scheduled auto-commit from silently claiming authorship of another agent's
+ * orphans or framework-level changes.
+ *
  * Never pushes. Mirrors bash bus/auto-commit.sh.
  */
-export function autoCommit(projectDir: string, dryRun: boolean = false): AutoCommitReport {
+export function autoCommit(projectDir: string, dryRun: boolean = false, agentPathPrefix?: string): AutoCommitReport {
   // Check if git repo
   try {
     execSync('git rev-parse --is-inside-work-tree', { cwd: projectDir, stdio: 'pipe' });
@@ -125,8 +133,25 @@ export function autoCommit(projectDir: string, dryRun: boolean = false): AutoCom
   const staged: string[] = [];
   const blocked: string[] = [];
 
+  // Normalise the agent path prefix: strip leading "./", ensure trailing "/"
+  // so prefix-matching is unambiguous (e.g. "orgs/foo/agents/bar/" matches
+  // "orgs/foo/agents/bar/x" but not "orgs/foo/agents/bar-other/x").
+  let normalisedPrefix: string | undefined;
+  if (agentPathPrefix && agentPathPrefix.trim()) {
+    normalisedPrefix = agentPathPrefix.replace(/^\.\//, '');
+    if (!normalisedPrefix.endsWith('/')) normalisedPrefix += '/';
+  }
+
   for (const file of changedFiles) {
     if (!file) continue;
+
+    // Path-filter: when a prefix is set, files outside it stay orphan + visible.
+    // Today's case (2026-06-01): analyst auto-commit nearly claimed authorship
+    // of an engineer-territory framework patch left in the working tree.
+    if (normalisedPrefix && !file.startsWith(normalisedPrefix)) {
+      blocked.push(`${file}:outside_agent_dir`);
+      continue;
+    }
 
     // Block .env files
     if (file.endsWith('.env') || file.includes('/.env')) {

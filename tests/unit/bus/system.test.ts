@@ -173,6 +173,84 @@ describe('Bus System', () => {
       expect(report.status).toBe('nothing_to_stage');
       expect(report.blocked.length).toBeGreaterThan(0);
     });
+
+    describe('agent path-filter', () => {
+      it('blocks files outside the agent dir with outside_agent_dir reason', () => {
+        // Mimic the silvermere-tech repo layout: agent dir + framework file outside
+        mkdirSync(join(gitDir, 'orgs', 'silvermere-tech', 'agents', 'engineer'), { recursive: true });
+        mkdirSync(join(gitDir, 'orgs', 'silvermere-tech', 'agents', 'analyst'), { recursive: true });
+        mkdirSync(join(gitDir, 'scripts'), { recursive: true });
+        // Seed tracked .gitkeep so untracked siblings list individually.
+        writeFileSync(join(gitDir, 'orgs', 'silvermere-tech', 'agents', 'engineer', '.gitkeep'), '');
+        writeFileSync(join(gitDir, 'orgs', 'silvermere-tech', 'agents', 'analyst', '.gitkeep'), '');
+        writeFileSync(join(gitDir, 'scripts', '.gitkeep'), '');
+        execSync('git add -A && git commit -m "seed"', { cwd: gitDir, stdio: 'pipe' });
+        writeFileSync(join(gitDir, 'orgs', 'silvermere-tech', 'agents', 'engineer', 'notes.md'), 'engineer note');
+        writeFileSync(join(gitDir, 'orgs', 'silvermere-tech', 'agents', 'analyst', 'notes.md'), 'analyst note');
+        writeFileSync(join(gitDir, 'scripts', 'framework-helper.js'), '// framework code');
+
+        const report = autoCommit(gitDir, true, 'orgs/silvermere-tech/agents/engineer/');
+
+        expect(report.staged).toContain('orgs/silvermere-tech/agents/engineer/notes.md');
+        expect(report.blocked.some(b => b.includes('orgs/silvermere-tech/agents/analyst/notes.md') && b.includes('outside_agent_dir'))).toBe(true);
+        expect(report.blocked.some(b => b.includes('scripts/framework-helper.js') && b.includes('outside_agent_dir'))).toBe(true);
+      });
+
+      it('prefix-match is strict (analyst does not match analyst-foo)', () => {
+        // Seed tracked .gitkeep in each subdir so subsequent untracked files
+        // within are listed individually by git status (otherwise git collapses
+        // untracked-only dirs to a single "?? dir/" entry).
+        mkdirSync(join(gitDir, 'orgs', 'o', 'agents', 'analyst'), { recursive: true });
+        mkdirSync(join(gitDir, 'orgs', 'o', 'agents', 'analyst-foo'), { recursive: true });
+        writeFileSync(join(gitDir, 'orgs', 'o', 'agents', 'analyst', '.gitkeep'), '');
+        writeFileSync(join(gitDir, 'orgs', 'o', 'agents', 'analyst-foo', '.gitkeep'), '');
+        execSync('git add -A && git commit -m "seed"', { cwd: gitDir, stdio: 'pipe' });
+        writeFileSync(join(gitDir, 'orgs', 'o', 'agents', 'analyst', 'a.md'), 'a');
+        writeFileSync(join(gitDir, 'orgs', 'o', 'agents', 'analyst-foo', 'b.md'), 'b');
+
+        const report = autoCommit(gitDir, true, 'orgs/o/agents/analyst/');
+
+        expect(report.staged).toContain('orgs/o/agents/analyst/a.md');
+        expect(report.blocked.some(b => b.includes('analyst-foo/b.md') && b.includes('outside_agent_dir'))).toBe(true);
+      });
+
+      it('no prefix = unfiltered (backward-compat for callers without agent context)', () => {
+        writeFileSync(join(gitDir, 'a.md'), 'a');
+        writeFileSync(join(gitDir, 'b.md'), 'b');
+
+        const report = autoCommit(gitDir, true);
+
+        expect(report.staged).toContain('a.md');
+        expect(report.staged).toContain('b.md');
+        expect(report.blocked.some(b => b.includes('outside_agent_dir'))).toBe(false);
+      });
+
+      it('normalises prefix without trailing slash', () => {
+        mkdirSync(join(gitDir, 'agents', 'foo'), { recursive: true });
+        writeFileSync(join(gitDir, 'agents', 'foo', '.gitkeep'), '');
+        execSync('git add -A && git commit -m "seed"', { cwd: gitDir, stdio: 'pipe' });
+        writeFileSync(join(gitDir, 'agents', 'foo', 'x.md'), 'x');
+        writeFileSync(join(gitDir, 'other.md'), 'other');
+
+        // Pass prefix WITHOUT trailing slash — function should normalise.
+        const report = autoCommit(gitDir, true, 'agents/foo');
+
+        expect(report.staged).toContain('agents/foo/x.md');
+        expect(report.blocked.some(b => b.includes('other.md') && b.includes('outside_agent_dir'))).toBe(true);
+      });
+
+      it('blocks-then-other-checks: a file outside the dir is blocked even if it would also fail other rules', () => {
+        // outside-dir block fires first; we should see outside_agent_dir reason,
+        // not credential_pattern_detected or .env, because the path-filter is
+        // the cheapest first-pass gate.
+        writeFileSync(join(gitDir, 'config.json'), '{"token=abc"}');
+
+        const report = autoCommit(gitDir, true, 'agents/foo/');
+
+        expect(report.blocked.some(b => b.includes('config.json') && b.includes('outside_agent_dir'))).toBe(true);
+        expect(report.blocked.some(b => b.includes('config.json') && b.includes('credential_pattern_detected'))).toBe(false);
+      });
+    });
   });
 
   describe('checkGoalStaleness', () => {
