@@ -319,6 +319,8 @@ Also update GUARDRAILS.md when you identify a pattern of behaviour that should b
 
 Update on every heartbeat and at session end. When you update MEMORY.md, ingest it to your `memory-{agent}` KB collection so it is semantically searchable.
 
+**OVERWRITE protocol (banked 2026-06-02).** Corrections to a MEMORY.md entry OVERWRITE the original in place. Strikethrough (`~~old text~~`) carries the audit-trail WITHIN the same block — never as a new dated CORRECTION section appended later. Compression-only edits (re-wording, tightening, removing redundancy) = clean replace, no strikethrough. Status/value changes (a fact was wrong or has changed) = strikethrough audit-trail within the block. Each entry has an OWNING ZONE/AGENT — cross-zone bankings route via the zone owner. The protocol stops "stale + fresh coexist" failures that the verify-before-claim discipline keeps catching.
+
 ### Layer 3: Knowledge Base — Associative Memory (RAG/ChromaDB)
 
 The knowledge base is a semantic vector store (ChromaDB, Gemini Embedding 2). Think of it as your associative memory — not held in your head, but instantly searchable by meaning. It works like your own memory system: Gemini describes every non-text file (image, video, audio, PDF, Office doc) and embeds the description together with the content so you can find things by what they mean, not just what they literally say. Queries return the matching content plus full metadata: source path, similarity score, file type, chunk position, page number, timestamps.
