@@ -247,20 +247,188 @@ def _retry_generate_content(client, *, model, contents, backoffs=(5, 15, 45)):
     raise last_err if last_err else RuntimeError("retry loop completed without response or error")
 
 
+def _retry_embed_content(client, *, model, contents, output_dimensionality, task_type, backoffs=(5, 15, 45)):
+    """Call client.models.embed_content with bounded retries on transient APIErrors.
+
+    `contents` is passed verbatim to the SDK:
+      - single string  -> one embedding (result.embeddings has length 1)
+      - list[str]      -> batch (result.embeddings has length == len(contents), input order)
+      - list[Part]     -> one multimodal embedding (length 1)
+
+    Retry semantics match _retry_generate_content: transient HTTP/status retried with
+    bounded backoff; non-transient APIErrors re-raised immediately.
+
+    Returns the raw EmbedContentResponse; callers extract .embeddings.
+    """
+    from google.genai import errors as _genai_errors
+    from google.genai import types
+    last_err = None
+    for attempt, backoff in enumerate(backoffs, start=1):
+        try:
+            return client.models.embed_content(
+                model=model,
+                contents=contents,
+                config=types.EmbedContentConfig(
+                    output_dimensionality=output_dimensionality,
+                    task_type=task_type,
+                ),
+            )
+        except _genai_errors.APIError as e:
+            last_err = e
+            is_transient = (e.code in TRANSIENT_HTTP_CODES) or (e.status in TRANSIENT_STATUS_NAMES)
+            if not is_transient:
+                raise
+            if attempt < len(backoffs):
+                print(f"    Transient embed error (HTTP {e.code} {e.status or ''}); retrying in {backoff}s (attempt {attempt}/{len(backoffs)})")
+                time.sleep(backoff)
+            else:
+                print(f"    Exhausted retries on transient embed error: HTTP {e.code} {e.status or ''}")
+    raise last_err if last_err else RuntimeError("retry loop completed without response or error")
+
+
 def embed_content(client, config, content, task_type="RETRIEVAL_DOCUMENT"):
     """Embed content using Gemini Embedding 2. Content can be text string or list of Parts."""
-    from google.genai import types
-    result = client.models.embed_content(
+    result = _retry_embed_content(
+        client,
         model=config.get("embedding_model", "gemini-embedding-2-preview"),
         contents=content,
-        config=types.EmbedContentConfig(
-            output_dimensionality=config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS),
-            task_type=task_type,
-        ),
+        output_dimensionality=config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS),
+        task_type=task_type,
     )
     if _tracker:
         _tracker.track_embedding(content)
     return result.embeddings[0].values
+
+
+def _call_batch_embed_rest(api_key, model, contents_list, output_dimensionality, task_type, backoffs=(5, 15, 45)):
+    """Direct POST to Gemini batchEmbedContents REST endpoint with bounded retries.
+
+    Bypasses google.genai 2.2.0's embed_content() — that SDK method collapses a
+    list of strings into ONE multimodal-style content and returns 1 embedding,
+    not N (verified 2026-06-02). The REST endpoint with `requests[]` shape DOES
+    return N embeddings for N requests, so we hit it directly via stdlib urllib.
+
+    Returns list of embedding vectors in input order (one per input string).
+    Retries on transient HTTP codes (in TRANSIENT_HTTP_CODES); re-raises
+    immediately on other 4xx codes; re-raises last error after exhausting retries.
+    """
+    import urllib.request
+    import urllib.error
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents?key={api_key}"
+    body = {
+        "requests": [
+            {
+                "model": f"models/{model}",
+                "content": {"parts": [{"text": text}]},
+                "taskType": task_type,
+                "outputDimensionality": output_dimensionality,
+            }
+            for text in contents_list
+        ]
+    }
+    payload = json.dumps(body).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+
+    last_err = None
+    for attempt, backoff in enumerate(backoffs, start=1):
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                resp_body = resp.read().decode("utf-8")
+            data = json.loads(resp_body)
+            if "error" in data:
+                code = data["error"].get("code", 0)
+                status = data["error"].get("status", "")
+                msg = data["error"].get("message", "")
+                if code in TRANSIENT_HTTP_CODES or status in TRANSIENT_STATUS_NAMES:
+                    last_err = RuntimeError(f"batch HTTP {code} {status}: {msg}")
+                    if attempt < len(backoffs):
+                        print(f"    Transient batch error (HTTP {code} {status}); retrying in {backoff}s (attempt {attempt}/{len(backoffs)})")
+                        time.sleep(backoff)
+                        continue
+                    raise last_err
+                raise RuntimeError(f"batch HTTP {code} {status}: {msg}")
+            embeddings = [e["values"] for e in data.get("embeddings", [])]
+            if len(embeddings) != len(contents_list):
+                raise RuntimeError(
+                    f"batchEmbedContents returned {len(embeddings)} embeddings for {len(contents_list)} inputs"
+                )
+            return embeddings
+        except urllib.error.HTTPError as e:
+            code = e.code
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+                err_data = json.loads(err_body)
+                status = err_data.get("error", {}).get("status", "")
+            except Exception:
+                status = ""
+            last_err = RuntimeError(f"batch HTTP {code} {status}: {e.reason}")
+            is_transient = (code in TRANSIENT_HTTP_CODES) or (status in TRANSIENT_STATUS_NAMES)
+            if not is_transient:
+                raise last_err
+            if attempt < len(backoffs):
+                print(f"    Transient batch error (HTTP {code} {status}); retrying in {backoff}s (attempt {attempt}/{len(backoffs)})")
+                time.sleep(backoff)
+            else:
+                print(f"    Exhausted retries on transient batch error: HTTP {code} {status}")
+        except urllib.error.URLError as e:
+            last_err = e
+            if attempt < len(backoffs):
+                print(f"    Network error ({e}); retrying in {backoff}s (attempt {attempt}/{len(backoffs)})")
+                time.sleep(backoff)
+            else:
+                print(f"    Exhausted retries on network error: {e}")
+    raise last_err if last_err else RuntimeError("batch retry loop completed without response or error")
+
+
+def embed_contents_batch(client, config, contents_list, task_type="RETRIEVAL_DOCUMENT", batch_size=100):
+    """Embed N text contents via Gemini batchEmbedContents (up to batch_size per request).
+
+    Returns list of embedding vectors in input order. Bypasses the Vertex AI
+    online_prediction_requests_per_base_model cap (~1-2 req/sec) because one
+    batch call counts as one request regardless of how many contents it carries.
+
+    Implementation note: google.genai 2.2.0's client.models.embed_content() does
+    NOT batch when passed a list-of-strings (it collapses to one multimodal
+    content and returns 1 embedding). We bypass the SDK and hit the
+    batchEmbedContents REST endpoint directly via stdlib urllib — see
+    _call_batch_embed_rest. The `client` parameter is retained for signature
+    symmetry with embed_content() and for the fallback path (which uses the
+    SDK's working single-content path).
+
+    `contents_list` must be a list of strings.
+
+    Fallback: if a batch call fails after all retries, that batch's items are
+    re-embedded one at a time via embed_content (which has its own retry-with-backoff
+    via _retry_embed_content). Other batches are unaffected. This preserves the
+    per-chunk resilience option as a safety net under the batch path.
+    """
+    if not contents_list:
+        return []
+    api_key = get_api_key(config)
+    embeddings = []
+    model = config.get("embedding_model", "gemini-embedding-2-preview")
+    output_dimensionality = config.get("embedding_dimensions", DEFAULT_EMBEDDING_DIMENSIONS)
+    for batch_start in range(0, len(contents_list), batch_size):
+        batch = contents_list[batch_start:batch_start + batch_size]
+        try:
+            batch_embeddings = _call_batch_embed_rest(
+                api_key=api_key,
+                model=model,
+                contents_list=batch,
+                output_dimensionality=output_dimensionality,
+                task_type=task_type,
+            )
+            if _tracker:
+                for item in batch:
+                    _tracker.track_embedding(item)
+            embeddings.extend(batch_embeddings)
+        except Exception as e:
+            print(f"    Batch embed failed ({type(e).__name__}: {e}); falling back to per-item embed for {len(batch)} items")
+            for item in batch:
+                embeddings.append(embed_content(client, config, item, task_type=task_type))
+    return embeddings
 
 
 def embed_multimodal(client, config, description_text, media_bytes, mime_type):
@@ -565,32 +733,44 @@ def ingest_text_file(client, config, collection, file_path):
         overlap=config.get("text_chunk_overlap", DEFAULT_TEXT_CHUNK_OVERLAP),
     )
 
-    count = 0
+    # Filter pass: collect items that need embedding (skip those Chroma already has)
+    pending = []
     for i, chunk in enumerate(chunks):
         doc_id = file_id(file_path, i)
         chunk_hash = compute_hash(chunk)
         if should_skip(collection, doc_id, chunk_hash):
             continue
+        pending.append((i, chunk, doc_id, chunk_hash))
 
-        embedding = embed_content(client, config, chunk)
-        collection.upsert(
-            ids=[doc_id],
-            embeddings=[embedding],
-            documents=[chunk],
-            metadatas=[{
-                "source": str(file_path.resolve()),
-                "type": "text",
-                "chunk_index": i,
-                "total_chunks": len(chunks),
-                "filename": file_path.name,
-                "file_ext": file_path.suffix.lower(),
-                "content_hash": chunk_hash,
-                "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }],
-        )
-        count += 1
+    if not pending:
+        return 0
 
-    return count
+    # Batch embed all pending chunks (one API request per batch_size up to 100)
+    pending_texts = [item[1] for item in pending]
+    pending_embeddings = embed_contents_batch(client, config, pending_texts)
+
+    # Bulk upsert
+    ingested_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+    ids = [item[2] for item in pending]
+    documents = [item[1] for item in pending]
+    metadatas = [{
+        "source": str(file_path.resolve()),
+        "type": "text",
+        "chunk_index": item[0],
+        "total_chunks": len(chunks),
+        "filename": file_path.name,
+        "file_ext": file_path.suffix.lower(),
+        "content_hash": item[3],
+        "ingested_at": ingested_at,
+    } for item in pending]
+    collection.upsert(
+        ids=ids,
+        embeddings=pending_embeddings,
+        documents=documents,
+        metadatas=metadatas,
+    )
+
+    return len(pending)
 
 
 def ingest_image(client, config, collection, file_path):
@@ -917,33 +1097,45 @@ def ingest_pdf(client, config, collection, file_path):
             overlap=config.get("text_chunk_overlap", DEFAULT_TEXT_CHUNK_OVERLAP),
         )
 
-    count = 0
+    # Filter pass: collect pages that need embedding (skip empty + Chroma-cached)
+    pending = []
     for i, page_content in enumerate(pages):
         if not page_content.strip():
             continue
         doc_id = file_id(file_path, i)
         if should_skip(collection, doc_id, file_hash):
             continue
+        pending.append((i, page_content, doc_id))
 
-        embedding = embed_content(client, config, page_content)
-        collection.upsert(
-            ids=[doc_id],
-            embeddings=[embedding],
-            documents=[page_content],
-            metadatas=[{
-                "source": str(file_path.resolve()),
-                "type": "pdf_page",
-                "chunk_index": i,
-                "total_chunks": len(pages),
-                "page_number": i + 1,
-                "filename": file_path.name,
-                "file_ext": ".pdf",
-                "content_hash": file_hash,
-                "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }],
-        )
-        count += 1
-    return count
+    if not pending:
+        return 0
+
+    # Batch embed
+    pending_texts = [item[1] for item in pending]
+    pending_embeddings = embed_contents_batch(client, config, pending_texts)
+
+    # Bulk upsert
+    ingested_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+    ids = [item[2] for item in pending]
+    documents = [item[1] for item in pending]
+    metadatas = [{
+        "source": str(file_path.resolve()),
+        "type": "pdf_page",
+        "chunk_index": item[0],
+        "total_chunks": len(pages),
+        "page_number": item[0] + 1,
+        "filename": file_path.name,
+        "file_ext": ".pdf",
+        "content_hash": file_hash,
+        "ingested_at": ingested_at,
+    } for item in pending]
+    collection.upsert(
+        ids=ids,
+        embeddings=pending_embeddings,
+        documents=documents,
+        metadatas=metadatas,
+    )
+    return len(pending)
 
 
 def extract_docx_text(file_path):
@@ -1058,7 +1250,8 @@ def ingest_office_doc(client, config, collection, file_path):
             overlap=config.get("text_chunk_overlap", DEFAULT_TEXT_CHUNK_OVERLAP),
         )
 
-    count = 0
+    # Filter pass: collect sections that need embedding
+    pending = []
     for i, section in enumerate(sections):
         if not section.strip():
             continue
@@ -1066,24 +1259,36 @@ def ingest_office_doc(client, config, collection, file_path):
         section_hash = compute_hash(section)
         if should_skip(collection, doc_id, section_hash):
             continue
+        pending.append((i, section, doc_id, section_hash))
 
-        embedding = embed_content(client, config, section)
+    if not pending:
+        return 0
+
+    # Batch embed
+    pending_texts = [item[1] for item in pending]
+    pending_embeddings = embed_contents_batch(client, config, pending_texts)
+
+    # Bulk upsert
+    ingested_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+    ids = [item[2] for item in pending]
+    documents = [item[1] for item in pending]
+    metadatas = []
+    for item in pending:
         meta = {
             "source": str(file_path.resolve()),
             "type": type_name,
-            "chunk_index": i,
+            "chunk_index": item[0],
             "total_chunks": len(sections),
             "filename": file_path.name,
             "file_ext": ext,
-            "content_hash": section_hash,
-            "ingested_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "content_hash": item[3],
+            "ingested_at": ingested_at,
         }
         if type_name == "slides":
-            meta["slide_number"] = i + 1
-
-        collection.upsert(ids=[doc_id], embeddings=[embedding], documents=[section], metadatas=[meta])
-        count += 1
-    return count
+            meta["slide_number"] = item[0] + 1
+        metadatas.append(meta)
+    collection.upsert(ids=ids, embeddings=pending_embeddings, documents=documents, metadatas=metadatas)
+    return len(pending)
 
 
 # Global flag for --force re-ingestion
