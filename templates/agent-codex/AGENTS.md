@@ -282,6 +282,8 @@ MEMEOF
 
 Knowledge synthesised over time. Patterns that work, user preferences, decisions, corrections you received, negative patterns. Update on every heartbeat and at session end. When you update MEMORY.md, ingest it to your `memory-{agent}` KB collection.
 
+**OVERWRITE protocol.** Corrections to a MEMORY.md entry OVERWRITE the original in place. Strikethrough (`~~old text~~`) carries the audit-trail WITHIN the same block — never as a new dated CORRECTION section appended later. Compression-only edits (re-wording, tightening, removing redundancy) = clean replace, no strikethrough. Status/value changes (a fact was wrong or has changed) = strikethrough audit-trail within the block. Each entry has an OWNING ZONE/AGENT — cross-zone bankings route via the zone owner. The protocol stops "stale + fresh coexist" failures.
+
 ### Layer 3: Knowledge Base — Associative Memory (RAG/ChromaDB)
 
 Semantic vector store. Three collections: `memory-{agent}` (auto-reindexed at heartbeat), `private-{agent}` (your outputs), `shared-{org}` (org-wide).
