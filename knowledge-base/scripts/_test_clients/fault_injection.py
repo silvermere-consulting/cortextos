@@ -56,6 +56,16 @@ class _StubResponse:
         self.usage_metadata = None
 
 
+class _StubEmbedding:
+    def __init__(self, values):
+        self.values = values
+
+
+class _StubEmbedResponse:
+    def __init__(self, n):
+        self.embeddings = [_StubEmbedding([0.1, 0.2, 0.3]) for _ in range(n)]
+
+
 class _StubModels:
     def __init__(self, script):
         self._script = list(script)
@@ -74,11 +84,32 @@ class _StubModels:
         status = _STATUS_FOR_CODE.get(code, "UNKNOWN")
         raise _InjectedAPIError(code, status, message or f"injected {code} {status}")
 
-    def embed_content(self, *a, **kw):
-        raise RuntimeError(
-            "fault_injection: embed_content is not scripted. Tests should target "
-            "_retry_generate_content directly, not the full ingest_pdf pipeline."
-        )
+    def embed_content(self, *, model=None, contents=None, config=None, **kwargs):
+        """Embed-content variant: shares the script with generate_content via _index.
+
+        On 200, returns a stub EmbedContentResponse with N embeddings where N = number
+        of contents in the input (1 for a single string, len(list) for a list of strings).
+        Each stub embedding is a list of 3 floats: [0.1, 0.2, 0.3]. The values are not
+        meaningful — tests assert on length, ordering and presence, not vector content.
+        """
+        if self._index >= len(self._script):
+            raise RuntimeError(
+                f"fault_injection: script exhausted at attempt {self._index + 1} "
+                f"(scripted {len(self._script)} responses)"
+            )
+        code, message = self._script[self._index]
+        self._index += 1
+        if code == 200:
+            if isinstance(contents, list):
+                # batch (list of strings) OR multimodal (list of Parts) — return one
+                # embedding per item. Real SDK returns 1 embedding for the multimodal
+                # case, but for our test purposes the count is set by len(contents).
+                n = len(contents)
+            else:
+                n = 1
+            return _StubEmbedResponse(n)
+        status = _STATUS_FOR_CODE.get(code, "UNKNOWN")
+        raise _InjectedAPIError(code, status, message or f"injected {code} {status}")
 
 
 class FaultInjectionClient:
