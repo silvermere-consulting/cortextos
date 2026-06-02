@@ -1,0 +1,21 @@
+#!/bin/sh
+# Rebuild dist/ on branch switch so the CLI symlink at $(npm bin -g)/cortextos
+# always matches the source on disk. Without this, switching branches changes
+# src/ but dist/cli.js stays stale, and any system relying on the global
+# `cortextos` symlink (a running daemon, fleet automation, CI hooks) silently
+# executes the prior branch's compiled code.
+#
+# git invokes this hook as: post-checkout <prev_head> <new_head> <branch_flag>
+# branch_flag == 1 means a branch (not a file) checkout. Only rebuild on branch
+# switches to avoid wasting time on `git checkout -- <path>`.
+
+prev_head="$1"
+new_head="$2"
+branch_flag="$3"
+
+if [ "$branch_flag" = "1" ] && [ "$prev_head" != "$new_head" ]; then
+  if command -v npm > /dev/null 2>&1 && [ -f package.json ] && grep -q '"build"' package.json; then
+    echo "[post-checkout] rebuilding dist/ for new branch..."
+    npm run build > /dev/null 2>&1 && echo "[post-checkout] dist/ rebuilt" || echo "[post-checkout] WARNING: build failed; dist/ may be stale"
+  fi
+fi

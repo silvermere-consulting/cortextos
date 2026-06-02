@@ -8,6 +8,8 @@
   },
   "scripts": {
     "build": "tsup",
+    "prepack": "npm run build",
+    "hooks:install": "git config core.hooksPath .githooks",
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",
