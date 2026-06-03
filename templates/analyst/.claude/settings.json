@@ -13,7 +13,8 @@
       "Write",
       "WebFetch",
       "WebSearch"
-    ]
+    ],
+    "defaultMode": "bypassPermissions"
   },
   "hooks": {
     "PermissionRequest": [
@@ -45,6 +46,17 @@
             "type": "command",
             "command": "cortextos bus hook-ask-telegram",
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cortextos bus hook-idle-flag",
+            "timeout": 5
           }
         ]
       }

@@ -22,6 +22,17 @@ export class TelegramPoller {
   private callbackHandlers: CallbackHandler[] = [];
   private reactionHandlers: ReactionHandler[] = [];
   private pollInterval: number;
+  /**
+   * Why the poll loop last exited. Read by AgentManager's poller-supervisor
+   * (#459 supervision-gap fix) to decide whether to restart:
+   *   - 'stopped-externally': intentional stop() (stopAgent) — do NOT restart.
+   *   - 'conflict-self-die': a Telegram 409 Conflict (another getUpdates
+   *     holder owns the lock, e.g. a not-yet-released connection after a
+   *     daemon crash) — the loop exits so the supervisor can sleep 30s and
+   *     retake the lock instead of hot-looping on Conflict.
+   *   - '' : loop still running / never exited.
+   */
+  lastExitReason: string = '';
 
   /**
    * @param api Telegram API client scoped to a single bot token.
@@ -81,6 +92,7 @@ export class TelegramPoller {
    */
   async start(): Promise<void> {
     this.running = true;
+    this.lastExitReason = '';
     let consecutiveFailures = 0;
     let lastSuccessfulPoll: string | null = null;
     const BASE_INTERVAL = this.pollInterval;
@@ -106,6 +118,17 @@ export class TelegramPoller {
           }), 'utf-8');
         } catch {}
       } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        // A 409 Conflict means another getUpdates connection holds the lock
+        // (e.g. a not-yet-released connection lingering ~60s after a daemon
+        // crash). Exit the loop with a distinct reason so the supervisor can
+        // sleep and retake the lock, rather than hot-looping on Conflict.
+        if (/Conflict/i.test(errMsg)) {
+          this.lastExitReason = 'conflict-self-die';
+          this.running = false;
+          return;
+        }
+        // Other errors are transient — log, track for degraded/dark status, continue polling.
         consecutiveFailures++;
         console.error('[telegram-poller] Poll error:', err);
         sleepMs = Math.min(BASE_INTERVAL * Math.pow(2, consecutiveFailures), MAX_INTERVAL);
@@ -132,10 +155,12 @@ export class TelegramPoller {
   }
 
   /**
-   * Stop the polling loop.
+   * Stop the polling loop. Marks the exit as intentional so the supervisor
+   * does not restart it.
    */
   stop(): void {
     this.running = false;
+    this.lastExitReason = 'stopped-externally';
   }
 
   /**

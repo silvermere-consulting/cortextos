@@ -71,9 +71,19 @@ function lastEmittedEvent(): { name: string; meta: Record<string, unknown> } | n
 }
 
 describe('src/bus/hooks — Day-2 per-handler wiring', () => {
+  let savedFrameworkRoot: string | undefined;
   beforeEach(() => {
     execFileCalls.length = 0;
     clearHandlerRegistry();
+    // a89cee2 added a CTX_FRAMEWORK_ROOT-gated production path that invokes
+    // node + dist/cli.js. Tests exercise the PATH-lookup fallback (legacy
+    // `cortextos` shape), so unset the env var inherited from the parent
+    // process (vitest run from a live agent inherits CTX_FRAMEWORK_ROOT).
+    savedFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    delete process.env.CTX_FRAMEWORK_ROOT;
+  });
+  afterEach(() => {
+    if (savedFrameworkRoot !== undefined) process.env.CTX_FRAMEWORK_ROOT = savedFrameworkRoot;
   });
 
   describe('loadHookRegistry', () => {

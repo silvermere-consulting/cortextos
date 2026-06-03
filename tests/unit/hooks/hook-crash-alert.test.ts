@@ -52,8 +52,18 @@ describe('readMaxCrashesPerDay', () => {
 });
 
 describe('notifyAgents', () => {
+  let savedFrameworkRoot: string | undefined;
   beforeEach(() => {
     execFileMock.mockReset();
+    // a89cee2 added a CTX_FRAMEWORK_ROOT-gated production path that invokes
+    // node + dist/cli.js instead of PATH-resolving 'cortextos'. Tests exercise
+    // the PATH-lookup fallback, so unset the env var inherited from the parent
+    // process (vitest run from a live agent inherits CTX_FRAMEWORK_ROOT).
+    savedFrameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+    delete process.env.CTX_FRAMEWORK_ROOT;
+  });
+  afterEach(() => {
+    if (savedFrameworkRoot !== undefined) process.env.CTX_FRAMEWORK_ROOT = savedFrameworkRoot;
   });
 
   it('sends one bus send-message per recipient', () => {
