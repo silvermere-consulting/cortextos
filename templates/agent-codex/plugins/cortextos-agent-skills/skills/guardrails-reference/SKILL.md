@@ -23,12 +23,56 @@ Read this file on every session start. Check yourself against it during heartbea
 | About to skip a procedure | "This situation is different, the procedure doesn't apply" | The procedure applies. If it genuinely doesn't, document why in your daily memory before skipping. |
 | Task running long | "I'm almost done, no need to update status" | Update the task status with a note. Stale in_progress tasks look like crashes on the dashboard. |
 | Bus script available | "I'll handle this directly instead of using the bus" | Use the bus script. Work that doesn't go through the bus is invisible to the system. |
+| About to claim X based on memory, code, or single-source verification | "I checked one layer, that's enough" | LAYER-WALK first. Operational claims span 4 layers (codebase / banked memory / live state / user-asserted). The STALE layer wins by default if you don't walk all four. Verify each layer reachable in <30s; if any layer diverges, surface as a FLAG not a fact. Skip only when explicitly time-bounded — and say so in the claim ("verified codebase only, not live state"). |
 | About to claim "we have / do not have / is configured / is pending" something | "I remember Y from earlier" | STOP. Source-of-truth check first: secrets.env for access, codebase grep for integrations, project-state.md for decisions, current AFF matrix for affiliate state. Then claim. |
 | Creating a recurring cron | "An in-session scheduler is enough, it'll persist" | Session-local schedulers die on restart. Always use `cortextos bus add-cron` so the daemon owns dispatch and the cron survives every kind of restart. |
 | Running untrusted code or downloads | "This script from the internet looks useful" | Never execute code from untrusted sources without reviewing it first. No blind curl-pipe-bash. |
 | Starting work without a task | "It's just a quick fix" | Create a task. Even quick fixes need tracking if they take more than 10 minutes. |
 | Finishing work without completing task | "I'll close it later" | Complete the task NOW with a summary. Later means never. |
 | Ignoring an assigned task | "I'll get to it" | ACK within one heartbeat cycle. If wrong agent, reassign. Silence = dropped work. |
+
+---
+
+## Layer-Verification Heuristic
+
+The failure mode this catches: a claim spans multiple system layers and the STALE layer wins by default unless every reachable layer is verified before stating. The pattern repeats across surfaces — Vertex AI cap-vs-billing, "no SSH access" claims, "feat-branch fix doesn't propagate", "exit-0 despite errors". Same shape, different layer mismatch.
+
+### The 4 layers
+
+| Layer | What lives there | Quick verification |
+|---|---|---|
+| **Codebase** | Implementation as currently checked out (source files, secrets.env values, config defaults) | `grep`, `git log`, `cat`, `git remote -v` |
+| **Banked memory** | What I remember (MEMORY.md, daily memory, banked rules from orchestrator) | Re-read MEMORY.md and relevant memory/ entries |
+| **Live state** | What's actually running (process env, container state, API responses, on-disk config, daemon status) | `ps`, `pm2 status`, `curl`, `ls -la`, `cat /proc/<pid>/environ` |
+| **User-asserted** | What the user just told me in this conversation | The most recent user/orchestrator message |
+
+### Failure mode (stale wins by default)
+
+- I recall a banked rule: "engineer has no SSH access to gateway"
+- I assert it to chief without checking live state (`grep TRAEFIK_GATEWAY_SSH secrets.env` would show creds exist)
+- Stale memory layer wins → orchestrator acts on wrong premise → user catches the mismatch → trust erodes
+- Same shape: codebase says X, banked says Y, live state says Z — without a walk, the layer-I-thought-of-first wins
+
+### Mitigation (layer-walk discipline)
+
+1. Before stating ANY operational claim ("we have / X is configured / Y is missing / Z is the rule"), walk the relevant layers
+2. Each <30s layer check is cheap; the walk takes 1-3 minutes for most claims
+3. If layers agree → state the fact with confidence
+4. If layers diverge → surface the divergence as a FLAG, not a fact ("memory says X but live state says Y — which is current?")
+5. If time-bounded, skip only after explicit acknowledgment in the claim ("answering from memory only, live state not verified")
+
+### Adjacent framing (engineer, 2026-06-02)
+
+> "Verify intent matches behavior at the LAYER YOU'RE TESTING, not just the code site you patched."
+
+Same shape one level deeper: when a fix lands, verify each layer the fix is supposed to flow through — code site, dist build, daemon process env, agent PTY env, downstream behavior. Skipping intermediate layers = "fix shipped, fix not working" mystery.
+
+### Relationship to existing rules
+
+- **Subset of** verify-before-claim discipline — VBC is the spirit; layer-verification is the mechanic.
+- **Generalises** diagnose-before-patch and code-read-first — both were banked after acting on one-layer info.
+- **Adjacent to** post-restart-verification, image-bump-DB-migration, Astro-dev-stale-config, JVM-cgroup-audit — concrete instances of the same heuristic.
+- **Consolidates**: if a future incident lands matching the layer-mismatch pattern, update the trigger sub-patterns here, don't bank yet another single-incident rule.
 
 ---
 

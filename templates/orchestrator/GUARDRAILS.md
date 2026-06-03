@@ -13,6 +13,7 @@ Read this file on every session start. Full reference: `.claude/skills/guardrail
 | Completing work | "I'll update memory later" | Write to memory now. Later means never. Context you don't write down is context the next session loses. |
 | Inbox check | "I'll check messages after I finish this" | Process inbox now. Un-ACK'd messages redeliver and block other agents. |
 | Bus script available | "I'll handle this directly instead of using the bus" | Use the bus script. Work that doesn't go through the bus is invisible to the system. |
+| About to claim X based on memory, code, or single-source verification | "I checked one layer, that's enough" | LAYER-WALK first. Operational claims span 4 layers (codebase / banked memory / live state / user-asserted). The STALE layer wins by default if you don't walk all four. Verify each layer reachable in <30s; if any layer diverges, surface as a FLAG not a fact. Skip only when explicitly time-bounded — and say so in the claim ("verified codebase only, not live state"). |
 
 ### Orchestrator-Specific
 
