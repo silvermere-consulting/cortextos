@@ -130,11 +130,36 @@ for (const { file, mime } of SILVERMERE_LOGO_CANDIDATES) {
   } catch { /* try next */ }
 }
 
+// PYLOT brand-mode logo (same brand/ directory). SVG preferred for crispness; PNG fallback.
+// Text fallback (PYLOT · بيلوت) renders if neither file exists.
+const PYLOT_LOGO_CANDIDATES = [
+  { file: 'pylot-logo.svg', mime: 'image/svg+xml' },
+  { file: 'pylot-logo.png', mime: 'image/png' },
+];
+let pylotLogoSrc = '';
+for (const { file, mime } of PYLOT_LOGO_CANDIDATES) {
+  const p = path.join(SILVERMERE_LOGO_DIR, file);
+  try {
+    if (fs.existsSync(p)) {
+      const buf = fs.readFileSync(p);
+      pylotLogoSrc = `data:${mime};base64,${buf.toString('base64')}`;
+      break;
+    }
+  } catch { /* try next */ }
+}
+
 const brandHeader = brandMode === 'silvermere'
   ? `<div class="brand-header">
     ${brandLogoSrc
       ? `<img class="brand-logo" src="${brandLogoSrc}" alt="Silvermere Advisory" />`
       : `<span class="brand-name">Silvermere Advisory</span>`}
+    <span class="brand-rule-dot"></span>
+  </div>`
+  : brandMode === 'pylot'
+  ? `<div class="brand-header brand-header--pylot">
+    ${pylotLogoSrc
+      ? `<img class="brand-logo brand-logo--pylot" src="${pylotLogoSrc}" alt="PYLOT" />`
+      : `<span class="brand-name brand-name--pylot">PYLOT &middot; بيلوت</span>`}
     <span class="brand-rule-dot"></span>
   </div>`
   : '';
@@ -207,6 +232,23 @@ const html = `<!DOCTYPE html>
     height: 5px;
     border-radius: 50%;
     background: #D4AF37;
+  }
+
+  /* PYLOT brand variant (overrides the Silvermere defaults above) */
+  .brand-header--pylot {
+    border-bottom: 3px solid #111;
+  }
+  .brand-logo--pylot {
+    height: 48px;
+    width: auto;
+  }
+  .brand-name--pylot {
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-size: 18pt;
+    font-weight: 900;
+    color: #111;
+    letter-spacing: 0.12em;
+    text-transform: none;
   }
 
   /* Front matter meta block */
