@@ -5,6 +5,8 @@
 // requester via the cortextos approval resolution note (existing inbox path).
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const FOUNDRY_BASE_URL =
   process.env.FOUNDRY_APPROVALS_URL ?? 'http://127.0.0.1:7113';
@@ -26,11 +28,53 @@ export interface FoundryError {
   status?: number;
 }
 
-function mintDashboardToken(ttlSeconds = 60): string {
-  const secret = process.env.FOUNDRY_TOKEN_SECRET;
-  if (!secret) {
-    throw new Error('FOUNDRY_TOKEN_SECRET not set in environment');
+// Resolved once and cached. The dashboard pm2 process does not load
+// orgs/<org>/secrets.env at boot, so process.env.FOUNDRY_TOKEN_SECRET is
+// typically empty even though the file holds the value. Fall back to a
+// disk read scoped to the configured tenant org so secret rotation does
+// not require a dashboard restart. process.env always wins when present.
+let resolvedSecret: string | null | undefined;
+
+function readSecretFromOrgFile(org: string): string | null {
+  const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+  if (!frameworkRoot) return null;
+  const secretsPath = path.join(frameworkRoot, 'orgs', org, 'secrets.env');
+  if (!fs.existsSync(secretsPath)) return null;
+  const lines = fs.readFileSync(secretsPath, 'utf-8').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (key !== 'FOUNDRY_TOKEN_SECRET') continue;
+    let value = line.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    return value.length > 0 ? value : null;
   }
+  return null;
+}
+
+function getFoundryTokenSecret(): string {
+  const fromEnv = process.env.FOUNDRY_TOKEN_SECRET;
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  if (resolvedSecret !== undefined) {
+    if (resolvedSecret === null) {
+      throw new Error('FOUNDRY_TOKEN_SECRET not set in environment and not found in secrets.env');
+    }
+    return resolvedSecret;
+  }
+  resolvedSecret = readSecretFromOrgFile(DEFAULT_TENANT);
+  if (!resolvedSecret) {
+    throw new Error('FOUNDRY_TOKEN_SECRET not set in environment and not found in secrets.env');
+  }
+  return resolvedSecret;
+}
+
+function mintDashboardToken(ttlSeconds = 60): string {
+  const secret = getFoundryTokenSecret();
   const now = new Date();
   const envelope = {
     caller_id: 'dashboard',
