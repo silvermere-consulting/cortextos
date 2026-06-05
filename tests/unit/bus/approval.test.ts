@@ -448,6 +448,45 @@ describe('createApproval — metadata field (Foundry bridge)', () => {
     const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
     expect(approval).not.toHaveProperty('metadata');
   });
+
+  it('persists an empty metadata object {} (distinct from absent)', async () => {
+    const id = await createApproval(
+      paths,
+      'engineer',
+      'TestOrg',
+      'empty meta',
+      'deployment',
+      undefined,
+      frameworkRoot,
+      undefined,
+      {},
+    );
+    const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
+    expect(approval).toHaveProperty('metadata');
+    expect(approval.metadata).toEqual({});
+  });
+
+  it('preserves nested objects and arrays inside metadata', async () => {
+    const metadata = {
+      foundry_approval_id: 'app_n1',
+      kind: 'domain:buy',
+      tags: ['urgent', 'first-time'],
+      cost_breakdown: { domain: 10.5, transfer: 0, total: 10.5 },
+    };
+    const id = await createApproval(
+      paths,
+      'engineer',
+      'TestOrg',
+      'nested meta',
+      'financial',
+      undefined,
+      frameworkRoot,
+      undefined,
+      metadata,
+    );
+    const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
+    expect(approval.metadata).toEqual(metadata);
+  });
 });
 
 describe('listPendingApprovals', () => {

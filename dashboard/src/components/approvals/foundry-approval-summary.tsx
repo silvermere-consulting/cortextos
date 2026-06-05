@@ -16,6 +16,7 @@ interface DomainBuyMeta {
   registrar?: string;
   price_usd?: number | string;
   tenant_id?: string;
+  foundry_approval_id?: string;
 }
 
 interface ZohoDowngradeMeta {
@@ -24,6 +25,7 @@ interface ZohoDowngradeMeta {
   zoho_org?: string;
   from_role?: string;
   to_role?: string;
+  foundry_approval_id?: string;
 }
 
 function readKind(meta: Record<string, unknown>): string | undefined {
@@ -74,6 +76,12 @@ export function FoundryApprovalSummary({ metadata, variant }: FoundryApprovalSum
             <span className="font-mono">{m.tenant_id}</span>
           </>
         )}
+        {m.foundry_approval_id && (
+          <>
+            <span className="text-muted-foreground">Foundry ID</span>
+            <span className="font-mono text-xs">{m.foundry_approval_id}</span>
+          </>
+        )}
       </div>
     );
   }
@@ -103,11 +111,18 @@ export function FoundryApprovalSummary({ metadata, variant }: FoundryApprovalSum
         <span>
           {fromRole} → {toRole}
         </span>
+        {m.foundry_approval_id && (
+          <>
+            <span className="text-muted-foreground">Foundry ID</span>
+            <span className="font-mono text-xs">{m.foundry_approval_id}</span>
+          </>
+        )}
       </div>
     );
   }
 
-  // Unknown Foundry kind — surface kind only so it isn't silent.
+  // Unknown Foundry kind — surface kind + all primitive metadata fields so
+  // operators are never blind to a new kind that ships before the UI catches up.
   if (variant === 'compact') {
     return (
       <p className="text-xs font-mono text-foreground/60">
@@ -115,10 +130,21 @@ export function FoundryApprovalSummary({ metadata, variant }: FoundryApprovalSum
       </p>
     );
   }
+  const rows: Array<[string, string]> = [['Kind', kind]];
+  for (const [k, v] of Object.entries(metadata)) {
+    if (k === 'kind') continue;
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+      rows.push([k, String(v)]);
+    }
+  }
   return (
     <div className="grid grid-cols-2 gap-y-1 text-sm">
-      <span className="text-muted-foreground">Kind</span>
-      <span className="font-mono">{kind}</span>
+      {rows.map(([k, v]) => (
+        <div key={k} className="contents">
+          <span className="text-muted-foreground">{k}</span>
+          <span className="font-mono">{v}</span>
+        </div>
+      ))}
     </div>
   );
 }
