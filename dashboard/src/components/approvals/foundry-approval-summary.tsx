@@ -28,12 +28,12 @@ interface ZohoDowngradeMeta {
   foundry_approval_id?: string;
 }
 
-function readKind(meta: Record<string, unknown>): string | undefined {
+export function readKind(meta: Record<string, unknown>): string | undefined {
   const k = meta.kind;
   return typeof k === 'string' ? k : undefined;
 }
 
-function formatPrice(value: unknown): string | undefined {
+export function formatPrice(value: unknown): string | undefined {
   if (typeof value === 'number') return `$${value.toFixed(2)}`;
   if (typeof value === 'string' && value.length > 0) return value.startsWith('$') ? value : `$${value}`;
   return undefined;

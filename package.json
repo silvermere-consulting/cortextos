@@ -53,6 +53,7 @@
   "devDependencies": {
     "@playwright/test": "^1.58.2",
     "@types/node": "^25.5.0",
+    "jsdom": "^29.1.1",
     "tsup": "^8.5.1",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
