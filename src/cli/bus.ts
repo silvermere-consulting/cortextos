@@ -1141,11 +1141,26 @@ busCommand
   .argument('<title>', 'What you are requesting approval for')
   .argument('<category>', 'Category: external-comms, financial, deployment, data-deletion, other')
   .argument('[context]', 'Additional context')
-  .action(async (title: string, category: string, context?: string) => {
+  .option('--meta <json>', 'Per-kind metadata as JSON (e.g. {"foundry_approval_id":"...","kind":"domain:buy","fqdn":"acme.ae"})')
+  .action(async (title: string, category: string, context: string | undefined, opts: { meta?: string }) => {
     const validCategories: ApprovalCategory[] = ['external-comms', 'financial', 'deployment', 'data-deletion', 'other'];
     if (!validCategories.includes(category as ApprovalCategory)) {
       console.error(`Invalid category '${category}'. Must be one of: ${validCategories.join(', ')}`);
       process.exit(1);
+    }
+    let metadata: Record<string, unknown> | undefined;
+    if (opts.meta) {
+      try {
+        const parsed = JSON.parse(opts.meta);
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          console.error(`--meta must be a JSON object`);
+          process.exit(1);
+        }
+        metadata = parsed as Record<string, unknown>;
+      } catch (err) {
+        console.error(`--meta is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      }
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
@@ -1155,7 +1170,7 @@ busCommand
     // orgDir resolves to where activity-channel.env actually lives (the
     // framework repo path, NOT the runtime state path — see
     // src/bus/approval.ts:postApprovalToActivityChannel for the history).
-    const id = await createApproval(paths, env.agentName, env.org, title, category as ApprovalCategory, context || '', env.frameworkRoot, env.agentDir);
+    const id = await createApproval(paths, env.agentName, env.org, title, category as ApprovalCategory, context || '', env.frameworkRoot, env.agentDir, metadata);
     console.log(id);
   });
 

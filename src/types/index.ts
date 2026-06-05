@@ -135,6 +135,8 @@ export interface Approval {
   updated_at: string;
   resolved_at: string | null;
   resolved_by: string | null;
+  /** Optional per-kind payload (e.g. {foundry_approval_id, kind: 'domain:buy', fqdn, registrar, price_usd}). */
+  metadata?: Record<string, unknown>;
 }
 
 // Agent Config Types (config.json)

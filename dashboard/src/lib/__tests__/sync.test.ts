@@ -175,6 +175,47 @@ describe('syncApprovals', () => {
     const resolved = db.prepare('SELECT * FROM approvals WHERE id = ?').get('ap-2') as Record<string, unknown>;
     expect(resolved.status).toBe('approved');
   });
+
+  it('serializes approval.metadata as JSON text in the metadata column', () => {
+    writeJSON('orgs/metaorg/approvals/pending/ap-meta-1.json', {
+      id: 'ap-meta-1',
+      title: 'domain:buy approval',
+      agent: 'engineer',
+      category: 'financial',
+      created_at: '2025-01-01T00:00:00Z',
+      metadata: {
+        foundry_approval_id: 'app_zxc',
+        kind: 'domain:buy',
+        fqdn: 'acme-trading.ae',
+        registrar: 'cloudflare',
+        price_usd: 9.95,
+      },
+    });
+
+    const count = syncApprovals('metaorg');
+    expect(count).toBe(1);
+
+    const row = db.prepare('SELECT metadata FROM approvals WHERE id = ?').get('ap-meta-1') as Record<string, unknown>;
+    expect(typeof row.metadata).toBe('string');
+    const parsed = JSON.parse(row.metadata as string);
+    expect(parsed.foundry_approval_id).toBe('app_zxc');
+    expect(parsed.kind).toBe('domain:buy');
+    expect(parsed.fqdn).toBe('acme-trading.ae');
+    expect(parsed.price_usd).toBe(9.95);
+  });
+
+  it('writes null metadata when the approval JSON has no metadata field', () => {
+    writeJSON('orgs/nullmeta/approvals/pending/ap-null-1.json', {
+      id: 'ap-null-1',
+      title: 'no metadata',
+      agent: 'alice',
+      created_at: '2025-01-01T00:00:00Z',
+    });
+
+    syncApprovals('nullmeta');
+    const row = db.prepare('SELECT metadata FROM approvals WHERE id = ?').get('ap-null-1') as Record<string, unknown>;
+    expect(row.metadata).toBeNull();
+  });
 });
 
 describe('syncEvents', () => {

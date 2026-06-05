@@ -120,9 +120,9 @@ export function syncApprovals(org: string): number {
 
   const upsert = db.prepare(`
     INSERT OR REPLACE INTO approvals
-      (id, title, category, description, status, agent, org, created_at, resolved_at, resolved_by, resolution_note, source_file)
+      (id, title, category, description, status, agent, org, created_at, resolved_at, resolved_by, resolution_note, source_file, metadata)
     VALUES
-      (@id, @title, @category, @description, @status, @agent, @org, @created_at, @resolved_at, @resolved_by, @resolution_note, @source_file)
+      (@id, @title, @category, @description, @status, @agent, @org, @created_at, @resolved_at, @resolved_by, @resolution_note, @source_file, @metadata)
   `);
 
   const run = db.transaction(() => {
@@ -154,6 +154,7 @@ export function syncApprovals(org: string): number {
             resolved_by: approval.resolved_by ?? null,
             resolution_note: approval.resolution_note ?? null,
             source_file: filePath,
+            metadata: approval.metadata ? JSON.stringify(approval.metadata) : null,
           });
           markSynced(filePath);
           synced++;

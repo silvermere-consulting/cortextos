@@ -47,7 +47,7 @@ export function getResolvedApprovals(
     const rows = db
       .prepare(
         `SELECT id, title, category, description, status, agent, org,
-                created_at, resolved_at, resolved_by, resolution_note, source_file
+                created_at, resolved_at, resolved_by, resolution_note, source_file, metadata
          FROM approvals ${where}
          ORDER BY resolved_at DESC`
       )
@@ -94,7 +94,7 @@ export function getApprovalById(id: string): Approval | null {
     const row = db
       .prepare(
         `SELECT id, title, category, description, status, agent, org,
-                created_at, resolved_at, resolved_by, resolution_note, source_file
+                created_at, resolved_at, resolved_by, resolution_note, source_file, metadata
          FROM approvals WHERE id = ?`
       )
       .get(id) as Record<string, unknown> | undefined;
@@ -125,7 +125,7 @@ function getApprovalsByStatus(status: string, org?: string): Approval[] {
     const rows = db
       .prepare(
         `SELECT id, title, category, description, status, agent, org,
-                created_at, resolved_at, resolved_by, resolution_note, source_file
+                created_at, resolved_at, resolved_by, resolution_note, source_file, metadata
          FROM approvals ${where}
          ORDER BY created_at DESC`
       )
@@ -139,6 +139,18 @@ function getApprovalsByStatus(status: string, org?: string): Approval[] {
 }
 
 function rowToApproval(row: Record<string, unknown>): Approval {
+  let metadata: Record<string, unknown> | undefined;
+  const rawMeta = row.metadata;
+  if (typeof rawMeta === 'string' && rawMeta.length > 0) {
+    try {
+      const parsed = JSON.parse(rawMeta);
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        metadata = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Tolerate corrupt metadata — surface the rest of the approval.
+    }
+  }
   return {
     id: row.id as string,
     title: row.title as string,
@@ -152,5 +164,6 @@ function rowToApproval(row: Record<string, unknown>): Approval {
     resolved_by: (row.resolved_by as string) ?? undefined,
     resolution_note: (row.resolution_note as string) ?? undefined,
     source_file: (row.source_file as string) ?? undefined,
+    ...(metadata ? { metadata } : {}),
   };
 }

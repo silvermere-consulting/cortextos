@@ -2,6 +2,7 @@
 
 import { Card } from '@/components/ui/card';
 import { CategoryBadge, OrgBadge, TimeAgo } from '@/components/shared';
+import { FoundryApprovalSummary } from './foundry-approval-summary';
 import type { Approval } from '@/lib/types';
 
 interface ApprovalCardProps {
@@ -22,6 +23,7 @@ export function ApprovalCard({ approval, onClick }: ApprovalCardProps) {
           </p>
           <CategoryBadge category={approval.category} />
         </div>
+        <FoundryApprovalSummary metadata={approval.metadata} variant="compact" />
         {approval.description && (
           <p className="text-xs text-muted-foreground line-clamp-2">
             {approval.description}

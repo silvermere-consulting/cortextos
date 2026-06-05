@@ -184,6 +184,7 @@ export async function createApproval(
   context?: string,
   frameworkRoot?: string,
   agentDir?: string,
+  metadata?: Record<string, unknown>,
 ): Promise<string> {
   validateApprovalCategory(category);
 
@@ -204,6 +205,7 @@ export async function createApproval(
     updated_at: now,
     resolved_at: null,
     resolved_by: null,
+    ...(metadata ? { metadata } : {}),
   };
 
   const pendingDir = join(paths.approvalDir, 'pending');

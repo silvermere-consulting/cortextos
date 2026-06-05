@@ -15,6 +15,7 @@ import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import { CategoryBadge, OrgBadge, TimeAgo } from '@/components/shared';
 import { Badge } from '@/components/ui/badge';
+import { FoundryApprovalSummary } from './foundry-approval-summary';
 import type { Approval } from '@/lib/types';
 
 interface ApprovalDetailDialogProps {
@@ -94,6 +95,17 @@ export function ApprovalDetailDialog({
               </>
             )}
           </div>
+
+          {/* Foundry-bridged details (domain:buy, zoho:downgrade, …) */}
+          {approval.metadata && (
+            <>
+              <Separator />
+              <div>
+                <p className="text-sm text-muted-foreground mb-2">Foundry request</p>
+                <FoundryApprovalSummary metadata={approval.metadata} variant="detail" />
+              </div>
+            </>
+          )}
 
           {/* Description */}
           {approval.description && (

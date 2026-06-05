@@ -419,6 +419,37 @@ describe('updateApproval (regression guard for activity-channel callback path)',
   });
 });
 
+describe('createApproval — metadata field (Foundry bridge)', () => {
+  it('persists metadata in the approval JSON when provided', async () => {
+    const metadata = {
+      foundry_approval_id: 'app_12345',
+      kind: 'domain:buy',
+      fqdn: 'acme-trading.ae',
+      registrar: 'cloudflare',
+      price_usd: 10.5,
+    };
+    const id = await createApproval(
+      paths,
+      'engineer',
+      'TestOrg',
+      'domain:buy approval',
+      'financial',
+      'context',
+      frameworkRoot,
+      undefined,
+      metadata,
+    );
+    const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
+    expect(approval.metadata).toEqual(metadata);
+  });
+
+  it('omits the metadata key when not provided (back-compat)', async () => {
+    const id = await createApproval(paths, 'alice', 'TestOrg', 'no metadata', 'deployment', undefined, frameworkRoot);
+    const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
+    expect(approval).not.toHaveProperty('metadata');
+  });
+});
+
 describe('listPendingApprovals', () => {
   it('returns only approvals still in pending/ (not resolved)', async () => {
     const id1 = await createApproval(paths, 'alice', 'TestOrg', 'Still pending', 'deployment', undefined, frameworkRoot);

@@ -93,6 +93,8 @@ export interface Approval {
   resolved_by?: string;
   resolution_note?: string;
   source_file?: string;
+  /** Per-kind payload (foundry_approval_id + kind + kind-specific fields like fqdn/registrar/price_usd). */
+  metadata?: Record<string, unknown>;
 }
 
 // -- Event Types --
