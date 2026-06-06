@@ -1436,7 +1436,17 @@ function buildFoundryBodyFromFlags(rest: string[]): { body: any; bodyArg?: strin
       else if (val === 'false') coerced = false;
       else if (val === 'null') coerced = null;
       else if (val !== '' && /^-?\d+(\.\d+)?$/.test(val)) coerced = Number(val);
-      else if (val.includes(',') && !val.startsWith('{') && !val.startsWith('[')) {
+      // CSV coercion is intentionally narrow: only token-like comma-lists (no
+      // whitespace, only word/dash chars per element). Story bodies and other
+      // prose strings containing commas must stay as strings — auto-splitting
+      // them broke story-analysis on first call. Use --body for JSON arrays
+      // with mixed/free-form content.
+      else if (
+        val.includes(',') &&
+        !val.startsWith('{') &&
+        !val.startsWith('[') &&
+        /^[A-Za-z0-9_\-.]+(?:,[A-Za-z0-9_\-.]+)+$/.test(val)
+      ) {
         coerced = val.split(',').map((s) => s.trim()).filter(Boolean);
       }
       body[key] = coerced;
@@ -1617,6 +1627,285 @@ busCommand
     }
 
     if (!response.ok) process.exit(2);
+  });
+
+// ---------------------------------------------------------------------------
+// foundry-story-analyse — convenience wrapper around `foundry story-analysis
+// analyse` with story-friendly flags (--story / --story-file / --corpus) and
+// a human-formatted summary of the response. Use --json for raw shape.
+// ---------------------------------------------------------------------------
+
+busCommand
+  .command('foundry-story-analyse')
+  .description('Analyse a single user story via the Foundry story-analysis service — formatted output')
+  .option('--story <text>', 'Story text inline (use --story-file for multi-line)')
+  .option('--story-file <path>', 'Path to a file containing the story text')
+  .option('--corpus <id>', 'Use a story from story-corpus-annotated-v1 (e.g. A1, B1, D1) — resolved from repos/storyintelligence/backend/tests/fixtures/story_corpus_v1.py')
+  .option('--analysis-id <uuid>', 'Optional analysis_id (defaults to a fresh UUID)')
+  .option('--org <org>', 'Override CTX_ORG (defaults to the caller\'s org)')
+  .option('--agent <name>', 'Override CTX_AGENT_NAME (defaults to the caller)')
+  .option('--ttl <seconds>', 'Token TTL (default 60)', '60')
+  .option('--timeout <ms>', 'Request timeout (default 60000 — Claude calls can run 15-35s)', '60000')
+  .option('--json', 'Output raw JSON response instead of formatted summary')
+  .action(async (opts: {
+    story?: string;
+    storyFile?: string;
+    corpus?: string;
+    analysisId?: string;
+    org?: string;
+    agent?: string;
+    ttl?: string;
+    timeout?: string;
+    json?: boolean;
+  }) => {
+    const env = resolveEnv();
+    const org = opts.org || env.org;
+    if (!org) {
+      console.error('ERROR: --org or CTX_ORG required');
+      process.exit(1);
+    }
+    const agent = opts.agent || env.agentName;
+    if (!agent) {
+      console.error('ERROR: --agent or CTX_AGENT_NAME required (need a caller identity for the Bearer token)');
+      process.exit(1);
+    }
+
+    const { existsSync, readFileSync } = require('fs');
+    const { join: pjoin } = require('path');
+    const frameworkRoot = env.frameworkRoot || process.cwd();
+
+    // Resolve story_text from one of --story / --story-file / --corpus
+    let storyText: string | null = null;
+    let storySource = '';
+    if (opts.story) {
+      storyText = opts.story;
+      storySource = 'inline';
+    } else if (opts.storyFile) {
+      if (!existsSync(opts.storyFile)) {
+        console.error(`ERROR: --story-file path not found: ${opts.storyFile}`);
+        process.exit(1);
+      }
+      storyText = readFileSync(opts.storyFile, 'utf-8');
+      storySource = `file:${opts.storyFile}`;
+    } else if (opts.corpus) {
+      const corpusPath = '/home/cortext/repos/storyintelligence/backend/tests/fixtures/story_corpus_v1.py';
+      if (!existsSync(corpusPath)) {
+        console.error(`ERROR: corpus fixture not found at ${corpusPath}`);
+        process.exit(1);
+      }
+      const text = readFileSync(corpusPath, 'utf-8');
+      const id = opts.corpus.toUpperCase();
+      // Each fixture is `<ID> = { ... "story_text": <value>, ... }` where
+      // <value> is either a paren-wrapped concatenation of Python string
+      // literals (multi-line stories) OR a single string literal (short
+      // stories like B1). Locate the start of the value and decide by shape.
+      const startRe = new RegExp(`(?:^|\\n)${id}\\s*=\\s*\\{[\\s\\S]*?"story_text"\\s*:\\s*`);
+      const startMatch = startRe.exec(text);
+      if (!startMatch) {
+        console.error(`ERROR: corpus id "${opts.corpus}" not found in ${corpusPath}`);
+        process.exit(1);
+      }
+      let pos = startMatch.index + startMatch[0].length;
+      let body: string;
+      if (text[pos] === '(') {
+        pos++;
+        let depth = 1;
+        let inStr = false;
+        let strCh = '';
+        const startBody = pos;
+        while (pos < text.length && depth > 0) {
+          const ch = text[pos];
+          if (inStr) {
+            if (ch === '\\') { pos += 2; continue; }
+            if (ch === strCh) inStr = false;
+          } else {
+            if (ch === '"' || ch === "'") { inStr = true; strCh = ch; }
+            else if (ch === '(') depth++;
+            else if (ch === ')') depth--;
+          }
+          if (depth === 0) break;
+          pos++;
+        }
+        if (depth !== 0) {
+          console.error(`ERROR: could not find closing paren for corpus story_text on ${id}`);
+          process.exit(1);
+        }
+        body = text.slice(startBody, pos);
+      } else if (text[pos] === '"' || text[pos] === "'") {
+        const strCh = text[pos];
+        pos++;
+        const startBody = pos;
+        while (pos < text.length) {
+          if (text[pos] === '\\') { pos += 2; continue; }
+          if (text[pos] === strCh) break;
+          pos++;
+        }
+        body = `${strCh}${text.slice(startBody, pos)}${strCh}`;
+      } else {
+        console.error(`ERROR: unexpected story_text shape for ${id} at offset ${pos}`);
+        process.exit(1);
+      }
+      const stringRe = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'/g;
+      let collected = '';
+      let sm: RegExpExecArray | null;
+      while ((sm = stringRe.exec(body)) !== null) {
+        const inner = sm[1] ?? sm[2] ?? '';
+        collected += inner
+          .replace(/\\n/g, '\n')
+          .replace(/\\t/g, '\t')
+          .replace(/\\"/g, '"')
+          .replace(/\\'/g, "'")
+          .replace(/\\\\/g, '\\');
+      }
+      storyText = collected;
+      storySource = `corpus:${id}`;
+    } else {
+      console.error('ERROR: one of --story / --story-file / --corpus is required');
+      process.exit(1);
+    }
+    if (!storyText || !storyText.trim()) {
+      console.error('ERROR: resolved story text is empty');
+      process.exit(1);
+    }
+
+    // Load registry + RBAC lib (same path as generic foundry call)
+    const registryPath = pjoin(frameworkRoot, 'orgs', org, 'projects', 'foundry', 'services', 'registry.json');
+    if (!existsSync(registryPath)) {
+      console.error(`ERROR: foundry registry not found at ${registryPath}`);
+      process.exit(1);
+    }
+    const registry = JSON.parse(readFileSync(registryPath, 'utf-8'));
+    const svc = registry.services && registry.services['story-analysis'];
+    if (!svc) {
+      console.error('ERROR: story-analysis not registered in registry.json');
+      process.exit(1);
+    }
+    const op = svc.operations && svc.operations.analyse;
+    if (!op) {
+      console.error('ERROR: story-analysis.operations.analyse not registered');
+      process.exit(1);
+    }
+
+    const rbacLibPath = pjoin(frameworkRoot, 'orgs', org, 'projects', 'foundry', 'lib', 'rbac');
+    if (!existsSync(rbacLibPath)) {
+      console.error(`ERROR: foundry RBAC lib not found at ${rbacLibPath}`);
+      process.exit(1);
+    }
+
+    // Load FOUNDRY_TOKEN_SECRET if not already in env
+    if (!process.env.FOUNDRY_TOKEN_SECRET) {
+      const secretsPath = pjoin(frameworkRoot, 'orgs', org, 'secrets.env');
+      if (existsSync(secretsPath)) {
+        for (const line of readFileSync(secretsPath, 'utf-8').split('\n')) {
+          const t = line.trim();
+          if (!t || t.startsWith('#')) continue;
+          const idx = t.indexOf('=');
+          if (idx > 0 && t.slice(0, idx) === 'FOUNDRY_TOKEN_SECRET') {
+            let v = t.slice(idx + 1);
+            if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+            process.env.FOUNDRY_TOKEN_SECRET = v;
+            break;
+          }
+        }
+      }
+    }
+    if (!process.env.FOUNDRY_TOKEN_SECRET) {
+      console.error(`ERROR: FOUNDRY_TOKEN_SECRET not set in env or orgs/${org}/secrets.env`);
+      process.exit(1);
+    }
+
+    const rbac = require(rbacLibPath);
+    const ttl = Math.max(1, Math.min(parseInt(opts.ttl || '60', 10), 3600));
+    let token: string;
+    try {
+      token = rbac.issueAgentToken({ caller_id: agent, tenant_id: org, ttl_seconds: ttl });
+    } catch (e: any) {
+      console.error(`ERROR: token issuance failed: ${e.message}`);
+      process.exit(1);
+    }
+
+    // Mint analysis_id if absent. UUID v4 via crypto.randomUUID (Node 14.17+).
+    const aid = opts.analysisId || (require('crypto').randomUUID());
+
+    const url = `${svc.url.replace(/\/$/, '')}${op.path}`;
+    const headers: Record<string, string> = {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    };
+    const body = JSON.stringify({ analysis_id: aid, story_text: storyText });
+
+    const timeoutMs = Math.max(100, parseInt(opts.timeout || '60000', 10));
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+
+    const t0 = Date.now();
+    let response: Response;
+    let text: string;
+    try {
+      response = await fetch(url, { method: 'POST', headers, body, signal: controller.signal });
+      text = await response.text();
+    } catch (e: any) {
+      clearTimeout(t);
+      if (e.name === 'AbortError') {
+        console.error(`ERROR: request timed out after ${timeoutMs}ms calling ${url}`);
+        process.exit(1);
+      }
+      console.error(`ERROR: request failed: ${e.message}`);
+      process.exit(1);
+    } finally {
+      clearTimeout(t);
+    }
+    const wallMs = Date.now() - t0;
+
+    let parsed: any = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch { /* keep null */ }
+
+    if (opts.json) {
+      console.log(JSON.stringify(parsed ?? { raw: text, status: response.status }, null, 2));
+      if (!response.ok) process.exit(2);
+      return;
+    }
+
+    if (!response.ok || !parsed) {
+      console.error(`HTTP ${response.status} from ${url}`);
+      console.error(typeof parsed === 'object' ? JSON.stringify(parsed, null, 2) : (text || '(empty body)'));
+      process.exit(2);
+    }
+
+    // Human-formatted summary
+    const c = parsed.clarity || {};
+    const sc = parsed.scope || {};
+    const issues: any[] = Array.isArray(parsed.issue_cards) ? parsed.issue_cards : [];
+    const notes: any[] = Array.isArray(parsed.notes) ? parsed.notes : [];
+    const story1 = storyText.trim().split('\n')[0].slice(0, 80);
+
+    console.log('═'.repeat(72));
+    console.log(`STORY ANALYSIS  (analysis_id ${parsed.analysis_id || aid})`);
+    console.log('═'.repeat(72));
+    console.log(`Source       : ${storySource}`);
+    console.log(`Story start  : ${story1}${storyText.length > 80 ? '…' : ''}`);
+    console.log(`Model        : ${parsed.model_used || '?'}    Cost: $${parsed.cost_usd ?? '?'}    Wall: ${(wallMs / 1000).toFixed(2)}s`);
+    console.log('-'.repeat(72));
+    console.log(`Clarity      : ${c.score ?? '?'} / 100  →  ${c.band || '?'}  (${c.label || ''})`);
+    console.log(`Scope        : ${sc.flag ? `FLAG (${sc.level})` : 'none'}  —  ${sc.summary || ''}`);
+    console.log(`Issue cards  : ${issues.length}`);
+    for (const card of issues) {
+      const sev = (card.severity || '?').toUpperCase().padEnd(6);
+      console.log(`  · [${sev}] ${card.id}  (${card.category}): ${card.title}`);
+    }
+    if (parsed.rewrite?.full_text) {
+      console.log('-'.repeat(72));
+      console.log('Rewrite (truncated to 600 chars):');
+      const rw = String(parsed.rewrite.full_text);
+      console.log(rw.length > 600 ? rw.slice(0, 600) + '…' : rw);
+    }
+    if (notes.length) {
+      console.log('-'.repeat(72));
+      console.log('Notes:');
+      for (const n of notes) console.log(`  · ${n}`);
+    }
+    console.log('═'.repeat(72));
   });
 
 // ---------------------------------------------------------------------------
