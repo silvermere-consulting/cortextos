@@ -19,6 +19,7 @@ import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByN
 import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, deleteKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
+import { convertFile, convertAndIngest } from '../bus/convert-file.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, syncOAuthFromCredentials, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
@@ -1303,6 +1304,70 @@ busCommand
       frameworkRoot: env.frameworkRoot || process.cwd(),
       instanceId: env.instanceId,
     });
+  });
+
+busCommand
+  .command('convert-file')
+  .description('Convert a file to markdown (PDF→Kreuzberg, Office/HTML/CSV/etc→markitdown). Optional --kb-ingest pipes the result into kb-ingest. License note: Kreuzberg is ELv2 internal-only — do not embed this command in client-facing products.')
+  .argument('<path>', 'File path to convert')
+  .option('--kb-ingest', 'Pipe the converted markdown into kb-ingest (instead of stdout)')
+  .option('--scope <s>', 'Scope for --kb-ingest: shared or private', 'shared')
+  .option('--collection <name>', 'Override auto-derived collection name (for --kb-ingest)')
+  .option('--org <org>', 'Organization name (required for --kb-ingest)')
+  .option('--agent <name>', 'Agent name (for --kb-ingest with --scope private)')
+  .option('--force', 'Re-ingest even if already indexed (--kb-ingest only)')
+  .option('--ocr', 'Force OCR on PDFs (requires tesseract-ocr installed)')
+  .option('--json', 'Emit a JSON envelope with content + extractor metadata (stdout mode only)')
+  .action((path: string, opts: {
+    kbIngest?: boolean;
+    scope?: string;
+    collection?: string;
+    org?: string;
+    agent?: string;
+    force?: boolean;
+    ocr?: boolean;
+    json?: boolean;
+  }) => {
+    const env = resolveEnv();
+    const frameworkRoot = env.frameworkRoot || process.cwd();
+
+    if (opts.kbIngest) {
+      const org = opts.org || env.org;
+      if (!org) {
+        console.error('ERROR: --org or CTX_ORG required when using --kb-ingest');
+        process.exit(1);
+      }
+      const { conversion, ingestRan, markdownTmpPath } = convertAndIngest(path, {
+        frameworkRoot,
+        instanceId: env.instanceId,
+        org,
+        agent: opts.agent || env.agentName,
+        scope: (opts.scope as 'shared' | 'private') || 'shared',
+        collection: opts.collection,
+        force: opts.force,
+        ocr: opts.ocr,
+        format: 'markdown',
+      });
+      if (!conversion.ok) {
+        if (conversion.stderr) process.stderr.write(conversion.stderr);
+        process.exit(conversion.exitCode || 1);
+      }
+      if (ingestRan && markdownTmpPath) {
+        console.log(`Converted and ingested. Intermediate markdown: ${markdownTmpPath}`);
+      }
+      return;
+    }
+
+    const result = convertFile(path, {
+      frameworkRoot,
+      ocr: opts.ocr,
+      format: opts.json ? 'json' : 'markdown',
+    });
+    if (!result.ok) {
+      if (result.stderr) process.stderr.write(result.stderr);
+      process.exit(result.exitCode || 1);
+    }
+    process.stdout.write(result.content);
   });
 
 busCommand

@@ -98,6 +98,7 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 | `kb-query "<question>" --org $CTX_ORG` | Semantic search |
 | `kb-ingest <path> --org $CTX_ORG --scope private\|shared` | Index files into KB |
 | `kb-collections --org $CTX_ORG` | List available collections |
+| `convert-file <path> [--kb-ingest] [--ocr] [--json]` | File → markdown (PDF via Kreuzberg, Office/HTML/CSV/etc via markitdown). Optional one-shot KB ingest. **Internal use only** — Kreuzberg is ELv2. Full docs: `.claude/skills/file-ingest/SKILL.md` |
 
 ### Discovery & Fleet
 | Command | What it does |

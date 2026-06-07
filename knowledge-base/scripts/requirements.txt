@@ -3,3 +3,7 @@ google-genai>=1.0.0
 python-docx>=1.0.0
 python-pptx>=1.0.0
 openpyxl>=3.1.0
+# convert-file (cortextos bus convert-file) — Office/HTML/CSV/etc via markitdown,
+# PDF via Kreuzberg v4.9.9. Kreuzberg is ELv2 (internal use only); markitdown is MIT.
+markitdown[all]
+kreuzberg==4.9.9
