@@ -170,6 +170,26 @@ for (const { file, mime } of PYLOT_LOGO_CANDIDATES) {
   } catch { /* try next */ }
 }
 
+// ClearSpeak brand-mode logo (same brand/ directory). Red wordmark for face-to-face
+// sharing with Robyn. Banked 2026-06-08 — writer was using brand_mode: silvermere
+// for ClearSpeak docs because there was no clearspeak mode.
+const CLEARSPEAK_LOGO_CANDIDATES = [
+  { file: 'clearspeak-logo.png', mime: 'image/png' },
+  { file: 'clearspeak-logo.svg', mime: 'image/svg+xml' },
+  { file: 'clearspeak-logo.jpg', mime: 'image/jpeg' },
+];
+let clearspeakLogoSrc = '';
+for (const { file, mime } of CLEARSPEAK_LOGO_CANDIDATES) {
+  const p = path.join(SILVERMERE_LOGO_DIR, file);
+  try {
+    if (fs.existsSync(p)) {
+      const buf = fs.readFileSync(p);
+      clearspeakLogoSrc = `data:${mime};base64,${buf.toString('base64')}`;
+      break;
+    }
+  } catch { /* try next */ }
+}
+
 const brandHeader = brandMode === 'silvermere'
   ? `<div class="brand-header">
     ${brandLogoSrc
@@ -183,6 +203,13 @@ const brandHeader = brandMode === 'silvermere'
       ? `<img class="brand-logo brand-logo--pylot" src="${pylotLogoSrc}" alt="PYLOT" />`
       : `<span class="brand-name brand-name--pylot">PYLOT &middot; بيلوت</span>`}
     <span class="brand-rule-dot"></span>
+  </div>`
+  : brandMode === 'clearspeak'
+  ? `<div class="brand-header brand-header--clearspeak">
+    ${clearspeakLogoSrc
+      ? `<img class="brand-logo brand-logo--clearspeak" src="${clearspeakLogoSrc}" alt="ClearSpeak" />`
+      : `<span class="brand-name brand-name--clearspeak">ClearSpeak</span>`}
+    <span class="brand-rule-dot brand-rule-dot--clearspeak"></span>
   </div>`
   : '';
 
@@ -271,6 +298,27 @@ const html = `<!DOCTYPE html>
     color: #111;
     letter-spacing: 0.12em;
     text-transform: none;
+  }
+
+  /* ClearSpeak brand variant (overrides the Silvermere defaults above) */
+  /* Signal-red rule + warm ink/stone palette matches the ClearSpeak Studio UI. */
+  .brand-header--clearspeak {
+    border-bottom: 2px solid #B92438;
+  }
+  .brand-logo--clearspeak {
+    height: 36px;
+    width: auto;
+  }
+  .brand-name--clearspeak {
+    font-family: 'Inter', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-size: 14pt;
+    font-weight: 800;
+    color: #1A1A1A;
+    letter-spacing: 0.06em;
+    text-transform: none;
+  }
+  .brand-rule-dot--clearspeak {
+    background: #B92438;
   }
 
   /* Front matter meta block */
