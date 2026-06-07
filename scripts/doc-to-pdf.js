@@ -190,6 +190,26 @@ for (const { file, mime } of CLEARSPEAK_LOGO_CANDIDATES) {
   } catch { /* try next */ }
 }
 
+// ClearSpeak FOOTER logo (black horizontal) — paired with the red-stacked
+// header logo per Steve brand assets v1.0 (2026-06-08). Rendered as a CSS
+// page-margin footer so it appears on every page of the PDF.
+const CLEARSPEAK_FOOTER_LOGO_CANDIDATES = [
+  { file: 'clearspeak-logo-footer.png', mime: 'image/png' },
+  { file: 'clearspeak-logo-footer.svg', mime: 'image/svg+xml' },
+  { file: 'clearspeak-logo-footer.jpg', mime: 'image/jpeg' },
+];
+let clearspeakFooterLogoSrc = '';
+for (const { file, mime } of CLEARSPEAK_FOOTER_LOGO_CANDIDATES) {
+  const p = path.join(SILVERMERE_LOGO_DIR, file);
+  try {
+    if (fs.existsSync(p)) {
+      const buf = fs.readFileSync(p);
+      clearspeakFooterLogoSrc = `data:${mime};base64,${buf.toString('base64')}`;
+      break;
+    }
+  } catch { /* try next */ }
+}
+
 const brandHeader = brandMode === 'silvermere'
   ? `<div class="brand-header">
     ${brandLogoSrc
@@ -300,13 +320,18 @@ const html = `<!DOCTYPE html>
     text-transform: none;
   }
 
-  /* ClearSpeak brand variant (overrides the Silvermere defaults above) */
-  /* Signal-red rule + warm ink/stone palette matches the ClearSpeak Studio UI. */
+  /* ClearSpeak GCC brand variant (overrides the Silvermere defaults above) */
+  /* Brand assets v1.0 (Steve 2026-06-08): red-stacked square logo top-left, */
+  /* black-horizontal logo in page footer. Signal-red rule + warm ink palette */
+  /* matches the ClearSpeak Studio UI. */
   .brand-header--clearspeak {
     border-bottom: 2px solid #B92438;
+    padding: 6px 0;
   }
   .brand-logo--clearspeak {
-    height: 36px;
+    /* Stacked square logo — slightly taller than the landscape pylot variant */
+    /* so the GCC sub-mark stays legible at print resolution. */
+    height: 56px;
     width: auto;
   }
   .brand-name--clearspeak {
@@ -513,6 +538,19 @@ const html = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// Per-page footer template — currently only for clearspeak brand mode.
+// Playwright requires self-contained HTML with explicit font sizing in
+// header/footer templates (zero is the default and would render blank).
+const footerTemplate = brandMode === 'clearspeak' && clearspeakFooterLogoSrc
+  ? `<div style="width:100%; padding:0 14mm; display:flex; justify-content:center; align-items:center; font-size:0;">
+       <img src="${clearspeakFooterLogoSrc}" style="height:32px; width:auto; display:block;" alt="ClearSpeak GCC" />
+     </div>`
+  : '';
+const useFooter = footerTemplate !== '';
+// Bump bottom margin when footer is active so content doesn't collide with it.
+const portraitBottomMargin = useFooter ? '32mm' : '22mm';
+const landscapeBottomMargin = useFooter ? '24mm' : '10mm';
+
 (async () => {
   const chromePath = findChrome();
   const browser = await chromium.launch({
@@ -526,8 +564,13 @@ const html = `<!DOCTYPE html>
     landscape: isLandscape,
     printBackground: true,
     margin: isLandscape
-      ? { top: '10mm', right: '10mm', bottom: '10mm', left: '10mm' }
-      : { top: '18mm', right: '16mm', bottom: '22mm', left: '16mm' },
+      ? { top: '10mm', right: '10mm', bottom: landscapeBottomMargin, left: '10mm' }
+      : { top: '18mm', right: '16mm', bottom: portraitBottomMargin, left: '16mm' },
+    displayHeaderFooter: useFooter,
+    // Empty header so the default "Page X of Y" / URL doesn't appear when
+    // displayHeaderFooter is on.
+    headerTemplate: '<div></div>',
+    footerTemplate: footerTemplate || '<div></div>',
   });
   await browser.close();
   console.log(`PDF written to: ${outputPath}`);
