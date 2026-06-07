@@ -72,7 +72,28 @@ function stripFrontMatter(src) {
 }
 
 const { meta, body } = stripFrontMatter(markdown);
-const htmlBody = marked.parse(body);
+const inputDir = path.dirname(resolvedInput);
+
+// Post-process parsed HTML: replace local <img src="..."> with base64 data URIs
+// so Playwright's setContent() (which has no baseURL) can render them.
+function inlineLocalImages(html) {
+  return html.replace(/<img([^>]*?)src="([^"]+)"([^>]*?)>/gi, (match, pre, src, post) => {
+    if (src.startsWith('data:') || src.startsWith('http://') || src.startsWith('https://')) {
+      return match; // already inline or remote — leave as-is
+    }
+    try {
+      const abs = path.isAbsolute(src) ? src : path.resolve(inputDir, src);
+      if (!fs.existsSync(abs)) return match;
+      const ext = path.extname(abs).toLowerCase();
+      const mimeMap = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml' };
+      const mime = mimeMap[ext] || 'image/jpeg';
+      const b64 = fs.readFileSync(abs).toString('base64');
+      return `<img${pre}src="data:${mime};base64,${b64}"${post}>`;
+    } catch { return match; }
+  });
+}
+
+const htmlBody = inlineLocalImages(marked.parse(body));
 
 // Project-code prefix from frontmatter — prepend "<code>-" to the auto-computed output
 // filename when `project_code:` is set, the user did NOT pass an explicit output path, and
@@ -135,6 +156,7 @@ for (const { file, mime } of SILVERMERE_LOGO_CANDIDATES) {
 const PYLOT_LOGO_CANDIDATES = [
   { file: 'pylot-logo.svg', mime: 'image/svg+xml' },
   { file: 'pylot-logo.png', mime: 'image/png' },
+  { file: 'pylot-logo.jpg', mime: 'image/jpeg' },
 ];
 let pylotLogoSrc = '';
 for (const { file, mime } of PYLOT_LOGO_CANDIDATES) {
