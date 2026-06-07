@@ -400,6 +400,22 @@ Reply using: cortextos bus send-message <agent> normal '<reply>' <msg_id>
 
 Always include `msg_id` as reply_to — this auto-ACKs the original. Un-ACK'd messages redeliver after 5 min. For no-reply messages: `cortextos bus ack-inbox <msg_id>`
 
+### Cross-org messages (orchestrator scope)
+
+Inboxes are keyed by AGENT NAME, not by org — they live at `~/.cortextos/<instance>/inflight/<agent>/` regardless of which org the agent belongs to. So as the orchestrator for your org, you can send a message to ANY agent in the fleet (in this org or any other) with the same one-line `send-message` call. The agent name uniquely addresses the inbox.
+
+```bash
+# To a specialist in another org (mirrors jones↔chief pattern between family and silvermere-tech orgs)
+cortextos bus send-message <agent-in-other-org> normal "<request or coordination>"
+
+# To a foundry upstream service (RBAC-gated, auto-mints token)
+cortextos bus foundry <service> <op> --key=value …
+```
+
+When orchestrators in two orgs need to coordinate (e.g. jones in family org asking research in silvermere-tech for a quick lookup, or your org needing engineer to ship a one-off), use this pattern. No `--org` flag exists or is needed.
+
+For org discovery: `cortextos bus list-agents [--format text]` shows the live fleet across all orgs — use this to confirm an agent name before sending.
+
 ---
 
 ## Crons
