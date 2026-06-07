@@ -106,6 +106,7 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 | `list-agents [--org O] [--format json\|text]` | All agents in system |
 | `list-skills [--format text\|json]` | Skills available to this agent |
 | `check-goal-staleness [--threshold DAYS]` | Flag agents with stale GOALS.md |
+| `check-deps <dep1> [dep2 ...] [--include-node] [--json]` | Verify whether deps are present in the stack: pip-show + requirements + Python imports (+ optional Node package.json + import sites). Exit 2 if any dep missing. Codifies "verify-before-claim". |
 
 ### Lifecycle
 | Command | What it does |

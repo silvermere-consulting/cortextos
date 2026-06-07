@@ -91,11 +91,11 @@ Show a task's append-only audit log (every status change, claim, completion).
 cortextos bus task-history <task_id>
 ```
 
-### check-deps
-Show open dependencies blocking a task — lists `blocked_by` entries that are not yet completed.
+### check-task-deps
+Show open dependencies blocking a task — lists `blocked_by` entries that are not yet completed. (Renamed from `check-deps` on 2026-06-07; the old name was reclaimed for the new stack-deps check below.)
 
 ```bash
-cortextos bus check-deps <task_id>
+cortextos bus check-task-deps <task_id>
 ```
 
 ### save-output
@@ -546,7 +546,8 @@ cortextos bus submit-community-item <item-name> <item-type> "<description>" [--d
 | Finish work                       | `complete-task`           |
 | Attach a file to a task           | `save-output`             |
 | Inspect a task's audit log        | `task-history`            |
-| See blockers on a task            | `check-deps`              |
+| See blockers on a task            | `check-task-deps`         |
+| Check if a dep is in our stack    | `check-deps`              |
 | See my queue                      | `list-tasks`              |
 | Compact old completed tasks       | `compact-tasks`           |
 | Leave a trail                     | `log-event`               |

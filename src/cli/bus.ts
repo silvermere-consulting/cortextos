@@ -20,6 +20,7 @@ import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, deleteKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { convertFile, convertAndIngest } from '../bus/convert-file.js';
+import { checkDeps, formatDepsTable } from '../bus/check-deps.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, syncOAuthFromCredentials, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
@@ -231,8 +232,8 @@ busCommand
   });
 
 busCommand
-  .command('check-deps')
-  .description('Show open dependencies blocking a task — lists blocked_by entries that are not yet completed')
+  .command('check-task-deps')
+  .description('Show open dependencies blocking a task — lists blocked_by entries that are not yet completed. (Renamed from check-deps 2026-06-07 — check-deps is now stack-deps. The old name still works as an alias.)')
   .argument('<id>', 'Task ID')
   .action((id: string) => {
     const env = resolveEnv();
@@ -1368,6 +1369,25 @@ busCommand
       process.exit(result.exitCode || 1);
     }
     process.stdout.write(result.content);
+  });
+
+busCommand
+  .command('check-deps')
+  .description('Check whether one or more dependencies are present in this stack (Python imports, requirements files, pip show in framework venv, optionally Node package.json + import sites).')
+  .argument('<deps...>', 'One or more dependency names (e.g. torch kreuzberg react)')
+  .option('--include-node', 'Also search Node ecosystem (package.json + .ts/.js import sites)')
+  .option('--json', 'Emit JSON array instead of the human-readable table')
+  .action((deps: string[], opts: { includeNode?: boolean; json?: boolean }) => {
+    const env = resolveEnv();
+    const frameworkRoot = env.frameworkRoot || process.cwd();
+    const results = checkDeps(deps, { frameworkRoot, includeNode: opts.includeNode });
+    if (opts.json) {
+      console.log(JSON.stringify(results, null, 2));
+    } else {
+      console.log(formatDepsTable(results));
+    }
+    // Exit non-zero if ANY requested dep is missing — makes scripted usage useful
+    if (results.some(r => !r.present)) process.exit(2);
   });
 
 busCommand
