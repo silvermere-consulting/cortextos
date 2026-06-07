@@ -397,6 +397,21 @@ cortextos enable "$AGENT" --org "$ORG" --restart
 4. Hard-restart the agent: `cortextos bus hard-restart --reason "load new hook"`. The daemon kills the PID and respawns a fresh process that re-reads `settings.json`.
 5. If the hook still does not fire after a fresh PID, instrument the script with an unconditional write to `/tmp/<agent>-hook-test.log` at the very top of `main()`, run a benign tool, and check whether the file appears. If yes, the hook is firing but the script is returning early. If no, the hook is wired wrong in `settings.json`.
 
+### User Reports Stuck Onboarding (banked 2026-06-07)
+
+When a user says "my new agent is stuck mid-onboarding" or "agent stopped responding partway through setup":
+
+1. **Diagnose first — distinguish dead from stuck-waiting:**
+   - `cortextos status` — is the process alive?
+   - `cat $HOME/.cortextos/default/state/$AGENT/heartbeat.json` — is the heartbeat recent?
+   - `cat $HOME/.cortextos/default/state/$AGENT/last-telegram-*.txt` — what did the agent last say?
+   - If process alive + heartbeat fresh + last Telegram was a question → **stuck-waiting on user reply, NOT crashed**.
+2. **For stuck-waiting (most common):** do NOT attempt session-jsonl fresh-boot mechanics. The right answer is:
+   - Tell the user to type `/onboarding` into Telegram. This re-fires the onboarding skill from Step 1 in the existing session.
+   - OR tell the user to reply to the agent's last question. Fast-checker delivers the reply, agent picks up where it left off.
+3. **Fresh-boot via session-jsonl deletion DOES NOT WORK** — see the Lifecycle gotcha in TOOLS.md. `cortextos start` uses `claude --continue`; if you archive/delete the jsonl, start fails silently and the agent appears dead.
+4. **`.onboarded` flag**: this is set ONLY after onboarding completes. If onboarding never finished, the flag was never written — there is nothing to "delete to reset".
+5. **If the process IS actually dead** (no heartbeat, no claude.exe in pgrep): standard crash recovery applies — check `.crash_count_today`, stderr log, then `cortextos start <agent>`.
 ---
 
 ## Quick Reference

@@ -104,6 +104,9 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 | `auto-commit [--dry-run]` | Daily workspace snapshot (local only) |
 | `check-upstream [--apply]` | Check for framework updates |
 
+
+> **Gotcha (banked 2026-06-07):** `cortextos start <agent>` uses `claude --continue` by default. If the Claude session jsonl was archived/deleted, --continue cannot find a session and start fails SILENTLY (no claude.exe process, `cortextos status` reports no agents). To recover: restore the jsonl OR write a sentinel session file. Do not delete session jsonl files to force fresh boot.
+
 ### Goals
 | Command | What it does |
 |---|---|
