@@ -32,8 +32,10 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
+import zipfile
 from pathlib import Path
 
 PDF_EXTS = {".pdf"}
@@ -151,7 +153,77 @@ def convert_markitdown(path: Path) -> str:
             "tool — Office/HTML/CSV/JSON are the sweet spot here.",
             code=6,
         )
-    return content
+    return enrich_office_images(content, path)
+
+
+# Markitdown emits a literal `![](data:image/<type>;base64...)` placeholder for
+# every embedded image in an Office document — the `...` is text, not a stream
+# truncation. The filename is lost, so KB consumers can't tell which image was
+# where. We post-process DOCX/PPTX output to substitute the source filename in
+# document order. Fail-soft: any zip/XML hiccup leaves the original output
+# untouched so conversion never breaks on enrichment.
+_MD_IMG_PLACEHOLDER = re.compile(r"!\[\]\(data:image/[^;]+;base64\.\.\.\)")
+
+
+def enrich_office_images(content: str, path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix not in {".docx", ".pptx"}:
+        return content
+    if not _MD_IMG_PLACEHOLDER.search(content):
+        return content
+    try:
+        ordered = _ordered_office_media(path, suffix)
+    except Exception:
+        return content
+    if not ordered:
+        return content
+
+    counter = {"i": 0}
+
+    def _sub(_match: "re.Match[str]") -> str:
+        i = counter["i"]
+        counter["i"] += 1
+        if i < len(ordered):
+            return f"[image: {ordered[i]}]"
+        return "[image: <unmatched>]"
+
+    return _MD_IMG_PLACEHOLDER.sub(_sub, content)
+
+
+def _parse_rels(xml_text: str) -> dict[str, str]:
+    return dict(re.findall(r'Id="([^"]+)"\s+Type="[^"]+"\s+Target="([^"]+)"', xml_text))
+
+
+def _ordered_office_media(path: Path, suffix: str) -> list[str]:
+    with zipfile.ZipFile(path) as z:
+        names = set(z.namelist())
+        if suffix == ".docx":
+            rels_name = "word/_rels/document.xml.rels"
+            doc_name = "word/document.xml"
+            if rels_name not in names or doc_name not in names:
+                return []
+            rels = _parse_rels(z.read(rels_name).decode("utf-8", "replace"))
+            doc = z.read(doc_name).decode("utf-8", "replace")
+            rids = re.findall(r'r:embed="(rId\d+)"', doc)
+            return [os.path.basename(rels[r]) for r in rids if r in rels]
+
+        if suffix == ".pptx":
+            slide_rels = sorted(
+                (n for n in names if re.match(r"ppt/slides/_rels/slide\d+\.xml\.rels$", n)),
+                key=lambda n: int(re.search(r"slide(\d+)", n).group(1)),
+            )
+            ordered: list[str] = []
+            for rels_name in slide_rels:
+                num = re.search(r"slide(\d+)", rels_name).group(1)
+                slide_name = f"ppt/slides/slide{num}.xml"
+                if slide_name not in names:
+                    continue
+                rels = _parse_rels(z.read(rels_name).decode("utf-8", "replace"))
+                doc = z.read(slide_name).decode("utf-8", "replace")
+                rids = re.findall(r'r:embed="(rId\d+)"', doc)
+                ordered.extend(os.path.basename(rels[r]) for r in rids if r in rels)
+            return ordered
+    return []
 
 
 def main() -> int:
