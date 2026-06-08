@@ -294,7 +294,16 @@ export class AgentManager {
       // smith-not-receiving-Telegram incident). See src/utils/strip-bom.ts.
       const envContent = stripBom(readFileSync(agentEnvFile, 'utf-8'));
       const botTokenMatch = envContent.match(/^BOT_TOKEN=(.+)$/m);
-      const chatIdMatch = envContent.match(/^CHAT_ID=(.+)$/m);
+      // CHAT_ID is the canonical name; CTX_TELEGRAM_CHAT_ID is accepted as a
+      // fallback because spawn templates and onboarding scripts have written
+      // it both ways historically. Without this fallback, an agent whose
+      // .env only has CTX_TELEGRAM_CHAT_ID (no CHAT_ID) gets chatId=undefined,
+      // TelegramPoller never starts, inbound Telegram messages silently
+      // queue at api.telegram.org and never reach the agent (2026-06-08
+      // shams/Hiba incident — 4 queued onboarding replies dropped). Third
+      // silent-Telegram-receive failure class after smith 2026-05-16 BOM bug.
+      const chatIdMatch = envContent.match(/^CHAT_ID=(.+)$/m)
+        ?? envContent.match(/^CTX_TELEGRAM_CHAT_ID=(.+)$/m);
       // ALLOWED_USERS (plural, comma-separated) takes precedence; ALLOWED_USER (singular) is backward-compat.
       const allowedUsersMatch = envContent.match(/^ALLOWED_USERS=(.+)$/m);
       const allowedUserMatch  = envContent.match(/^ALLOWED_USER=(.+)$/m);
