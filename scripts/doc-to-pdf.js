@@ -308,7 +308,10 @@ const html = `<!DOCTYPE html>
     border-bottom: 3px solid #111;
   }
   .brand-logo--pylot {
-    height: 48px;
+    /* v3 logo (Steve 2026-06-08): 1774x887 landscape mark — bumped from 48px */
+    /* to 96px for stronger header presence on investor briefs. 96px tall x */
+    /* ~192px wide reads prominent without dominating body content. */
+    height: 96px;
     width: auto;
   }
   .brand-name--pylot {
