@@ -35,6 +35,11 @@ CONFIG_FILE = Path(os.environ.get("MMRAG_CONFIG", str(MMRAG_DIR / "config.json")
 CHROMADB_DIR = Path(os.environ.get("MMRAG_CHROMADB_DIR", str(MMRAG_DIR / "chromadb")))
 MEDIA_DIR = MMRAG_DIR / "media"
 LOG_DIR = MMRAG_DIR / "logs"
+GEN_CACHE_DIR = MMRAG_DIR / "cache" / "gen"
+# Bump when ANY gen prompt changes (PDF extraction, image/video/audio description)
+# so previously cached outputs are not reused under a new prompt. New entries
+# write at the new version; old entries remain on disk until cache-clear.
+GEN_CACHE_VERSION = 1
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
@@ -279,6 +284,56 @@ def embed_multimodal(client, config, description_text, media_bytes, mime_type):
 def embed_query(client, config, query_text):
     """Embed a query string for retrieval."""
     return embed_content(client, config, query_text, task_type="RETRIEVAL_QUERY")
+
+
+def _hash_bytes(data):
+    """sha256 hex of bytes, used as the gen-cache key."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _gen_cache_path(content_hash, kind="text"):
+    """Path on disk for the cached gen-output of a given content hash + kind.
+
+    `kind` is "text" for PDF extracts and "desc" for image/video/audio
+    descriptions. Keeping them separate means a hash collision across kinds
+    (theoretically possible if the same byte string is ingested first as one
+    type then another) doesn't load the wrong cached output.
+    """
+    return GEN_CACHE_DIR / f"{content_hash}.v{GEN_CACHE_VERSION}.{kind}.txt"
+
+
+def load_gen_cache(content_hash, kind="text"):
+    """Return cached gen-output text for `content_hash`, or None if absent.
+
+    Closes the gen-token leak path: Gemini-Pro is called to extract content
+    from PDFs / describe media BEFORE the (separately-quota'd) embed call.
+    When an embed 429s mid-ingest, the surrounding ingest function raises
+    and the caller logs a kb_quota_skip — but the gen tokens were already
+    banked, and the next heartbeat re-runs the full ingest, re-burning them.
+    Persisting gen-output on disk by content hash means the retry loads
+    from cache and skips the gen-call entirely.
+    """
+    p = _gen_cache_path(content_hash, kind)
+    if not p.exists():
+        return None
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def save_gen_cache(content_hash, text, kind="text"):
+    """Persist gen-output text to disk. Called immediately after a successful
+    _retry_generate_content / describe_media call, BEFORE the embed step, so
+    that an embed failure on the same ingest leaves the cache intact for the
+    next retry. Best-effort — log and continue on disk errors so a cache
+    write hiccup never blocks an otherwise successful ingest."""
+    try:
+        p = _gen_cache_path(content_hash, kind)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    except Exception as e:
+        print(f"    WARN: gen-cache write failed for {content_hash[:12]}: {e}")
 
 
 def describe_media(client, config, file_path, media_type="video"):
@@ -553,8 +608,18 @@ def ingest_image(client, config, collection, file_path):
         print(f"  SKIP (exists): {file_path}")
         return 0
 
-    print(f"  Generating description for {file_path.name}...")
-    description, media_bytes, mime = describe_media(client, config, file_path, "image")
+    with open(file_path, "rb") as f:
+        media_bytes = f.read()
+    file_hash = _hash_bytes(media_bytes)
+    mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+
+    description = load_gen_cache(file_hash, kind="desc")
+    if description is not None:
+        print(f"  Gen-cache HIT for {file_path.name} ({file_hash[:12]}) — skipping description call")
+    else:
+        print(f"  Generating description for {file_path.name}...")
+        description, media_bytes, mime = describe_media(client, config, file_path, "image")
+        save_gen_cache(file_hash, description, kind="desc")
 
     # Option B: embed text description + raw image together
     try:
@@ -632,12 +697,36 @@ def ingest_video(client, config, collection, file_path):
         media_bytes = None
         mime = None
 
+        # Gen-cache: hash the chunk bytes once, check cache for both "video"
+        # and "audio-fallback" kinds since the same chunk may have been described
+        # via either path on a prior run.
+        chunk_hash = None
+        if chunk_path.exists():
+            try:
+                chunk_hash = _hash_bytes(chunk_path.read_bytes())
+            except Exception:
+                chunk_hash = None
+
+        cached_desc = load_gen_cache(chunk_hash, kind="desc") if chunk_hash else None
+        if cached_desc is not None:
+            description = cached_desc
+            # Re-load chunk bytes + mime so multimodal embed still has them.
+            try:
+                media_bytes = chunk_path.read_bytes()
+                mime = mimetypes.guess_type(str(chunk_path))[0] or "application/octet-stream"
+            except Exception:
+                media_bytes = None
+                mime = None
+            print(f"    Gen-cache HIT ({chunk_hash[:12]}) — skipping description call")
+
         # Strategy: try video description first, fall back to audio-only for large chunks
-        if chunk_size_mb <= 20:
+        if description is None and chunk_size_mb <= 20:
             # Small enough for full video analysis
             try:
                 description, media_bytes, mime = describe_media(client, config, chunk_path, "video")
                 print(f"    Described via video")
+                if chunk_hash:
+                    save_gen_cache(chunk_hash, description, kind="desc")
             except Exception as e:
                 print(f"    Video description failed ({e}), trying audio...")
 
@@ -657,6 +746,13 @@ def ingest_video(client, config, collection, file_path):
                         f"{chunk['start']:.0f}s-{chunk['end']:.0f}s]\n\n{description}"
                     )
                     print(f"    Described via audio extraction")
+                    # Cache by audio-track hash so a re-run after embed-fail
+                    # skips the audio describe call too.
+                    try:
+                        audio_hash = _hash_bytes(audio_path.read_bytes())
+                        save_gen_cache(audio_hash, description, kind="desc")
+                    except Exception:
+                        pass
                 except Exception as e:
                     print(f"    Audio description also failed: {e}")
 
@@ -715,8 +811,18 @@ def ingest_audio(client, config, collection, file_path):
             print(f"  SKIP (exists): {file_path}")
             return 0
 
-        print(f"  Transcribing {file_path.name}...")
-        description, media_bytes, mime = describe_media(client, config, file_path, "audio")
+        with open(file_path, "rb") as f:
+            media_bytes = f.read()
+        file_hash = _hash_bytes(media_bytes)
+        mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+
+        description = load_gen_cache(file_hash, kind="desc")
+        if description is not None:
+            print(f"  Gen-cache HIT for {file_path.name} ({file_hash[:12]}) — skipping transcription call")
+        else:
+            print(f"  Transcribing {file_path.name}...")
+            description, media_bytes, mime = describe_media(client, config, file_path, "audio")
+            save_gen_cache(file_hash, description, kind="desc")
 
         try:
             embedding = embed_multimodal(client, config, description, media_bytes, mime)
@@ -750,14 +856,35 @@ def ingest_audio(client, config, collection, file_path):
             if already_exists(collection, doc_id):
                 continue
 
-            print(f"  Transcribing chunk {chunk['index'] + 1}/{total_chunks}...")
-            try:
-                description, media_bytes, mime = describe_media(client, config, chunk["path"], "audio")
-            except Exception as e:
-                print(f"  WARNING: Failed to transcribe chunk {chunk['index']}: {e}")
-                description = f"Audio chunk from {file_path.name}, {chunk['start']:.0f}s to {chunk['end']:.0f}s"
-                media_bytes = None
-                mime = None
+            chunk_path = Path(chunk["path"])
+            chunk_hash = None
+            if chunk_path.exists():
+                try:
+                    chunk_hash = _hash_bytes(chunk_path.read_bytes())
+                except Exception:
+                    chunk_hash = None
+
+            cached_desc = load_gen_cache(chunk_hash, kind="desc") if chunk_hash else None
+            if cached_desc is not None:
+                description = cached_desc
+                try:
+                    media_bytes = chunk_path.read_bytes()
+                    mime = mimetypes.guess_type(str(chunk_path))[0] or "application/octet-stream"
+                except Exception:
+                    media_bytes = None
+                    mime = None
+                print(f"  Gen-cache HIT for chunk {chunk['index'] + 1}/{total_chunks} ({chunk_hash[:12]})")
+            else:
+                print(f"  Transcribing chunk {chunk['index'] + 1}/{total_chunks}...")
+                try:
+                    description, media_bytes, mime = describe_media(client, config, chunk["path"], "audio")
+                    if chunk_hash:
+                        save_gen_cache(chunk_hash, description, kind="desc")
+                except Exception as e:
+                    print(f"  WARNING: Failed to transcribe chunk {chunk['index']}: {e}")
+                    description = f"Audio chunk from {file_path.name}, {chunk['start']:.0f}s to {chunk['end']:.0f}s"
+                    media_bytes = None
+                    mime = None
 
             if media_bytes and mime:
                 try:
@@ -796,36 +923,50 @@ def ingest_pdf(client, config, collection, file_path):
     with open(file_path, "rb") as f:
         data = f.read()
 
+    file_hash = _hash_bytes(data)
+
     # Estimate page count (rough: ~3KB per page for typical PDFs, but varies wildly)
     # We'll ask Gemini to process the whole thing and get structured output
     # For PDFs > 6 pages, we chunk by asking for specific page ranges
 
     print(f"  Analyzing PDF: {file_path.name}...")
 
-    # Gemini Flash returns 503 UNAVAILABLE during high-demand windows. Without
-    # retries, a single 503 kills the ingest. _retry_generate_content wraps the
-    # call with bounded retries on transient SDK conditions (HTTP 429/500/503,
-    # status UNAVAILABLE/RESOURCE_EXHAUSTED) and fails fast on everything else.
-    extraction_prompt = (
-        "Extract ALL content from this PDF. For each page, include:\n"
-        "1. Page number\n"
-        "2. All text content (headings, body, lists, footnotes)\n"
-        "3. Description of any images, charts, diagrams, or tables\n"
-        "4. Key concepts and topics on that page\n"
-        "Separate each page's content with '=== PAGE N ===' markers.\n"
-        "Be thorough - this will be used for search and retrieval."
-    )
-    response = _retry_generate_content(
-        client,
-        model=config.get("gemini_model", "gemini-2.5-flash"),
-        contents=[
-            types.Part.from_bytes(data=data, mime_type="application/pdf"),
-            extraction_prompt,
-        ],
-    )
-    if _tracker:
-        _tracker.track_generation(response)
-    text = response.text
+    # Gen-cache: if a prior attempt successfully extracted this PDF's text
+    # but the subsequent embed call hit Gemini's embedding-quota ceiling,
+    # the extracted text was lost and the next ingest re-burned Gemini-Pro
+    # tokens on the same PDF. Cache the extracted text by content hash so
+    # the retry skips the gen-call entirely.
+    text = load_gen_cache(file_hash, kind="text")
+    if text is not None:
+        print(f"  Gen-cache HIT ({file_hash[:12]}) — skipping PDF extraction call")
+    else:
+        # Gemini Flash returns 503 UNAVAILABLE during high-demand windows. Without
+        # retries, a single 503 kills the ingest. _retry_generate_content wraps the
+        # call with bounded retries on transient SDK conditions (HTTP 429/500/503,
+        # status UNAVAILABLE/RESOURCE_EXHAUSTED) and fails fast on everything else.
+        extraction_prompt = (
+            "Extract ALL content from this PDF. For each page, include:\n"
+            "1. Page number\n"
+            "2. All text content (headings, body, lists, footnotes)\n"
+            "3. Description of any images, charts, diagrams, or tables\n"
+            "4. Key concepts and topics on that page\n"
+            "Separate each page's content with '=== PAGE N ===' markers.\n"
+            "Be thorough - this will be used for search and retrieval."
+        )
+        response = _retry_generate_content(
+            client,
+            model=config.get("gemini_model", "gemini-2.5-flash"),
+            contents=[
+                types.Part.from_bytes(data=data, mime_type="application/pdf"),
+                extraction_prompt,
+            ],
+        )
+        if _tracker:
+            _tracker.track_generation(response)
+        text = response.text
+        # Persist BEFORE the embed step so an embed failure on this same run
+        # leaves the cache intact for the next retry.
+        save_gen_cache(file_hash, text, kind="text")
 
     # Split by page markers if present, otherwise chunk normally
     pages = []
@@ -1482,6 +1623,54 @@ def cmd_delete(args):
     print(f"Deleted {len(ids_to_delete)} chunk(s) from '{collection_name}' for: {source_path}")
 
 
+def cmd_cache_clear(args):
+    """Prune the gen-output cache. Default lists; --older-than N or --all to actually delete."""
+    if not GEN_CACHE_DIR.exists():
+        print(f"Gen-cache empty (no dir at {GEN_CACHE_DIR}).")
+        return
+
+    files = sorted(GEN_CACHE_DIR.glob("*.txt"))
+    if not files:
+        print(f"Gen-cache empty: {GEN_CACHE_DIR}")
+        return
+
+    now = time.time()
+    candidates = []
+    total_size = 0
+    for p in files:
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            continue
+        age_days = (now - st.st_mtime) / 86400
+        total_size += st.st_size
+        if args.all or (args.older_than is not None and age_days >= args.older_than):
+            candidates.append((p, st.st_size, age_days))
+
+    if not args.confirm:
+        print(f"Gen-cache at {GEN_CACHE_DIR}: {len(files)} files, {total_size / 1024 / 1024:.2f} MB")
+        if candidates:
+            print(f"Would delete {len(candidates)} file(s) (dry run — pass --confirm to actually delete):")
+            for p, size, age in candidates[:20]:
+                print(f"  {p.name} ({size / 1024:.1f} KB, {age:.1f}d old)")
+            if len(candidates) > 20:
+                print(f"  ...and {len(candidates) - 20} more")
+        else:
+            print("Nothing matches the prune criteria. Use --all to clear everything, --older-than DAYS to age-prune.")
+        return
+
+    deleted = 0
+    freed = 0
+    for p, size, _age in candidates:
+        try:
+            p.unlink()
+            deleted += 1
+            freed += size
+        except Exception as e:
+            print(f"  failed to delete {p.name}: {e}")
+    print(f"Deleted {deleted} cache file(s), freed {freed / 1024 / 1024:.2f} MB.")
+
+
 def cmd_reset(args):
     if not args.confirm:
         print("ERROR: Pass --confirm to reset the knowledge base.")
@@ -1551,6 +1740,21 @@ def main():
     p_reset = sub.add_parser("reset", help="Reset the entire knowledge base")
     p_reset.add_argument("--confirm", action="store_true", help="Confirm reset")
 
+    # cache-clear: prune the gen-output disk cache
+    p_cache_clear = sub.add_parser(
+        "cache-clear",
+        help="Prune the gen-output cache (PDF extracts + media descriptions)",
+    )
+    p_cache_clear.add_argument("--all", action="store_true", help="Target every cached file")
+    p_cache_clear.add_argument(
+        "--older-than", type=float, default=None,
+        help="Target files older than N days (float ok, e.g. 7 or 0.5)",
+    )
+    p_cache_clear.add_argument(
+        "--confirm", action="store_true",
+        help="Actually delete; without this, runs as a dry-run listing",
+    )
+
     # usage
     p_usage = sub.add_parser("usage", help="Show token usage and cost summary")
     p_usage.add_argument("--json", "-j", action="store_true", help="Output as JSON")
@@ -1571,6 +1775,7 @@ def main():
         "delete": cmd_delete,
         "reset": cmd_reset,
         "usage": cmd_usage,
+        "cache-clear": cmd_cache_clear,
     }
 
     commands[args.command](args)
