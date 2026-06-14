@@ -1,31 +1,48 @@
 #!/usr/bin/env python3
-"""cortextOS org backup — Step 1 (zip + email).
+"""cortextOS org backup — Step 1 (zip + email) + Step 2 (FTPS off-site).
 
 Zips the silvermere-tech org's durable knowledge and config, then:
   - DAILY: emails the zip to bertha@silvermere.tech (self-managed retention,
     last 7 daily backups kept via IMAP prune).
   - WEEKLY (Sundays, or pass --weekly): also emails the zip to
     steven.barker@silvermereconsulting.com as an offsite copy.
+  - STEP 2 (if BACKUP_FTP_HOST configured in secrets.env): uploads the zip
+    to an FTPS target for true off-site backup. Runs regardless of zip size
+    — provides off-site backup for ALL daily zips, not just the oversized
+    ones that fail the email path. Includes retention pruning.
 
-Both sends use the system path (no auto-CC). The weekly send is TO Steven
-by design, not a CC — it's his explicit offsite copy.
+Both email sends use the system path (no auto-CC). The weekly send is TO
+Steven by design, not a CC — it's his explicit offsite copy.
 
-SIZE GUARD: zips exceeding SIZE_LIMIT_MB are rejected; the email is sent
-without an attachment, noting what was skipped. The FTP step (Step 2,
-TODO) handles larger payloads.
+SIZE GUARD on email: zips exceeding SIZE_LIMIT_MB are sent as a no-attachment
+notification only — the FTP step (Step 2) is the recovery path for those.
+If FTP is not configured AND the zip is oversized, the email body says so
+explicitly so a human can manually intervene.
 
 Usage:
   backup.py                   # daily mode (auto-weekly on Sundays)
   backup.py --weekly          # force weekly send today
   backup.py --dry-run         # build + size-check the zip, don't send
+  backup.py --no-ftp          # skip Step 2 even if configured (one-off testing)
 
-TODO Step 2: zip + FTP for larger payloads incl ChromaDB.
+CONFIG (secrets.env keys for Step 2 — all optional; absence = Step 2 disabled):
+  BACKUP_FTP_HOST              FTPS hostname (REQUIRED to enable Step 2)
+  BACKUP_FTP_PORT              FTPS port (default 21)
+  BACKUP_FTP_USER              login
+  BACKUP_FTP_PASSWORD          login password
+  BACKUP_FTP_PATH              remote dir for backups (default /)
+  BACKUP_FTP_RETENTION_DAYS    purge older zips after N days (default 30)
+
 TODO Step 3: restore script in restore.py (companion to this script).
 """
 import argparse
+import ftplib
 import imaplib
 import os
+import re
+import shutil
 import smtplib
+import ssl
 import sys
 import tempfile
 import zipfile
@@ -42,6 +59,11 @@ SIZE_LIMIT_MB = 20
 DAILY_DEST = "bertha@silvermere.tech"
 WEEKLY_DEST = "steven.barker@silvermereconsulting.com"
 KEEP_DAILY = 7
+# Durable on-box retained copy. The zip is otherwise built in a TemporaryDirectory
+# and discarded on exit — so on oversized days (no email attachment) with FTPS
+# unconfigured there was NO retained copy anywhere. This guarantees at least one.
+LOCAL_RETAIN_DIR = Path("/home/cortext/backups/org-daily")
+KEEP_LOCAL = 14
 BACKUP_SUBJECT_PREFIX = "[BACKUP]"
 
 # Paths to include in the zip (relative to ORG_ROOT).
@@ -150,6 +172,28 @@ def build_zip(dest_path: str) -> tuple[float, list[str]]:
     return size_mb, skipped
 
 
+def retain_local(zip_path: str, date_str: str) -> str:
+    """Copy the built zip to a durable local path + prune old copies.
+    The on-box retained snapshot — guarantees a retained copy exists even when
+    the zip is oversized (no email attachment) AND FTPS is unconfigured."""
+    try:
+        LOCAL_RETAIN_DIR.mkdir(parents=True, exist_ok=True)
+        dest = LOCAL_RETAIN_DIR / f"silvermere-tech-backup-{date_str}.zip"
+        shutil.copy2(zip_path, dest)
+        zips = sorted(LOCAL_RETAIN_DIR.glob("silvermere-tech-backup-*.zip"))
+        pruned = 0
+        for old in (zips[:-KEEP_LOCAL] if len(zips) > KEEP_LOCAL else []):
+            try:
+                old.unlink()
+                pruned += 1
+            except OSError:
+                pass
+        size_mb = dest.stat().st_size / (1024 * 1024)
+        return f"Local retain: {dest} ({size_mb:.2f} MB); pruned {pruned}, keeping last {KEEP_LOCAL}"
+    except Exception as e:
+        return f"Local retain: FAILED — {e}"
+
+
 def send_backup(smtp_host, smtp_port, sender, password, recipient, subject, body, zip_path=None):
     if zip_path:
         msg = MIMEMultipart("mixed")
@@ -172,6 +216,107 @@ def send_backup(smtp_host, smtp_port, sender, password, recipient, subject, body
     with smtplib.SMTP_SSL(smtp_host, smtp_port) as smtp:
         smtp.login(sender, password)
         smtp.sendmail(sender, [recipient], msg.as_string())
+
+
+def _ftp_connect(secrets):
+    """Return (FTP_TLS connection, remote_dir) or None if Step 2 not configured."""
+    host = secrets.get("BACKUP_FTP_HOST", "").strip()
+    if not host:
+        return None, None
+    port = int(secrets.get("BACKUP_FTP_PORT", 21))
+    user = secrets.get("BACKUP_FTP_USER", "").strip()
+    password = secrets.get("BACKUP_FTP_PASSWORD", "").strip()
+    remote_dir = secrets.get("BACKUP_FTP_PATH", "/").strip() or "/"
+
+    ctx = ssl.create_default_context()
+    ftps = ftplib.FTP_TLS(context=ctx)
+    ftps.connect(host, port, timeout=60)
+    ftps.login(user, password)
+    ftps.prot_p()
+    # cwd to target dir, creating leaf if necessary
+    parts = [p for p in remote_dir.split("/") if p]
+    ftps.cwd("/")
+    for p in parts:
+        try:
+            ftps.cwd(p)
+        except ftplib.error_perm:
+            ftps.mkd(p)
+            ftps.cwd(p)
+    return ftps, remote_dir
+
+
+def upload_to_ftp(secrets, zip_path: str) -> str:
+    """Upload zip_path via FTPS. Returns one-line status string for email body."""
+    try:
+        ftps, remote_dir = _ftp_connect(secrets)
+    except Exception as e:
+        return f"FTP: FAILED to connect — {e}"
+    if ftps is None:
+        return "FTP: skipped (BACKUP_FTP_HOST not configured)"
+
+    fname = os.path.basename(zip_path)
+    try:
+        with open(zip_path, "rb") as fh:
+            ftps.storbinary(f"STOR {fname}", fh)
+        size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+        try:
+            ftps.quit()
+        except Exception:
+            ftps.close()
+        return f"FTP: uploaded {fname} ({size_mb:.2f} MB) to {secrets['BACKUP_FTP_HOST']}:{remote_dir}"
+    except Exception as e:
+        try:
+            ftps.close()
+        except Exception:
+            pass
+        return f"FTP: upload FAILED — {e}"
+
+
+_BACKUP_NAME_RE = re.compile(r"^silvermere-tech-backup-(\d{4}-\d{2}-\d{2})\.zip$")
+
+
+def prune_ftp(secrets) -> str:
+    """Delete backup zips on the FTPS target older than retention. Returns status line."""
+    retention_days = int(secrets.get("BACKUP_FTP_RETENTION_DAYS", 30))
+    try:
+        ftps, _ = _ftp_connect(secrets)
+    except Exception as e:
+        return f"FTP prune: FAILED to connect — {e}"
+    if ftps is None:
+        return "FTP prune: skipped (not configured)"
+
+    try:
+        names = ftps.nlst()
+    except Exception as e:
+        try:
+            ftps.close()
+        except Exception:
+            pass
+        return f"FTP prune: listing FAILED — {e}"
+
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = _dt.now(timezone.utc).date() - _td(days=retention_days)
+    deleted = 0
+    for n in names:
+        m = _BACKUP_NAME_RE.match(os.path.basename(n))
+        if not m:
+            continue
+        try:
+            file_date = _dt.strptime(m.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            try:
+                ftps.delete(n)
+                deleted += 1
+            except Exception:
+                pass
+
+    try:
+        ftps.quit()
+    except Exception:
+        ftps.close()
+    return f"FTP prune: deleted {deleted} backup(s) older than {retention_days}d"
 
 
 def prune_imap(host, port, user, password, keep_n=KEEP_DAILY):
@@ -202,6 +347,8 @@ def main():
                         help="Force weekly send (also send to Steven). Default: auto on Sundays.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Build zip and report size; do not send.")
+    parser.add_argument("--no-ftp", action="store_true",
+                        help="Skip Step 2 FTPS upload even if configured.")
     args = parser.parse_args()
 
     try:
@@ -233,13 +380,40 @@ def main():
         if skipped:
             print(f"Excluded {len(skipped)} file(s) (credentials/binaries)")
 
+        # Durable on-box retained copy FIRST — the must-have safety net, done
+        # before email/FTP so a retained snapshot exists even if those steps fail.
+        if args.dry_run:
+            local_status = f"Local retain: dry-run — would copy to {LOCAL_RETAIN_DIR}"
+        else:
+            local_status = retain_local(zip_path, date_str)
+        print(local_status)
+
+        # Step 2 — FTPS off-site upload (runs first so email body can report status)
+        if args.no_ftp:
+            ftp_status = "FTP: skipped (--no-ftp)"
+        elif args.dry_run:
+            host_cfg = secrets.get("BACKUP_FTP_HOST", "").strip()
+            ftp_status = (
+                f"FTP: dry-run — would upload to {host_cfg}:{secrets.get('BACKUP_FTP_PATH', '/').strip() or '/'}"
+                if host_cfg
+                else "FTP: dry-run — not configured (BACKUP_FTP_HOST unset)"
+            )
+            ftp_prune_status = "FTP prune: dry-run — skipped"
+        else:
+            ftp_status = upload_to_ftp(secrets, zip_path)
+            print(ftp_status)
+            ftp_prune_status = prune_ftp(secrets)
+            print(ftp_prune_status)
+
         over_limit = size_mb > SIZE_LIMIT_MB
         if over_limit:
             print(f"WARN: zip ({size_mb:.1f} MB) exceeds {SIZE_LIMIT_MB} MB limit — sending without attachment")
             body = (
                 f"cortextOS org backup — {date_str}\n\n"
                 f"Zip size: {size_mb:.1f} MB — EXCEEDS EMAIL LIMIT ({SIZE_LIMIT_MB} MB).\n"
-                f"Attachment omitted. Payload awaits FTP step (Step 2 TODO).\n\n"
+                f"Attachment omitted. Retained copies:\n"
+                f"  {local_status}\n"
+                f"  {ftp_status}\n\n"
                 f"Excluded {len(skipped)} credential/binary file(s).\n"
             )
             attach = None
@@ -251,12 +425,14 @@ def main():
                 f"docs, research, scripts, project docs (clearspeak-studio/app excluded).\n"
                 f"Excluded credentials: secrets.env, gsc-service-account.json, .env files.\n\n"
                 f"Excluded {len(skipped)} additional credential/binary file(s).\n\n"
+                f"Retained copies:\n  {local_status}\n  {ftp_status}\n\n"
                 f"Restore: use scripts/restore.py to fetch + unzip from IMAP.\n"
             )
             attach = zip_path
 
         if args.dry_run:
             print(f"DRY RUN — would send to {DAILY_DEST}" + (f" + {WEEKLY_DEST}" if is_weekly else ""))
+            print(f"DRY RUN — {ftp_status}")
             if over_limit:
                 print("DRY RUN — zip over limit, would send without attachment")
             return
