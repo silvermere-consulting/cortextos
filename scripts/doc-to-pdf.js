@@ -51,6 +51,18 @@ if (!fs.existsSync(resolvedInput)) {
   process.exit(1);
 }
 
+// Guard: this script takes POSITIONAL args (<input> [output]); it does not parse
+// --flags. A flag-shaped output arg (e.g. someone expecting `--output foo`) would
+// otherwise be path.resolve()'d into a file literally named '--output' at cwd.
+// Reject loudly instead of silently misrouting the PDF (see stray ./--org, ./--output).
+if (process.argv[3] && process.argv[3].startsWith('--')) {
+  console.error(
+    `Output path looks like a flag: '${process.argv[3]}'.\n` +
+    `doc-to-pdf uses positional args — Usage: node scripts/doc-to-pdf.js <input.md> [output.pdf]\n` +
+    `It does not accept --flags; pass a real output path or omit it to auto-name.`);
+  process.exit(1);
+}
+
 const explicitOutput = !!process.argv[3];
 let outputPath = explicitOutput
   ? path.resolve(process.argv[3])
