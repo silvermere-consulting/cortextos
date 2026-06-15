@@ -286,8 +286,38 @@ def _retry_embed_content(client, *, model, contents, output_dimensionality, task
     raise last_err if last_err else RuntimeError("retry loop completed without response or error")
 
 
+# EMBEDDING_BACKEND switch — 'gemini' (default) | 'local'
+# Local path uses scripts/local_embedder.py (nomic-embed-text-v1.5 ONNX, 768-dim,
+# Gemini-compatible). Set env var EMBEDDING_BACKEND=local to route through it.
+# Same output shape (List[float] of 768 floats) so call sites are unchanged.
+EMBEDDING_BACKEND = os.environ.get("EMBEDDING_BACKEND", "gemini").lower()
+
+
+def _local_embed_text(text: str, task_type: str = "RETRIEVAL_DOCUMENT"):
+    """Lazy-import the local embedder so the gemini path doesn't pay the
+    onnxruntime + tokenizers + numpy import cost when not in use."""
+    from local_embedder import embed_text
+    return embed_text(text, task_type=task_type)
+
+
+def _local_embed_texts(texts, task_type: str = "RETRIEVAL_DOCUMENT", batch_size: int = 32):
+    from local_embedder import embed_texts
+    return embed_texts(texts, task_type=task_type, batch_size=batch_size)
+
+
 def embed_content(client, config, content, task_type="RETRIEVAL_DOCUMENT"):
-    """Embed content using Gemini Embedding 2. Content can be text string or list of Parts."""
+    """Embed content. Routes via EMBEDDING_BACKEND env var:
+      - 'local'  → nomic-embed-text-v1.5 ONNX (text only; multimodal falls
+                   back to Gemini if requested but local is set)
+      - 'gemini' → Gemini Embedding 2 (default)
+    Content can be text string or list of Parts (Parts only supported on gemini)."""
+    if EMBEDDING_BACKEND == "local":
+        # Local path is text-only. If a list-of-Parts is passed (multimodal),
+        # we can't handle it; fall through to gemini for that one call.
+        if isinstance(content, str):
+            return _local_embed_text(content, task_type=task_type)
+        # Non-string path → caller wants multimodal; gemini is the only option
+        # for that today, so route through even if EMBEDDING_BACKEND=local.
     result = _retry_embed_content(
         client,
         model=config.get("embedding_model", "gemini-embedding-2-preview"),
@@ -406,6 +436,14 @@ def embed_contents_batch(client, config, contents_list, task_type="RETRIEVAL_DOC
     """
     if not contents_list:
         return []
+    if EMBEDDING_BACKEND == "local":
+        # Local ONNX path — no API quota, no batch-vs-single shape issue.
+        # 768-dim output is identical to gemini-embedding-2-preview.
+        if _tracker:
+            for item in contents_list:
+                _tracker.track_embedding(item)
+        # batch_size=32 is the local-embedder sweet spot (CPU-bound + memory)
+        return _local_embed_texts(contents_list, task_type=task_type, batch_size=32)
     api_key = get_api_key(config)
     embeddings = []
     model = config.get("embedding_model", "gemini-embedding-2-preview")
