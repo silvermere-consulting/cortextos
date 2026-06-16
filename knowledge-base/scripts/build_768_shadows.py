@@ -61,7 +61,13 @@ DEFAULT_TARGETS = [
     "shared-silvermere-tech",  # longest pole — last
 ]
 DEFAULT_SUFFIX = "__768shadow"
-EMBED_BATCH = 64
+# EMBED_BATCH bounds peak activation memory: _embed_batch pads every doc in a
+# chunk to the chunk's LONGEST sequence (up to MAX_SEQ_LEN=512), so a batch of
+# long-form docs (e.g. writer content) builds a (BATCH, 512, hidden) fp32 tensor
+# across all transformer layers — at 64 that spiked >6G and OOM-killed the build
+# (2026-06-16). 8 keeps peak ~2.5G. Batch size only changes grouping, NOT the
+# output vectors (each doc is mean-pooled independently; padding is attention-masked).
+EMBED_BATCH = 8
 ADD_BATCH = 256
 
 
