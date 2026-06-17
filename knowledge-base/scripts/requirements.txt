@@ -7,3 +7,16 @@ openpyxl>=3.1.0
 # PDF via Kreuzberg v4.9.9. Kreuzberg is ELv2 (internal use only); markitdown is MIT.
 markitdown[all]
 kreuzberg==4.9.9
+
+# Local embedder (EMBEDDING_BACKEND=local, nomic-embed-text-v1.5 ONNX) + embed-eval stack.
+# Pinned to the versions running the @768 cutover so a venv rebuild stays reproducible.
+# fp32 inference needs onnxruntime+onnx+numpy; int8 eval mode additionally needs sympy+ml_dtypes
+# (installed on-disk 2026-06-16 — a blind rebuild would silently drop them and break int8 eval).
+# For an EXACT rebuild (all transitive deps) use requirements-lock.txt instead.
+onnxruntime==1.26.0
+onnx==1.22.0
+tokenizers==0.23.1
+huggingface_hub==1.14.0
+numpy==2.4.4
+sympy==1.14.0
+ml_dtypes==0.5.4
