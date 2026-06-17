@@ -46,6 +46,33 @@ export const doctorCommand = new Command('doctor')
       });
     }
 
+    // BUG-011 dormancy check: the running daemon's PM2 kill_timeout must exceed
+    // the daemon's ~20s agent-stop window, else PM2 SIGKILLs mid-shutdown and
+    // orphans PTYs (which then trip the false "BUG-011 REGRESSION CHECK" warn).
+    // The fix (kill_timeout:25000) lives in ecosystem.config.js, but PM2 caches
+    // process config — a plain `pm2 restart` keeps the OLD value, so the fix can
+    // silently go dormant. This surfaces that drift. Skipped if PM2/daemon absent.
+    const KILL_TIMEOUT_MIN_MS = 25000;
+    try {
+      const jlist = execSync('pm2 jlist', { encoding: 'utf-8', stdio: 'pipe', timeout: 5000 });
+      const procs: Array<{ name?: string; pm2_env?: { kill_timeout?: number } }> = JSON.parse(jlist);
+      const daemon = procs.find(p => p.name === 'cortextos-daemon');
+      if (daemon) {
+        // PM2 default when unset is 1600ms.
+        const kt = daemon.pm2_env?.kill_timeout ?? 1600;
+        checks.push({
+          name: 'Daemon kill_timeout (BUG-011)',
+          status: kt >= KILL_TIMEOUT_MIN_MS ? 'pass' : 'warn',
+          message: kt >= KILL_TIMEOUT_MIN_MS
+            ? `${kt}ms (orphan protection active)`
+            : `${kt}ms — below ${KILL_TIMEOUT_MIN_MS}ms; BUG-011 orphan protection is DORMANT`,
+          fix: kt >= KILL_TIMEOUT_MIN_MS
+            ? undefined
+            : 'Running daemon has a stale cached config. Re-apply ecosystem.config.js: pm2 delete cortextos-daemon && pm2 start ecosystem.config.js && pm2 save (a plain pm2 restart reuses the stale value)',
+        });
+      }
+    } catch { /* pm2 not installed, daemon not running, or jlist unparseable — skip */ }
+
     // Check Claude Code CLI
     try {
       const claudeVersion = execSync('claude --version', { encoding: 'utf-8', timeout: 5000 }).trim();
