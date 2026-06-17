@@ -108,7 +108,13 @@ class UsageTracker:
             self.session["generation_output_tokens"] += getattr(um, "candidates_token_count", 0) or 0
 
     def cost(self):
-        emb = (self.session["embedding_tokens"] / 1_000_000) * EMBEDDING_PRICE_PER_M
+        # Local embedder (nomic ONNX) runs on CPU = free; only Gemini embedding bills.
+        # Generation (Flash media descriptions) still routes through Gemini even under
+        # EMBEDDING_BACKEND=local, so gen_in/gen_out stay billed.
+        if EMBEDDING_BACKEND == "local":
+            emb = 0.0
+        else:
+            emb = (self.session["embedding_tokens"] / 1_000_000) * EMBEDDING_PRICE_PER_M
         gen_in = (self.session["generation_input_tokens"] / 1_000_000) * FLASH_INPUT_PRICE_PER_M
         gen_out = (self.session["generation_output_tokens"] / 1_000_000) * FLASH_OUTPUT_PRICE_PER_M
         return {
@@ -1668,9 +1674,21 @@ def cmd_usage(args):
     c = data.get("cumulative", {})
     sessions = data.get("sessions", [])
 
-    emb_cost = (c.get("embedding_tokens", 0) / 1_000_000) * EMBEDDING_PRICE_PER_M
-    gen_in_cost = (c.get("generation_input_tokens", 0) / 1_000_000) * FLASH_INPUT_PRICE_PER_M
-    gen_out_cost = (c.get("generation_output_tokens", 0) / 1_000_000) * FLASH_OUTPUT_PRICE_PER_M
+    # Cost components are summed from per-session cost dicts (era-aware: local-backend
+    # sessions persisted $0 embedding), NOT recomputed from cumulative tokens at the
+    # Gemini rate — cumulative tokens mix billed (gemini) + free (local) eras.
+    # Fall back to a Gemini-rate token estimate only for legacy sessions with no cost dict.
+    emb_cost = gen_in_cost = gen_out_cost = 0.0
+    for s in sessions:
+        sc = s.get("cost")
+        if sc:
+            emb_cost += sc.get("embedding", 0)
+            gen_in_cost += sc.get("generation_input", 0)
+            gen_out_cost += sc.get("generation_output", 0)
+        else:
+            emb_cost += (s.get("embedding_tokens", 0) / 1_000_000) * EMBEDDING_PRICE_PER_M
+            gen_in_cost += (s.get("generation_input_tokens", 0) / 1_000_000) * FLASH_INPUT_PRICE_PER_M
+            gen_out_cost += (s.get("generation_output_tokens", 0) / 1_000_000) * FLASH_OUTPUT_PRICE_PER_M
     total = emb_cost + gen_in_cost + gen_out_cost
 
     print("mmrag Usage Summary")
