@@ -960,6 +960,15 @@ export class AgentManager {
   }
 
   /**
+   * Public accessor for an agent's resolved org. Used by the daemon-level
+   * frozen-turn watchdog to build org-scoped analytics/event paths without
+   * reaching into private resolution logic.
+   */
+  getAgentOrg(name: string): string {
+    return this.resolveAgentOrg(name);
+  }
+
+  /**
    * Return the CronScheduler for a given agent (for testing / introspection).
    * Returns undefined if no scheduler is running for that agent.
    */

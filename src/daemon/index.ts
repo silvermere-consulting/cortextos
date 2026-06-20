@@ -1,10 +1,15 @@
 import { AgentManager } from './agent-manager.js';
 import { IPCServer } from './ipc-server.js';
+import { FrozenTurnWatchdog, type FrozenTurnDetail } from './frozen-turn-watchdog.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
+import { logEvent } from '../bus/event.js';
+import { sendMessage } from '../bus/message.js';
+import { resolvePaths } from '../utils/paths.js';
+import { stripBom } from '../utils/strip-bom.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -220,6 +225,7 @@ function handleFatal(
 class Daemon {
   private agentManager: AgentManager | null = null;
   private ipcServer: IPCServer | null = null;
+  private watchdog: FrozenTurnWatchdog | null = null;
   private instanceId: string;
   private ctxRoot: string;
 
@@ -266,12 +272,36 @@ class Daemon {
     // Discover and start agents
     await this.agentManager.discoverAndStart();
 
+    // Start the daemon-level frozen-turn watchdog. Runs OUTSIDE every agent
+    // PTY (pure file reads of state the daemon already maintains), so it can
+    // detect and recover a hung agent — including the fleet-monitor agent
+    // itself, which an in-session monitor structurally cannot. See the module
+    // header for the 2026-06-20 incident this closes.
+    const am = this.agentManager;
+    const instanceId = this.instanceId;
+    this.watchdog = new FrozenTurnWatchdog({
+      ctxRoot: this.ctxRoot,
+      instanceId,
+      getRunningAgents: () => am.getAgentNames(),
+      resolveOrg: (agent) => am.getAgentOrg(agent),
+      restartAgent: (agent) => am.restartAgent(agent),
+      recordEvent: ({ agent, org, category, event, severity, meta }) => {
+        try {
+          logEvent(resolvePaths(agent, instanceId, org || undefined), agent, org, category, event, severity, meta);
+        } catch { /* observational only — never disrupt the watchdog */ }
+      },
+      escalate: (detail) => this.escalateFrozenTurn(frameworkRoot, instanceId, detail),
+      logger: (msg) => console.log(`[watchdog] ${msg}`),
+    });
+    this.watchdog.start();
+
     console.log(`[daemon] Running (pid: ${process.pid})`);
 
     // Handle shutdown signals
     const shutdown = async () => {
       console.log('[daemon] Shutting down...');
       try {
+        this.watchdog?.stop();
         if (this.agentManager) {
           await this.agentManager.stopAll();
         }
@@ -344,6 +374,39 @@ class Daemon {
         unlinkSync(pidFile);
       } catch { /* ignore */ }
     });
+  }
+
+  /**
+   * Rung-3 escalation for the frozen-turn watchdog: after two auto-restarts in
+   * the rolling hour failed to recover an agent, alert the org's orchestrator
+   * on the bus so a human/orchestrator can intervene. Best-effort — a failure
+   * here must never disrupt the watchdog loop.
+   */
+  private escalateFrozenTurn(frameworkRoot: string, instanceId: string, detail: FrozenTurnDetail): void {
+    try {
+      const org = this.agentManager?.getAgentOrg(detail.agent);
+      if (!org) return;
+
+      // Resolve the org's orchestrator from context.json (chief for
+      // silvermere-tech, jones for family). Skip silently if unresolved.
+      let orchestrator: string | undefined;
+      try {
+        const ctx = JSON.parse(stripBom(readFileSync(join(frameworkRoot, 'orgs', org, 'context.json'), 'utf-8')));
+        orchestrator = ctx.orchestrator;
+      } catch { /* no context.json — skip */ }
+      if (!orchestrator || orchestrator === detail.agent) return;
+
+      const text =
+        `🚨 WATCHDOG ESCALATION: ${detail.agent} appears frozen and TWO auto-restarts in the last hour did not recover it ` +
+        `(${detail.unansweredFires} unanswered heartbeat fires; last real response ${detail.lastRealHeartbeat ?? 'never'}). ` +
+        `Auto-restart is now paused for this agent for the rest of the hour. Manual check needed: \`cortextos restart ${detail.agent}\` ` +
+        `or inspect its PTY/logs for a wedged turn.`;
+      const paths = resolvePaths(detail.agent, instanceId, org);
+      sendMessage(paths, detail.agent, orchestrator, 'high', text);
+      console.log(`[watchdog] escalated ${detail.agent} freeze to ${orchestrator}`);
+    } catch (err) {
+      console.error(`[watchdog] escalation failed for ${detail.agent}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 
