@@ -279,6 +279,15 @@ class Daemon {
     // header for the 2026-06-20 incident this closes.
     const am = this.agentManager;
     const instanceId = this.instanceId;
+    // Optional env overrides for the watchdog timing constants. Lets ops tune
+    // detection latency (and run a short profile for a controlled acceptance
+    // test) without a code change. Unset → the module's production defaults.
+    const envNum = (key: string): number | undefined => {
+      const v = process.env[key];
+      if (!v) return undefined;
+      const n = parseInt(v, 10);
+      return Number.isFinite(n) && n > 0 ? n : undefined;
+    };
     this.watchdog = new FrozenTurnWatchdog({
       ctxRoot: this.ctxRoot,
       instanceId,
@@ -292,6 +301,11 @@ class Daemon {
       },
       escalate: (detail) => this.escalateFrozenTurn(frameworkRoot, instanceId, detail),
       logger: (msg) => console.log(`[watchdog] ${msg}`),
+      checkIntervalMs: envNum('CTX_WATCHDOG_CHECK_MS'),
+      graceMs: envNum('CTX_WATCHDOG_GRACE_MS'),
+      verifyMs: envNum('CTX_WATCHDOG_VERIFY_MS'),
+      rollingWindowMs: envNum('CTX_WATCHDOG_WINDOW_MS'),
+      freezeThreshold: envNum('CTX_WATCHDOG_FREEZE_N'),
     });
     this.watchdog.start();
 
