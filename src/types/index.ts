@@ -160,6 +160,15 @@ export interface AgentConfig {
   startup_delay?: number;
   max_session_seconds?: number;
   max_crashes_per_day?: number;
+  /**
+   * CrashLoopPauser sliding-window: auto-pause an agent that crashes
+   * `crash_window_max` times within `crash_window_ms`, a faster signal than the
+   * per-day counter. Defaults (30min / 3) activate the protection fleet-wide;
+   * set crash_window_ms to 0 to disable the window and fall back to the daily
+   * counter only.
+   */
+  crash_window_ms?: number;
+  crash_window_max?: number;
   model?: string;
   working_directory?: string;
   enabled?: boolean;
@@ -639,7 +648,8 @@ export type IPCCommandType =
   | 'add-cron'
   | 'update-cron'
   | 'remove-cron'
-  | 'fleet-health';
+  | 'fleet-health'
+  | 'compact-agent';
 
 // ---------------------------------------------------------------------------
 // Execution log pagination response — Subtask 4.3
