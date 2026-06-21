@@ -7,6 +7,9 @@ import {
   parseUsageOutput,
   storeUsageData,
   collectTelegramCommands,
+  parseDfKOutput,
+  evaluateDiskAnomaly,
+  DISK_ALERT_THRESHOLD,
 } from '../src/bus/metrics.js';
 
 describe('Sprint 5: Observability & Metrics', () => {
@@ -256,6 +259,76 @@ describe('Sprint 5: Observability & Metrics', () => {
 
       const report = collectMetrics(ctxRoot);
       expect(report.agents.bot1.errors_today).toBe(1);
+    });
+
+    it('includes a root-filesystem disk metric in the system report', () => {
+      writeFileSync(join(ctxRoot, 'config', 'enabled-agents.json'), '{}', 'utf-8');
+      const report = collectMetrics(ctxRoot);
+      // df is universally available on the Linux test host; `/` always exists.
+      expect(report.system.disk).toBeDefined();
+      const disk = report.system.disk!;
+      expect(disk.mount).toBe('/');
+      expect(disk.percent_used).toBeGreaterThanOrEqual(0);
+      expect(disk.percent_used).toBeLessThanOrEqual(100);
+      expect(disk.total_gb).toBeGreaterThan(0);
+    });
+  });
+
+  describe('parseDfKOutput', () => {
+    const SAMPLE = [
+      'Filesystem     1024-blocks     Used Available Capacity Mounted on',
+      '/dev/sda2         49283072 34000000  12000000      74% /',
+    ].join('\n');
+
+    it('parses the data row into GiB-rounded fields', () => {
+      const d = parseDfKOutput(SAMPLE, '/');
+      expect(d).not.toBeNull();
+      expect(d!.mount).toBe('/');
+      expect(d!.percent_used).toBe(74);
+      // 49283072 KiB / 1024 / 1024 = 47.0 GiB
+      expect(d!.total_gb).toBeCloseTo(47.0, 1);
+      expect(d!.used_gb).toBeCloseTo(32.4, 1);
+    });
+
+    it('returns null on header-only / unparseable output', () => {
+      expect(parseDfKOutput('Filesystem 1024-blocks Used Available Capacity Mounted on', '/')).toBeNull();
+      expect(parseDfKOutput('', '/')).toBeNull();
+      expect(parseDfKOutput('garbage line', '/')).toBeNull();
+    });
+  });
+
+  describe('evaluateDiskAnomaly (tiered routing classification)', () => {
+    const mk = (percent_used: number) => ({ mount: '/', percent_used, used_gb: 1, free_gb: 1, total_gb: 2 });
+
+    it('returns null at or below the 85% threshold', () => {
+      expect(evaluateDiskAnomaly(mk(74))).toBeNull();
+      expect(evaluateDiskAnomaly(mk(DISK_ALERT_THRESHOLD))).toBeNull();
+      expect(evaluateDiskAnomaly(null)).toBeNull();
+      expect(evaluateDiskAnomaly(undefined)).toBeNull();
+    });
+
+    it('classifies 85< as warning/warning', () => {
+      const a = evaluateDiskAnomaly(mk(88));
+      expect(a).toEqual({ severity: 'warning', tier: 'warning', disk: mk(88) });
+    });
+
+    it('classifies 92< as warning/elevated', () => {
+      const a = evaluateDiskAnomaly(mk(95));
+      expect(a!.severity).toBe('warning');
+      expect(a!.tier).toBe('elevated');
+    });
+
+    it('classifies >97 as critical/critical (Steven-eligible tier)', () => {
+      const a = evaluateDiskAnomaly(mk(99));
+      expect(a!.severity).toBe('critical');
+      expect(a!.tier).toBe('critical');
+    });
+
+    it('boundaries: 92 warning, 93/97 elevated, 98 critical', () => {
+      expect(evaluateDiskAnomaly(mk(92))!.tier).toBe('warning'); // top of warning band (not >92)
+      expect(evaluateDiskAnomaly(mk(93))!.tier).toBe('elevated');
+      expect(evaluateDiskAnomaly(mk(97))!.tier).toBe('elevated'); // top of elevated band (not >97)
+      expect(evaluateDiskAnomaly(mk(98))!.tier).toBe('critical');
     });
   });
 

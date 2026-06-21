@@ -27,11 +27,42 @@ export interface AgentMetrics {
   heartbeat_stale: boolean;
 }
 
+/**
+ * Host disk usage for a single mount, captured at collect-metrics time so the
+ * nightly report carries a disk trend and a >85% blind-spot can be surfaced as
+ * an anomaly. Added after the 2026-06-20 disk-pressure incident (/ hit 96%
+ * while collect-metrics had no disk field at all). Sizes are GiB (binary,
+ * matching `df -h`) rounded to 1 decimal.
+ */
+export interface DiskMetrics {
+  mount: string;
+  percent_used: number;
+  used_gb: number;
+  free_gb: number;
+  total_gb: number;
+}
+
 export interface SystemMetrics {
   total_tasks_completed: number;
   agents_healthy: number;
   agents_total: number;
   approvals_pending: number;
+  /** Root-filesystem usage. Optional so old reports / df failures don't break consumers. */
+  disk?: DiskMetrics;
+}
+
+/** Disk usage at/above this percent is surfaced as an anomaly at collect time. */
+export const DISK_ALERT_THRESHOLD = 85;
+
+/**
+ * Tiered classification the analyst's routing keys off. Mirrors the agreed
+ * spec (2026-06-20): 85< warning, 92< elevated, 97< critical. Only the
+ * `critical` tier is Steven-eligible on the analyst side.
+ */
+export interface DiskAnomaly {
+  severity: 'warning' | 'critical';
+  tier: 'warning' | 'elevated' | 'critical';
+  disk: DiskMetrics;
 }
 
 export interface MetricsReport {
@@ -120,6 +151,70 @@ function isCompactionEvent(line: string): boolean {
     return false;
   }
   return evt.category === 'metric' && evt.event === 'compaction_started';
+}
+
+/**
+ * Parse the output of `df -P -k <mount>` into a DiskMetrics. Pure (no IO) so it
+ * is unit-testable without spawning df. `-P` guarantees the POSIX one-data-line
+ * format (no wrapping); `-k` gives 1024-byte blocks. Returns null if the output
+ * has no parseable data row.
+ */
+export function parseDfKOutput(output: string, mount: string): DiskMetrics | null {
+  const lines = output
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('Filesystem'));
+  if (lines.length === 0) return null;
+
+  // Fields: Filesystem 1024-blocks Used Available Capacity Mounted-on
+  const fields = lines[lines.length - 1].split(/\s+/);
+  if (fields.length < 6) return null;
+
+  const totalKib = Number(fields[1]);
+  const usedKib = Number(fields[2]);
+  const freeKib = Number(fields[3]);
+  const percent = parseInt(fields[4].replace('%', ''), 10);
+  if (!Number.isFinite(totalKib) || !Number.isFinite(usedKib) || !Number.isFinite(freeKib) || !Number.isFinite(percent)) {
+    return null;
+  }
+
+  const toGib = (kib: number): number => Math.round((kib / 1024 / 1024) * 10) / 10;
+  return {
+    mount,
+    percent_used: percent,
+    used_gb: toGib(usedKib),
+    free_gb: toGib(freeKib),
+    total_gb: toGib(totalKib),
+  };
+}
+
+/**
+ * Capture disk usage for a mount via `df -P -k`. Best-effort: returns null if
+ * df fails or output is unparseable — a disk read must never break the report.
+ */
+export function collectDiskMetrics(mount = '/'): DiskMetrics | null {
+  try {
+    const out = execSync(`df -P -k ${mount}`, { encoding: 'utf-8', timeout: 5000 });
+    return parseDfKOutput(out, mount);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Classify a DiskMetrics into a tiered anomaly, or null if below threshold.
+ * Pure — this is the load-bearing tier logic the analyst's routing depends on.
+ *   85 < p <= 92  -> warning  / warning
+ *   92 < p <= 97  -> warning  / elevated
+ *        p  > 97  -> critical / critical
+ */
+export function evaluateDiskAnomaly(disk: DiskMetrics | null | undefined): DiskAnomaly | null {
+  if (!disk) return null;
+  const p = disk.percent_used;
+  if (p <= DISK_ALERT_THRESHOLD) return null;
+  if (p > 97) return { severity: 'critical', tier: 'critical', disk };
+  if (p > 92) return { severity: 'warning', tier: 'elevated', disk };
+  return { severity: 'warning', tier: 'warning', disk };
 }
 
 export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
@@ -251,6 +346,8 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
     }
   }
 
+  const disk = collectDiskMetrics('/');
+
   const report: MetricsReport = {
     timestamp,
     agents,
@@ -259,6 +356,7 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       agents_healthy: agentsHealthy,
       agents_total: agentsTotal,
       approvals_pending: approvalsPending,
+      ...(disk ? { disk } : {}),
     },
   };
 
