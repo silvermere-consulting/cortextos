@@ -8,6 +8,7 @@ import { join, basename, dirname } from 'path';
 import { execSync } from 'child_process';
 import { ensureDir } from '../utils/atomic.js';
 import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
+import { collectAgentMemory, type MemorySnapshot } from './agent-memory.js';
 
 // --- Types ---
 
@@ -32,6 +33,8 @@ export interface SystemMetrics {
   agents_healthy: number;
   agents_total: number;
   approvals_pending: number;
+  /** Per-agent RSS + RAM headroom (OOM monitor). Optional so old reports / non-Linux don't break consumers. */
+  memory?: MemorySnapshot;
 }
 
 export interface MetricsReport {
@@ -251,6 +254,10 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
     }
   }
 
+  // Per-agent RSS + RAM headroom (OOM monitor — flag-only, see agent-memory.ts).
+  // Best-effort: zeroed snapshot on non-Linux / read failure.
+  const memory = collectAgentMemory('/proc');
+
   const report: MetricsReport = {
     timestamp,
     agents,
@@ -259,6 +266,7 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       agents_healthy: agentsHealthy,
       agents_total: agentsTotal,
       approvals_pending: approvalsPending,
+      ...(memory.agents.length || memory.mem_total_mb ? { memory } : {}),
     },
   };
 
