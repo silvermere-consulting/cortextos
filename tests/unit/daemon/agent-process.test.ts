@@ -162,6 +162,34 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     expect(ap.getStatus().status).toBe('crashed');
   });
 
+  it('CrashLoopPauser HALTS after crash_window_max crashes inside the window', async () => {
+    // Restored CrashLoopPauser: with the window active (defaults 3/30min, here
+    // tightened via config), the Nth crash within the window auto-pauses the
+    // agent (status='halted') BEFORE the daily counter would. Previously dead
+    // code (fields undeclared → undefined>0 → block never ran).
+    const ap = new AgentProcess('alice', mockEnv, { crash_window_ms: 60_000, crash_window_max: 3 });
+    await ap.start();
+    expect(ap.getStatus().status).toBe('running');
+
+    // Three crashes back-to-back (all within the 60s window).
+    capturedOnExit!(1, 0); // crash 1 → crashed
+    expect(ap.getStatus().status).toBe('crashed');
+    capturedOnExit!(1, 0); // crash 2 → crashed
+    expect(ap.getStatus().status).toBe('crashed');
+    capturedOnExit!(1, 0); // crash 3 → window full → HALTED (auto-paused)
+    expect(ap.getStatus().status).toBe('halted');
+  });
+
+  it('CrashLoopPauser disabled (crash_window_ms=0) falls back to the daily counter', async () => {
+    // Escape hatch: window off → never halts via the window; the agent stays in
+    // 'crashed' (daily-counter path) no matter how many fast crashes occur.
+    const ap = new AgentProcess('alice', mockEnv, { crash_window_ms: 0, crash_window_max: 3 });
+    await ap.start();
+
+    for (let i = 0; i < 5; i++) capturedOnExit!(1, 0);
+    expect(ap.getStatus().status).toBe('crashed');
+  });
+
   it('unexpected PTY exit persists a CRASH line to restarts.log', async () => {
     // Default fs mocks: no .daemon-stop marker, no .crash_count_today file.
     const ap = new AgentProcess('alice', mockEnv, {});

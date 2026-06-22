@@ -26,6 +26,18 @@ export class AgentProcess {
   private sessionTimer: ReturnType<typeof setTimeout> | null = null;
   private crashCount: number = 0;
   private maxCrashesPerDay: number = 10;
+  // CrashLoopPauser (instar-inspired) sliding-window crash-loop detector. These
+  // back the window check in handleExit(): if the agent crashes crashWindowMax
+  // times within crashWindowMs, it is auto-paused (status='halted') — a faster
+  // signal than the per-day counter. Defaults activate the protection fleet-wide
+  // (30min / 3); config.json crash_window_ms/crash_window_max override, and
+  // crash_window_ms <= 0 disables the window (daily-counter-only fallback).
+  // Restored 2026-06-21: the fields were referenced but never declared/initialized,
+  // so `this.crashWindowMs > 0` was `undefined > 0` = false and the window block
+  // was dead code (daily counter still gated). See MEMORY.md CrashLoopPauser finding.
+  private crashTimestamps: number[] = [];
+  private crashWindowMs: number = 30 * 60 * 1000;
+  private crashWindowMax: number = 3;
   private sessionStart: Date | null = null;
   private status: AgentStatus['status'] = 'stopped';
   private stopping: boolean = false;
@@ -70,6 +82,12 @@ export class AgentProcess {
     this.config = config;
     if (config.max_crashes_per_day !== undefined) {
       this.maxCrashesPerDay = config.max_crashes_per_day;
+    }
+    if (config.crash_window_ms !== undefined) {
+      this.crashWindowMs = config.crash_window_ms;
+    }
+    if (config.crash_window_max !== undefined) {
+      this.crashWindowMax = config.crash_window_max;
     }
     this.dedup = new MessageDedup();
     this.log = log || ((msg) => console.log(`[${name}] ${msg}`));
