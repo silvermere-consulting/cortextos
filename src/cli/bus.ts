@@ -11,7 +11,7 @@ import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
 import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
-import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
+import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands, evaluateDiskAnomaly } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
@@ -946,6 +946,24 @@ busCommand
   .action(() => {
     const env = resolveEnv();
     const report = collectMetrics(env.ctxRoot, env.org || undefined);
+
+    // Disk blind-spot fix (2026-06-20 incident): surface a >85% root-fs anomaly
+    // at collect time so the analyst's routing can act on it. Tiered severity in
+    // meta; the analyst keys Steven-eligibility off tier === 'critical' (>97%).
+    const anomaly = evaluateDiskAnomaly(report.system.disk);
+    if (anomaly) {
+      const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+      logEvent(paths, env.agentName, env.org, 'metric', 'anomaly_detected', anomaly.severity, JSON.stringify({
+        kind: 'disk',
+        tier: anomaly.tier,
+        mount: anomaly.disk.mount,
+        percent_used: anomaly.disk.percent_used,
+        used_gb: anomaly.disk.used_gb,
+        free_gb: anomaly.disk.free_gb,
+        total_gb: anomaly.disk.total_gb,
+      }));
+    }
+
     console.log(JSON.stringify(report, null, 2));
   });
 
