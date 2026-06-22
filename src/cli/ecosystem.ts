@@ -142,6 +142,16 @@ module.exports = {
       },
       max_restarts: 50,
       restart_delay: 5000,
+      // BUG-011 fix: kill_timeout must exceed the daemon's ~20s agent-stop
+      // window so PM2 doesn't SIGKILL mid-shutdown and orphan PTYs (orphans
+      // from the prior session connect to the new daemon's IPC socket and
+      // issue late start-agent commands that trip the false "BUG-011
+      // REGRESSION CHECK" warn). Emitted by the generator — NOT hand-added —
+      // so it survives every \`cortextos ecosystem\` regeneration. PM2 still
+      // caches process config: apply a changed value with
+      // \`pm2 delete cortextos-daemon && pm2 start ecosystem.config.js && pm2 save\`
+      // (a plain \`pm2 restart\` reuses the stale cached config).
+      kill_timeout: 25000,
       autorestart: true,
     }${dashboardAppBlock},
   ],
