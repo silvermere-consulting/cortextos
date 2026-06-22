@@ -267,7 +267,6 @@ const brandHeader = brandMode === 'silvermere'
     ${discoverliwaLogoSrc
       ? `<img class="brand-logo brand-logo--discoverliwa" src="${discoverliwaLogoSrc}" alt="Discover Liwa" />`
       : `<span class="brand-name brand-name--discoverliwa">Discover Liwa</span>`}
-    <span class="brand-rule-dot brand-rule-dot--discoverliwa"></span>
   </div>`
   : '';
 
