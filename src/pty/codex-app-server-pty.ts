@@ -201,6 +201,24 @@ export class CodexAppServerPTY {
     this._onExitHandler = null;
   }
 
+  /**
+   * SIGKILL-escalation counterpart to AgentPTY.forceKill(), present so the
+   * AgentProcess.stop() escalation path can call forceKill() uniformly across
+   * runtimes. Codex tears down synchronously in kill() (fires onExit inline),
+   * so stop()'s escalation almost never reaches here; this is a belt-and-braces
+   * hard kill of the underlying app-server PTY if one is somehow still alive.
+   */
+  forceKill(): void {
+    if (this._appServerPty) {
+      try {
+        this._appServerPty.kill('SIGKILL');
+      } catch {
+        // Process already gone — ignore.
+      }
+      this._appServerPty = null;
+    }
+  }
+
   isAlive(): boolean {
     return this._alive;
   }

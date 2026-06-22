@@ -281,8 +281,31 @@ export class AgentProcess {
       // on top of pty.kill() lag. The functional correctness no longer depends
       // on this timeout (stopRequested handles late exits), but a generous
       // timeout reduces "Ignoring late exit from previous lifecycle" log noise.
+      //
+      // Watchdog-followup fix: track whether the exit actually fired so we can
+      // SIGKILL-escalate below. A child that is STOPped (T-state, e.g. the
+      // watchdog acceptance test's `kill -STOP`) or that ignores/blocks the
+      // graceful SIGTERM/SIGHUP holds it pending and never exits — pty.kill()
+      // alone leaks the old PTY as a daemon orphan after recovery respawns the
+      // agent. SIGKILL cannot be caught, blocked, or ignored and reaps even a
+      // stopped process, making watchdog recovery bulletproof.
+      let exited = false;
       if (exitPromise) {
+        exitPromise.then(() => { exited = true; });
         await Promise.race([exitPromise, sleep(15000)]);
+      }
+      if (!exited && typeof (pty as { forceKill?: () => void }).forceKill === 'function') {
+        this.log('Graceful stop timed out — escalating to SIGKILL');
+        try {
+          (pty as { forceKill: () => void }).forceKill();
+        } catch {
+          // Process may have exited between the check and here — ignore.
+        }
+        // Give the now-SIGKILLed process a moment for its onExit to fire so the
+        // exit is observed (and stopRequested cleared) before we return.
+        if (exitPromise) {
+          await Promise.race([exitPromise, sleep(3000)]);
+        }
       }
     }
 

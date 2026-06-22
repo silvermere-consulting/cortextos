@@ -30,6 +30,12 @@ type SpawnFn = (file: string, args: string[], options: IPtySpawnOptions) => IPty
  */
 export class AgentPTY {
   private pty: IPty | null = null;
+  // Retained reference to the underlying node-pty handle so forceKill() can
+  // SIGKILL-escalate AFTER kill() has optimistically nulled `this.pty`. Without
+  // this, a graceful kill() throws the handle away and a child that holds the
+  // graceful signal pending (T-state / SIG_IGN) leaks as an orphan because we
+  // can no longer reach it. Cleared only when the real onExit fires.
+  private rawPty: IPty | null = null;
   private _alive = false;
   private outputBuffer: OutputBuffer;
   private env: CtxEnv;
@@ -151,6 +157,7 @@ export class AgentPTY {
       env: ptyEnv,
     });
 
+    this.rawPty = this.pty;
     this._alive = true;
 
     // Track whether we've already accepted the bypass-permissions prompt so we
@@ -187,6 +194,7 @@ export class AgentPTY {
     this.pty.onExit(({ exitCode, signal }) => {
       this._alive = false;
       this.pty = null;
+      this.rawPty = null;
       if (this.onExitHandler) {
         this.onExitHandler(exitCode, signal);
       }
@@ -312,7 +320,40 @@ export class AgentPTY {
     if (pty) {
       this._alive = false;
       this.pty = null;
-      pty.kill();
+      // NOTE: this.rawPty is intentionally NOT cleared here — it is retained so
+      // forceKill() can SIGKILL-escalate if this graceful kill does not produce
+      // an exit. It is cleared by the onExit handler when the process actually
+      // dies (by any means).
+      try {
+        pty.kill();
+      } catch {
+        // PTY may have exited between the isAlive() check and here — ignore.
+      }
+    }
+  }
+
+  /**
+   * Force-terminate the underlying process with SIGKILL.
+   *
+   * Used by AgentProcess.stop() as an escalation when the graceful kill() did
+   * not produce an exit within the timeout — e.g. a child that is STOPped
+   * (T-state, from a SIGSTOP) or ignoring/blocking the graceful signal holds
+   * SIGTERM/SIGHUP pending, so the PTY would otherwise leak as a daemon orphan.
+   * SIGKILL cannot be caught, blocked, or ignored, and is delivered even to
+   * stopped processes, so recovery never leaks an unkillable PTY.
+   *
+   * Operates on the retained rawPty handle (kill() nulls this.pty). Safe to call
+   * after kill() and idempotent: a no-op once the process has already exited
+   * (onExit clears rawPty).
+   */
+  forceKill(): void {
+    const pty = this.rawPty;
+    if (pty) {
+      try {
+        pty.kill('SIGKILL');
+      } catch {
+        // Process already gone — ignore.
+      }
     }
   }
 

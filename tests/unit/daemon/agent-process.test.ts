@@ -6,6 +6,7 @@ let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
 const mockPty = {
   spawn: vi.fn().mockResolvedValue(undefined),
   kill: vi.fn(),
+  forceKill: vi.fn(),
   write: vi.fn(),
   getPid: vi.fn().mockReturnValue(12345),
   isAlive: vi.fn().mockReturnValue(true),
@@ -95,6 +96,7 @@ beforeEach(() => {
   capturedOnExit = null;
   mockPty.spawn.mockClear();
   mockPty.kill.mockClear();
+  mockPty.forceKill.mockClear();
   mockPty.write.mockClear();
   mockPty.isAlive.mockClear();
   mockPty.isAlive.mockReturnValue(true);
@@ -130,6 +132,50 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     // (after its internal sleeps finish — wait long enough)
     await stopPromise;
     expect(stopResolved).toBe(true);
+    expect(ap.getStatus().status).toBe('stopped');
+  }, 10000);
+
+  it('stop() escalates to SIGKILL (forceKill) when the graceful exit times out', async () => {
+    // watchdog-followup: a STOPped (T-state) or signal-ignoring child holds the
+    // graceful SIGTERM/SIGHUP pending and never exits, so the PTY exit handler
+    // never fires. stop() must escalate to forceKill() (SIGKILL) instead of
+    // leaking the old PTY as a daemon orphan after recovery respawns the agent.
+    // Fake timers fast-forward the internal graceful sleeps + the 15s exit race.
+    vi.useFakeTimers();
+    try {
+      const ap = new AgentProcess('alice', mockEnv, {});
+      await ap.start();
+
+      // Do NOT fire capturedOnExit — the child is "frozen" and never exits.
+      const stopPromise = ap.stop();
+
+      // Advance through: 1s (Ctrl-C) + 5s (/exit) + 15s (exit race timeout)
+      // + 3s (post-SIGKILL grace) with margin.
+      await vi.advanceTimersByTimeAsync(1000 + 5000 + 15000 + 3000 + 500);
+      await stopPromise;
+
+      // Graceful kill was attempted first, then SIGKILL escalation fired.
+      expect(mockPty.kill).toHaveBeenCalled();
+      expect(mockPty.forceKill).toHaveBeenCalledTimes(1);
+      expect(ap.getStatus().status).toBe('stopped');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stop() does NOT escalate to SIGKILL when the PTY exits gracefully', async () => {
+    // Regression guard for the escalation: a clean exit within the race window
+    // must NOT trigger forceKill() — SIGKILL is the timeout-only last resort.
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    const stopPromise = ap.stop();
+    // Let stop() get past its graceful sleeps, then fire a clean exit.
+    await new Promise(r => setTimeout(r, 100));
+    capturedOnExit!(0, 0);
+    await stopPromise;
+
+    expect(mockPty.forceKill).not.toHaveBeenCalled();
     expect(ap.getStatus().status).toBe('stopped');
   }, 10000);
 
