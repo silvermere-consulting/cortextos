@@ -12,6 +12,7 @@ import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity 
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands, evaluateDiskAnomaly } from '../bus/metrics.js';
+import { evaluateMemoryAnomalies, memoryThresholdsFromEnv } from '../bus/agent-memory.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
@@ -963,6 +964,31 @@ busCommand
         total_gb: anomaly.disk.total_gb,
       }));
     }
+
+    // OOM monitor (flag-only — never restarts; see agent-memory.ts): surface
+    // per-agent RSS exceedance + low RAM headroom as metric/anomaly_detected,
+    // routed by the analyst exactly like the disk >85% flag. Memory-pressure is
+    // a distinct failure class from a frozen turn — this only FLAGS so a human
+    // can right-size RAM/agents; it must never be wired to a restart.
+    if (report.system.memory) {
+      const anomalies = evaluateMemoryAnomalies(report.system.memory, memoryThresholdsFromEnv());
+      if (anomalies.length) {
+        const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+        for (const a of anomalies) {
+          logEvent(paths, env.agentName, env.org, 'metric', 'anomaly_detected', a.severity, JSON.stringify({
+            kind: 'memory',
+            class: 'memory_pressure',
+            scope: a.scope,
+            tier: a.tier,
+            agent: a.agent,
+            rss_mb: a.rss_mb,
+            threshold_mb: a.threshold_mb,
+            mem_available_mb: a.mem_available_mb,
+            mem_total_mb: a.mem_total_mb,
+            available_pct: a.available_pct,
+          }));
+        }
+      }
 
     console.log(JSON.stringify(report, null, 2));
   });

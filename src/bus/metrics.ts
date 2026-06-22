@@ -8,6 +8,7 @@ import { join, basename, dirname } from 'path';
 import { execSync } from 'child_process';
 import { ensureDir } from '../utils/atomic.js';
 import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
+import { collectAgentMemory, type MemorySnapshot } from './agent-memory.js';
 
 // --- Types ---
 
@@ -49,6 +50,8 @@ export interface SystemMetrics {
   approvals_pending: number;
   /** Root-filesystem usage. Optional so old reports / df failures don't break consumers. */
   disk?: DiskMetrics;
+  /** Per-agent RSS + RAM headroom (OOM monitor). Optional so old reports / non-Linux don't break consumers. */
+  memory?: MemorySnapshot;
 }
 
 /** Disk usage at/above this percent is surfaced as an anomaly at collect time. */
@@ -348,6 +351,10 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
 
   const disk = collectDiskMetrics('/');
 
+  // Per-agent RSS + RAM headroom (OOM monitor — flag-only, see agent-memory.ts).
+  // Best-effort: zeroed snapshot on non-Linux / read failure.
+  const memory = collectAgentMemory('/proc');
+
   const report: MetricsReport = {
     timestamp,
     agents,
@@ -357,6 +364,7 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       agents_total: agentsTotal,
       approvals_pending: approvalsPending,
       ...(disk ? { disk } : {}),
+      ...(memory.agents.length || memory.mem_total_mb ? { memory } : {}),
     },
   };
 
