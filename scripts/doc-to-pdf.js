@@ -222,6 +222,25 @@ for (const { file, mime } of CLEARSPEAK_FOOTER_LOGO_CANDIDATES) {
   } catch { /* try next */ }
 }
 
+// DiscoverLiwa brand-mode logo (Oasis Grove horizontal lockup, transparent PNG).
+// Used for the Liwa project artefacts (LFA) where DiscoverLiwa is the dominant brand
+// and Silvermere appears only as the commissioning attribution in the footer.
+const DISCOVERLIWA_LOGO_CANDIDATES = [
+  { file: 'discoverliwa-logo.svg', mime: 'image/svg+xml' },
+  { file: 'discoverliwa-logo.png', mime: 'image/png' },
+];
+let discoverliwaLogoSrc = '';
+for (const { file, mime } of DISCOVERLIWA_LOGO_CANDIDATES) {
+  const p = path.join(SILVERMERE_LOGO_DIR, file);
+  try {
+    if (fs.existsSync(p)) {
+      const buf = fs.readFileSync(p);
+      discoverliwaLogoSrc = `data:${mime};base64,${buf.toString('base64')}`;
+      break;
+    }
+  } catch { /* try next */ }
+}
+
 const brandHeader = brandMode === 'silvermere'
   ? `<div class="brand-header">
     ${brandLogoSrc
@@ -242,6 +261,13 @@ const brandHeader = brandMode === 'silvermere'
       ? `<img class="brand-logo brand-logo--clearspeak" src="${clearspeakLogoSrc}" alt="ClearSpeak" />`
       : `<span class="brand-name brand-name--clearspeak">ClearSpeak</span>`}
     <span class="brand-rule-dot brand-rule-dot--clearspeak"></span>
+  </div>`
+  : brandMode === 'discoverliwa'
+  ? `<div class="brand-header brand-header--discoverliwa">
+    ${discoverliwaLogoSrc
+      ? `<img class="brand-logo brand-logo--discoverliwa" src="${discoverliwaLogoSrc}" alt="Discover Liwa" />`
+      : `<span class="brand-name brand-name--discoverliwa">Discover Liwa</span>`}
+    <span class="brand-rule-dot brand-rule-dot--discoverliwa"></span>
   </div>`
   : '';
 
@@ -359,6 +385,21 @@ const html = `<!DOCTYPE html>
   }
   .brand-rule-dot--clearspeak {
     background: #B92438;
+  }
+
+  /* DiscoverLiwa brand variant — Oasis Grove cream identity (LFA project). */
+  /* Copper Ochre rule + Ghaf Green dot; full cream palette is applied per-doc */
+  /* via inline <style> so the shared Silvermere palette stays the default. */
+  .brand-header--discoverliwa {
+    border-bottom: 2px solid #C4844A;
+    padding-bottom: 12px;
+  }
+  .brand-logo--discoverliwa {
+    height: 58px;
+    width: auto;
+  }
+  .brand-rule-dot--discoverliwa {
+    background: #2E4A30;
   }
 
   /* Front matter meta block */
@@ -559,6 +600,11 @@ const html = `<!DOCTYPE html>
 const footerTemplate = brandMode === 'clearspeak' && clearspeakFooterLogoSrc
   ? `<div style="width:100%; padding:0 14mm; display:flex; justify-content:center; align-items:center; font-size:0;">
        <img src="${clearspeakFooterLogoSrc}" style="height:32px; width:auto; display:block;" alt="ClearSpeak GCC" />
+     </div>`
+  : brandMode === 'discoverliwa'
+  ? `<div style="width:100%; padding:0 16mm; display:flex; justify-content:space-between; align-items:center; font-family:'Roboto','Helvetica Neue',Arial,sans-serif; font-size:7pt; color:#6B6256; letter-spacing:0.04em;">
+       <span style="font-size:7pt; color:#6B6256;"><span class="pageNumber"></span> / <span class="totalPages"></span></span>
+       <span style="font-size:7pt; color:#6B6256;">Commissioned by Silvermere Technology &middot; silvermere.tech</span>
      </div>`
   : '';
 const useFooter = footerTemplate !== '';
