@@ -12,7 +12,7 @@ import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity 
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands, evaluateDiskAnomaly } from '../bus/metrics.js';
-import { evaluateMemoryAnomalies, memoryThresholdsFromEnv } from '../bus/agent-memory.js';
+import { evaluateMemoryAnomalies, memoryThresholdsFromEnv, agentRssLadderFromEnv } from '../bus/agent-memory.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
@@ -971,7 +971,12 @@ busCommand
     // a distinct failure class from a frozen turn — this only FLAGS so a human
     // can right-size RAM/agents; it must never be wired to a restart.
     if (report.system.memory) {
-      const anomalies = evaluateMemoryAnomalies(report.system.memory, memoryThresholdsFromEnv());
+      const memThresholds = memoryThresholdsFromEnv();
+      const anomalies = evaluateMemoryAnomalies(
+        report.system.memory,
+        memThresholds,
+        (agent) => agentRssLadderFromEnv(agent, memThresholds),
+      );
       if (anomalies.length) {
         const paths = resolvePaths(env.agentName, env.instanceId, env.org);
         for (const a of anomalies) {

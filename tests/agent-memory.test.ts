@@ -9,6 +9,8 @@ import {
   memoryThresholdsFromEnv,
   evaluateMemoryAnomalies,
   collectAgentMemory,
+  agentEnvSuffix,
+  agentRssLadderFromEnv,
   DEFAULT_MEMORY_THRESHOLDS,
   type MemorySnapshot,
 } from '../src/bus/agent-memory.js';
@@ -42,6 +44,76 @@ describe('agent-memory — thresholds from env', () => {
     expect(t.agent_critical_mb).toBe(DEFAULT_MEMORY_THRESHOLDS.agent_critical_mb); // untouched
     // invalid override ignored
     expect(memoryThresholdsFromEnv({ CTX_MEM_AGENT_WARN_MB: 'abc' }).agent_warn_mb).toBe(DEFAULT_MEMORY_THRESHOLDS.agent_warn_mb);
+  });
+});
+
+describe('agent-memory — per-agent RSS ladder overrides', () => {
+  const d = DEFAULT_MEMORY_THRESHOLDS;
+
+  it('agentEnvSuffix uppercases and underscores non-alphanumerics', () => {
+    expect(agentEnvSuffix('engineer')).toBe('ENGINEER');
+    expect(agentEnvSuffix('business-analyst')).toBe('BUSINESS_ANALYST');
+    expect(agentEnvSuffix('a.b-c')).toBe('A_B_C');
+  });
+
+  it('falls back to the global base when no agent-specific override is set', () => {
+    expect(agentRssLadderFromEnv('engineer', d, {})).toEqual({
+      agent_warn_mb: d.agent_warn_mb,
+      agent_elevated_mb: d.agent_elevated_mb,
+      agent_critical_mb: d.agent_critical_mb,
+    });
+  });
+
+  it('applies an agent-specific override per rung, independently', () => {
+    const l = agentRssLadderFromEnv('engineer', d, {
+      CTX_MEM_AGENT_WARN_MB_ENGINEER: '1600',
+      CTX_MEM_AGENT_ELEVATED_MB_ENGINEER: '1900',
+      CTX_MEM_AGENT_CRITICAL_MB_ENGINEER: '2200',
+    });
+    expect(l).toEqual({ agent_warn_mb: 1600, agent_elevated_mb: 1900, agent_critical_mb: 2200 });
+    // a single-rung override leaves the other rungs on base
+    const partial = agentRssLadderFromEnv('engineer', d, { CTX_MEM_AGENT_WARN_MB_ENGINEER: '1600' });
+    expect(partial.agent_warn_mb).toBe(1600);
+    expect(partial.agent_elevated_mb).toBe(d.agent_elevated_mb);
+  });
+
+  it('an override for one agent does not leak to another', () => {
+    const env = { CTX_MEM_AGENT_WARN_MB_ENGINEER: '1600' };
+    expect(agentRssLadderFromEnv('analyst', d, env).agent_warn_mb).toBe(d.agent_warn_mb);
+    expect(agentRssLadderFromEnv('engineer', d, env).agent_warn_mb).toBe(1600);
+  });
+
+  it('ignores non-positive / non-numeric overrides (falls through to base)', () => {
+    expect(agentRssLadderFromEnv('engineer', d, { CTX_MEM_AGENT_WARN_MB_ENGINEER: 'abc' }).agent_warn_mb).toBe(d.agent_warn_mb);
+    expect(agentRssLadderFromEnv('engineer', d, { CTX_MEM_AGENT_WARN_MB_ENGINEER: '0' }).agent_warn_mb).toBe(d.agent_warn_mb);
+    expect(agentRssLadderFromEnv('engineer', d, { CTX_MEM_AGENT_WARN_MB_ENGINEER: '-5' }).agent_warn_mb).toBe(d.agent_warn_mb);
+  });
+
+  it('evaluateMemoryAnomalies honours the ladderFor resolver: a heavy agent stays silent under its own raised ceiling', () => {
+    const snap: MemorySnapshot = {
+      agents: [
+        { agent: 'engineer', rss_mb: 1100, procs: 3 }, // over global warn (1000), under its raised ceiling
+        { agent: 'analyst', rss_mb: 1100, procs: 1 },  // over global warn — should still flag
+      ],
+      mem_total_mb: 13000, mem_available_mb: 6000, available_pct: 46,
+    };
+    const ladderFor = (agent: string) => agentRssLadderFromEnv(agent, d, {
+      CTX_MEM_AGENT_WARN_MB_ENGINEER: '1600',
+      CTX_MEM_AGENT_ELEVATED_MB_ENGINEER: '1900',
+      CTX_MEM_AGENT_CRITICAL_MB_ENGINEER: '2200',
+    });
+    const anoms = evaluateMemoryAnomalies(snap, d, ladderFor).filter(a => a.scope === 'agent');
+    expect(anoms.map(a => a.agent)).toEqual(['analyst']);
+    expect(anoms[0]).toMatchObject({ tier: 'warning', threshold_mb: d.agent_warn_mb });
+  });
+
+  it('without a resolver, the global ladder applies to every agent (back-compat)', () => {
+    const snap: MemorySnapshot = {
+      agents: [{ agent: 'engineer', rss_mb: d.agent_warn_mb + 1, procs: 1 }],
+      mem_total_mb: 13000, mem_available_mb: 6000, available_pct: 46,
+    };
+    const anoms = evaluateMemoryAnomalies(snap, d).filter(a => a.scope === 'agent');
+    expect(anoms.map(a => a.agent)).toEqual(['engineer']);
   });
 });
 

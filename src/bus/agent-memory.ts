@@ -66,21 +66,69 @@ export const DEFAULT_MEMORY_THRESHOLDS: MemoryThresholds = {
   headroom_critical_pct: 7,
 };
 
+/** Parse a positive finite number from an env value, else fall back to default. */
+function envNum(env: NodeJS.ProcessEnv, key: string, d: number): number {
+  const v = env[key];
+  const n = v == null ? NaN : Number(v);
+  return Number.isFinite(n) && n > 0 ? n : d;
+}
+
 /** Read thresholds from env (CTX_MEM_*), falling back to defaults. Pure given an env map. */
 export function memoryThresholdsFromEnv(env: NodeJS.ProcessEnv = process.env): MemoryThresholds {
-  const num = (k: string, d: number): number => {
-    const v = env[k];
-    const n = v == null ? NaN : Number(v);
-    return Number.isFinite(n) && n > 0 ? n : d;
-  };
   const d = DEFAULT_MEMORY_THRESHOLDS;
   return {
-    agent_warn_mb: num('CTX_MEM_AGENT_WARN_MB', d.agent_warn_mb),
-    agent_elevated_mb: num('CTX_MEM_AGENT_ELEVATED_MB', d.agent_elevated_mb),
-    agent_critical_mb: num('CTX_MEM_AGENT_CRITICAL_MB', d.agent_critical_mb),
-    headroom_warn_pct: num('CTX_MEM_HEADROOM_WARN_PCT', d.headroom_warn_pct),
-    headroom_elevated_pct: num('CTX_MEM_HEADROOM_ELEVATED_PCT', d.headroom_elevated_pct),
-    headroom_critical_pct: num('CTX_MEM_HEADROOM_CRITICAL_PCT', d.headroom_critical_pct),
+    agent_warn_mb: envNum(env, 'CTX_MEM_AGENT_WARN_MB', d.agent_warn_mb),
+    agent_elevated_mb: envNum(env, 'CTX_MEM_AGENT_ELEVATED_MB', d.agent_elevated_mb),
+    agent_critical_mb: envNum(env, 'CTX_MEM_AGENT_CRITICAL_MB', d.agent_critical_mb),
+    headroom_warn_pct: envNum(env, 'CTX_MEM_HEADROOM_WARN_PCT', d.headroom_warn_pct),
+    headroom_elevated_pct: envNum(env, 'CTX_MEM_HEADROOM_ELEVATED_PCT', d.headroom_elevated_pct),
+    headroom_critical_pct: envNum(env, 'CTX_MEM_HEADROOM_CRITICAL_PCT', d.headroom_critical_pct),
+  };
+}
+
+/**
+ * The per-agent RSS ladder — the only slice of the thresholds that varies per
+ * agent. The headroom ladder is box-global (one box, one MemAvailable), so it
+ * is NOT per-agent. `MemoryThresholds` is structurally a superset, so a plain
+ * global `MemoryThresholds` is a valid `AgentRssLadder`.
+ */
+export interface AgentRssLadder {
+  agent_warn_mb: number;
+  agent_elevated_mb: number;
+  agent_critical_mb: number;
+}
+
+/**
+ * Normalise an agent name into the env-key suffix: uppercase, every run-safe
+ * non-alphanumeric → '_' (e.g. `business-analyst` → `BUSINESS_ANALYST`). Keeps
+ * the override keys shell- and env-safe regardless of agent naming.
+ */
+export function agentEnvSuffix(agent: string): string {
+  return agent.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+}
+
+/**
+ * Resolve the per-agent RSS ladder. Per rung, an agent-specific override wins
+ * over the global ladder in `base`:
+ *   CTX_MEM_AGENT_WARN_MB_<AGENT>     > base.agent_warn_mb
+ *   CTX_MEM_AGENT_ELEVATED_MB_<AGENT> > base.agent_elevated_mb
+ *   CTX_MEM_AGENT_CRITICAL_MB_<AGENT> > base.agent_critical_mb
+ * Only positive finite numbers override; anything else falls through to `base`.
+ * This lets a heavy agent (e.g. `engineer`, ~1.1 GB baseline from its tooling)
+ * carry its own ceiling without raising the bar for light agents — exactly the
+ * case that was tripping the global warn tier routinely. Each rung is resolved
+ * independently, so an override can lift just `warn` and leave the rest global.
+ */
+export function agentRssLadderFromEnv(
+  agent: string,
+  base: AgentRssLadder = DEFAULT_MEMORY_THRESHOLDS,
+  env: NodeJS.ProcessEnv = process.env,
+): AgentRssLadder {
+  const sfx = agentEnvSuffix(agent);
+  return {
+    agent_warn_mb: envNum(env, `CTX_MEM_AGENT_WARN_MB_${sfx}`, base.agent_warn_mb),
+    agent_elevated_mb: envNum(env, `CTX_MEM_AGENT_ELEVATED_MB_${sfx}`, base.agent_elevated_mb),
+    agent_critical_mb: envNum(env, `CTX_MEM_AGENT_CRITICAL_MB_${sfx}`, base.agent_critical_mb),
   };
 }
 
@@ -132,6 +180,7 @@ export interface MemoryAnomaly {
 export function evaluateMemoryAnomalies(
   snap: MemorySnapshot,
   t: MemoryThresholds = DEFAULT_MEMORY_THRESHOLDS,
+  ladderFor?: (agent: string) => AgentRssLadder,
 ): MemoryAnomaly[] {
   const out: MemoryAnomaly[] = [];
   const base = {
@@ -140,13 +189,16 @@ export function evaluateMemoryAnomalies(
     available_pct: snap.available_pct,
   };
 
-  // Per-agent RSS ladder.
+  // Per-agent RSS ladder. `ladderFor`, when supplied, resolves a per-agent
+  // override (heavy agents get their own ceiling); without it, the global `t`
+  // ladder applies to every agent — `MemoryThresholds` is a valid AgentRssLadder.
   for (const a of snap.agents) {
+    const ladder = ladderFor ? ladderFor(a.agent) : t;
     let tier: MemoryAnomaly['tier'] | null = null;
     let threshold = 0;
-    if (a.rss_mb > t.agent_critical_mb) { tier = 'critical'; threshold = t.agent_critical_mb; }
-    else if (a.rss_mb > t.agent_elevated_mb) { tier = 'elevated'; threshold = t.agent_elevated_mb; }
-    else if (a.rss_mb > t.agent_warn_mb) { tier = 'warning'; threshold = t.agent_warn_mb; }
+    if (a.rss_mb > ladder.agent_critical_mb) { tier = 'critical'; threshold = ladder.agent_critical_mb; }
+    else if (a.rss_mb > ladder.agent_elevated_mb) { tier = 'elevated'; threshold = ladder.agent_elevated_mb; }
+    else if (a.rss_mb > ladder.agent_warn_mb) { tier = 'warning'; threshold = ladder.agent_warn_mb; }
     if (tier) {
       out.push({
         kind: 'memory', scope: 'agent',
