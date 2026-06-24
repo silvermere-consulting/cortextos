@@ -43,6 +43,7 @@ import re
 import shutil
 import smtplib
 import ssl
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -65,6 +66,12 @@ KEEP_DAILY = 7
 LOCAL_RETAIN_DIR = Path("/home/cortext/backups/org-daily")
 KEEP_LOCAL = 14
 BACKUP_SUBJECT_PREFIX = "[BACKUP]"
+
+# Step 2b — off-host copy to the OVH gateway (internal infra, our own box).
+# True off-host copy that survives total loss of the app VM. The gateway is a
+# small 2.0G LXC, so retention is kept lean (zip ~55MB → 7 copies ~385MB).
+GATEWAY_REMOTE_DIR = "/home/cortext/backups/silvermere-org"
+KEEP_GATEWAY = 7
 
 # Paths to include in the zip (relative to ORG_ROOT).
 # Explicit inclusion list keeps the zip predictable and avoids accidental
@@ -319,6 +326,79 @@ def prune_ftp(secrets) -> str:
     return f"FTP prune: deleted {deleted} backup(s) older than {retention_days}d"
 
 
+def _run_ssh(cmd_args, env, timeout=120):
+    """Run an ssh/scp command (cmd_args already starts with 'ssh'/'scp') detached
+    from any controlling tty via setsid so SSH_ASKPASS is honoured for password
+    auth. Returns (returncode, stdout, stderr)."""
+    full = ["setsid", "-w"] + cmd_args
+    p = subprocess.run(full, env=env, capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+def upload_to_gateway(secrets, zip_path: str) -> str:
+    """Step 2b — off-host copy of the zip to the OVH gateway over SSH/scp.
+    Internal infra (our own box), so no spend/approval gate. Verifies the remote
+    byte-size matches local before reporting success, then prunes to KEEP_GATEWAY.
+    Returns a one-line status string for the email body."""
+    host = secrets.get("TRAEFIK_GATEWAY_HOST", "").strip()
+    user = secrets.get("TRAEFIK_GATEWAY_SSH_USER", "").strip()
+    password = secrets.get("TRAEFIK_GATEWAY_SSH_PASSWORD", "").strip()
+    if not (host and user and password):
+        return "Gateway: skipped (TRAEFIK_GATEWAY_* not configured)"
+
+    askpass_path = None
+    try:
+        fd, askpass_path = tempfile.mkstemp(prefix="bk_askpass_", suffix=".sh")
+        with os.fdopen(fd, "w") as f:
+            f.write('#!/bin/sh\necho "$GW_SSH_PW"\n')
+        os.chmod(askpass_path, 0o700)
+        env = os.environ.copy()
+        env["GW_SSH_PW"] = password
+        env["SSH_ASKPASS"] = askpass_path
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env["DISPLAY"] = env.get("DISPLAY", ":0")
+
+        ssh_opts = ["-o", "StrictHostKeyChecking=accept-new",
+                    "-o", "ConnectTimeout=30", "-o", "BatchMode=no"]
+        target = f"{user}@{host}"
+        fname = os.path.basename(zip_path)
+        remote_file = f"{GATEWAY_REMOTE_DIR}/{fname}"
+
+        rc, _out, err = _run_ssh(["ssh"] + ssh_opts + [target, f"mkdir -p {GATEWAY_REMOTE_DIR}"], env)
+        if rc != 0:
+            return f"Gateway: FAILED (mkdir) — {err.strip() or rc}"
+
+        rc, _out, err = _run_ssh(
+            ["scp"] + ssh_opts + [zip_path, f"{target}:{remote_file}"], env, timeout=300)
+        if rc != 0:
+            return f"Gateway: FAILED (scp) — {err.strip() or rc}"
+
+        # Verify the copy landed intact: remote byte-size must equal local.
+        local_size = os.path.getsize(zip_path)
+        rc, out, _err = _run_ssh(["ssh"] + ssh_opts + [target, f"stat -c %s {remote_file}"], env)
+        remote_size = out.strip()
+        if rc != 0 or not remote_size.isdigit() or int(remote_size) != local_size:
+            return (f"Gateway: FAILED (size mismatch: local={local_size} "
+                    f"remote={remote_size or '?'})")
+
+        # Prune to last KEEP_GATEWAY by mtime (newest kept).
+        prune_cmd = (f"ls -1t {GATEWAY_REMOTE_DIR}/silvermere-tech-backup-*.zip 2>/dev/null "
+                     f"| tail -n +{KEEP_GATEWAY + 1} | xargs -r rm -f")
+        _run_ssh(["ssh"] + ssh_opts + [target, prune_cmd], env)
+
+        size_mb = local_size / (1024 * 1024)
+        return (f"Gateway: uploaded {fname} ({size_mb:.2f} MB) to {host}:{GATEWAY_REMOTE_DIR} "
+                f"(size-verified, keep last {KEEP_GATEWAY})")
+    except Exception as e:
+        return f"Gateway: FAILED — {e}"
+    finally:
+        if askpass_path:
+            try:
+                os.unlink(askpass_path)
+            except OSError:
+                pass
+
+
 def prune_imap(host, port, user, password, keep_n=KEEP_DAILY):
     """Delete oldest [BACKUP] emails in bertha's inbox, keeping the last keep_n."""
     try:
@@ -349,6 +429,8 @@ def main():
                         help="Build zip and report size; do not send.")
     parser.add_argument("--no-ftp", action="store_true",
                         help="Skip Step 2 FTPS upload even if configured.")
+    parser.add_argument("--no-gateway", action="store_true",
+                        help="Skip Step 2b off-host gateway copy.")
     args = parser.parse_args()
 
     try:
@@ -405,6 +487,19 @@ def main():
             ftp_prune_status = prune_ftp(secrets)
             print(ftp_prune_status)
 
+        # Step 2b — off-host copy to the OVH gateway (our own box, no spend).
+        # The primary off-host path now that FTPS is unconfigured: guarantees a
+        # copy survives total loss of this VM.
+        if args.no_gateway:
+            gw_status = "Gateway: skipped (--no-gateway)"
+        elif args.dry_run:
+            gw_host = secrets.get("TRAEFIK_GATEWAY_HOST", "").strip()
+            gw_status = (f"Gateway: dry-run — would copy to {gw_host}:{GATEWAY_REMOTE_DIR}"
+                         if gw_host else "Gateway: dry-run — not configured")
+        else:
+            gw_status = upload_to_gateway(secrets, zip_path)
+            print(gw_status)
+
         over_limit = size_mb > SIZE_LIMIT_MB
         if over_limit:
             print(f"WARN: zip ({size_mb:.1f} MB) exceeds {SIZE_LIMIT_MB} MB limit — sending without attachment")
@@ -413,7 +508,8 @@ def main():
                 f"Zip size: {size_mb:.1f} MB — EXCEEDS EMAIL LIMIT ({SIZE_LIMIT_MB} MB).\n"
                 f"Attachment omitted. Retained copies:\n"
                 f"  {local_status}\n"
-                f"  {ftp_status}\n\n"
+                f"  {ftp_status}\n"
+                f"  {gw_status}\n\n"
                 f"Excluded {len(skipped)} credential/binary file(s).\n"
             )
             attach = None
@@ -425,7 +521,7 @@ def main():
                 f"docs, research, scripts, project docs (clearspeak-studio/app excluded).\n"
                 f"Excluded credentials: secrets.env, gsc-service-account.json, .env files.\n\n"
                 f"Excluded {len(skipped)} additional credential/binary file(s).\n\n"
-                f"Retained copies:\n  {local_status}\n  {ftp_status}\n\n"
+                f"Retained copies:\n  {local_status}\n  {ftp_status}\n  {gw_status}\n\n"
                 f"Restore: use scripts/restore.py to fetch + unzip from IMAP.\n"
             )
             attach = zip_path
@@ -433,6 +529,7 @@ def main():
         if args.dry_run:
             print(f"DRY RUN — would send to {DAILY_DEST}" + (f" + {WEEKLY_DEST}" if is_weekly else ""))
             print(f"DRY RUN — {ftp_status}")
+            print(f"DRY RUN — {gw_status}")
             if over_limit:
                 print("DRY RUN — zip over limit, would send without attachment")
             return
