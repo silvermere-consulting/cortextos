@@ -592,13 +592,31 @@ def main():
         # IMAP prune — keep last KEEP_DAILY daily backups
         prune_imap(imap_host, imap_port, sender, password, keep_n=KEEP_DAILY)
 
-        # Weekly send → Steven (offsite copy)
+        # Weekly send → Steven: NOTIFICATION ONLY (no attachment).
+        # The recipient's mail provider (mailchannels) HARD-BOUNCES .zip attachments
+        # ("550 5.7.1 attachment type not allowed"), so attaching the zip just NDRs.
+        # The off-site copy is served by the gateway copy (and OVH FTPS once wired),
+        # not the mailbox — so this is a status notice + pointer, never an attachment.
         if is_weekly:
-            print(f"Sending weekly offsite copy to {WEEKLY_DEST}...")
-            weekly_subject = f"{subject} [weekly]"
+            print(f"Sending weekly status notice to {WEEKLY_DEST}...")
+            weekly_subject = f"{subject} [weekly status]"
+            weekly_body = (
+                f"Weekly backup status — {date_str}\n\n"
+                f"The silvermere-tech org backup ran successfully ({size_mb:.2f} MB, clean/"
+                f"source-of-truth).\n\n"
+                f"No attachment: your mail provider rejects .zip attachments "
+                f"(550 attachment-type-not-allowed), so the full zip is NOT emailed. "
+                f"Retained copies (the real safety net):\n"
+                f"  {local_status}\n"
+                f"  {gw_status}\n"
+                f"  {ftp_status}\n\n"
+                f"True off-site (OVH Backup Storage via FTPS) is being wired; until then the "
+                f"gateway copy on a separate box is the off-host safety. Ask engineer/chief "
+                f"for the full zip if you ever need to restore.\n"
+            )
             send_backup(smtp_host, smtp_port, sender, password, WEEKLY_DEST,
-                        weekly_subject, body, attach)
-            print(f"OK  weekly backup sent to {WEEKLY_DEST}")
+                        weekly_subject, weekly_body, None)
+            print(f"OK  weekly status notice sent to {WEEKLY_DEST} (no attachment)")
 
 
 if __name__ == "__main__":
