@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
+import { stalenessThresholdMin } from '@/lib/data/heartbeats';
 
 export const dynamic = 'force-dynamic';
 
@@ -63,16 +64,26 @@ interface HeartbeatFile {
   org?: string;
   last_heartbeat?: string;
   current_task?: string;
+  loop_interval?: string;
 }
 
-const STALE_MS = 30 * 60 * 1000;
-const DOWN_MS = 2 * 60 * 60 * 1000;
+const STALE_FLOOR_MS = 30 * 60 * 1000;
+const DOWN_FLOOR_MS = 2 * 60 * 60 * 1000;
 
 function healthFromHeartbeat(hb: HeartbeatFile): HealthStatus {
   if (!hb.last_heartbeat) return 'down';
   const age = Date.now() - new Date(hb.last_heartbeat).getTime();
-  if (age < STALE_MS) return 'healthy';
-  if (age < DOWN_MS) return 'stale';
+  // Cosmetic only. Real liveness = frozen-turn watchdog (cron-fired-unanswered correlation),
+  // NOT this threshold. Safe to keep interval-aware/lax — do NOT re-tighten to "catch freezes";
+  // that is the watchdogs job and tightening only re-introduces false amber on idle agents.
+  //
+  // Interval-aware: stale only after 2x the agent's own heartbeat cadence (floor 30min) so an
+  // idle hourly-heartbeat agent never flashes amber mid-cycle. Down band scales above stale.
+  // Reuses the canonical staleness algorithm in lib/data/heartbeats.ts (single source of truth).
+  const staleMs = Math.max(STALE_FLOOR_MS, stalenessThresholdMin(hb.loop_interval) * 60 * 1000);
+  const downMs = Math.max(DOWN_FLOOR_MS, staleMs * 2);
+  if (age < staleMs) return 'healthy';
+  if (age < downMs) return 'stale';
   return 'down';
 }
 

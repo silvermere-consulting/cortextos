@@ -30,7 +30,7 @@ function parseIntervalMs(interval: string | undefined | null): number | null {
   }
 }
 
-function stalenessThresholdMin(loopInterval: string | undefined | null): number {
+export function stalenessThresholdMin(loopInterval: string | undefined | null): number {
   const ms = parseIntervalMs(loopInterval);
   return ms !== null ? (ms * STALENESS_MULTIPLIER) / (60 * 1000) : STALE_THRESHOLD_MIN;
 }

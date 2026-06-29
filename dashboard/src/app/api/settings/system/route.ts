@@ -6,6 +6,12 @@ import { CTX_ROOT } from '@/lib/config';
 export const dynamic = 'force-dynamic';
 
 interface SystemConfig {
+  // RECONCILE NOTE (2026-06-29): this field is persisted by the settings UI but is NOT read by
+  // any health computation. Fleet health is interval-aware (2x each agent's loop_interval, floor
+  // 30min) in api/agents/fleet-health/route.ts + lib/data/heartbeats.ts — that is the single
+  // source of truth. Do NOT wire this flat value into staleness: the default 120 is in *seconds*
+  // (2min), which would re-introduce the exact false-amber bug we just fixed for idle hourly
+  // agents. Kept only as a dormant manual-override hook; left a no-op deliberately.
   heartbeatStalenessThreshold: number;
   maxCrashesPerDay: number;
   sessionRefreshInterval: number;
