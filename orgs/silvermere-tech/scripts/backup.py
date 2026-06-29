@@ -100,6 +100,7 @@ INCLUDE_PATTERNS = [
     "projects/silvermere-tech-email",
     "projects/foundry",
     "projects/clearspeak-studio",  # node_modules/build/dist/.next stripped by EXCLUDE_DIRS
+    "backups/umami",               # self-host Umami DB dump (written fresh by dump_umami_db() each run)
 ]
 
 # Always exclude these patterns even if matched above
@@ -469,6 +470,32 @@ def prune_imap(host, port, user, password, keep_n=KEEP_DAILY):
         print(f"WARN: IMAP prune failed — {e} (backup still sent)", file=sys.stderr)
 
 
+def dump_umami_db() -> str:
+    """Dump the self-host Umami postgres into ORG_ROOT/backups/umami so the
+    file-collection step rides it into the daily zip. Best-effort: NEVER raises —
+    a dump failure must not break the org file backup. Added 2026-06-29."""
+    out_dir = ORG_ROOT / "backups" / "umami"
+    out_file = out_dir / "umami-db.sql.gz"
+    env = {**os.environ,
+           "DOCKER_HOST": os.environ.get("DOCKER_HOST", "unix:///run/user/1001/docker.sock")}
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with open(out_file, "wb") as fh:
+            p1 = subprocess.Popen(
+                ["docker", "exec", "silvermere-umami-db", "pg_dump", "-U", "umami", "umami"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            p2 = subprocess.Popen(["gzip", "-9"], stdin=p1.stdout, stdout=fh)
+            p1.stdout.close()
+            p2.communicate(timeout=180)
+            p1.wait(timeout=10)
+        if p1.returncode == 0 and out_file.exists() and out_file.stat().st_size > 0:
+            return f"OK ({out_file.stat().st_size:,} bytes)"
+        err = (p1.stderr.read().decode()[:160] if p1.stderr else "")
+        return f"FAILED (rc={p1.returncode}) {err}"
+    except Exception as e:  # noqa: BLE001 — best-effort, never break the file backup
+        return f"skipped (error: {e})"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backup silvermere-tech org to email")
     parser.add_argument("--weekly", action="store_true",
@@ -500,6 +527,8 @@ def main():
     subject = f"{BACKUP_SUBJECT_PREFIX} silvermere-tech {date_str} {time_str}"
 
     is_weekly = args.weekly or (now.weekday() == 6)  # 6 = Sunday
+
+    print(f"Umami DB dump: {dump_umami_db()}")
 
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = os.path.join(tmp, f"silvermere-tech-backup-{date_str}.zip")
