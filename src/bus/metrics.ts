@@ -52,6 +52,23 @@ export interface SystemMetrics {
   disk?: DiskMetrics;
   /** Per-agent RSS + RAM headroom (OOM monitor). Optional so old reports / non-Linux don't break consumers. */
   memory?: MemorySnapshot;
+  /** Box-level orphaned agent-browser chrome (PPID==1). Optional so old reports / non-Linux don't break consumers. */
+  orphan_browser?: OrphanBrowserMetrics;
+}
+
+/**
+ * Box-level orphaned browser processes — chrome/chromium/headless_shell trees
+ * that agent-browser/Playwright leaked when an agent session died mid-run, so
+ * they reparented to init (PPID==1). They are invisible to per-agent RSS
+ * attribution (no owning agent), which is the monitor blind spot this closes.
+ * The orphan-chrome-reaper timer auto-kills them every 30min; this line just
+ * gives collect-metrics visibility of what is currently orphaned.
+ */
+export interface OrphanBrowserMetrics {
+  /** Count of orphaned (PPID==1) chrome-family processes at collect time. */
+  orphan_count: number;
+  /** Total RSS (MB, 1-decimal) held by those orphaned processes. */
+  rss_mb: number;
 }
 
 /** Disk usage at/above this percent is surfaced as an anomaly at collect time. */
@@ -199,6 +216,64 @@ export function collectDiskMetrics(mount = '/'): DiskMetrics | null {
   try {
     const out = execSync(`df -P -k ${mount}`, { encoding: 'utf-8', timeout: 5000 });
     return parseDfKOutput(out, mount);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True for a `ps comm` value that is an agent-browser chrome-family process.
+ * Mirrors the orphan-chrome-reaper.sh comm set (chrome / chromium /
+ * chromium-browser / headless_shell / chrome_crashpad_handler). Uses a
+ * startsWith for the crashpad handler because `ps comm` truncates to 15 chars
+ * (TASK_COMM_LEN), so `chrome_crashpad_handler` arrives as `chrome_crashpad`.
+ */
+function isOrphanBrowserComm(comm: string): boolean {
+  return (
+    comm === 'chrome' ||
+    comm === 'chromium' ||
+    comm === 'chromium-browser' ||
+    comm === 'headless_shell' ||
+    comm.startsWith('chrome_crashpad')
+  );
+}
+
+/**
+ * Parse `ps -eo pid=,ppid=,rss=,comm=` output into an OrphanBrowserMetrics.
+ * Counts chrome-family processes reparented to init (PPID==1) and sums their
+ * RSS. Pure (no IO) so it is unit-testable without spawning ps. Mirrors the
+ * orphan-chrome-reaper's detection (comm set + PPID==1) so the metric and the
+ * reaper agree on what "orphaned browser" means; the reaper's 3-min age guard
+ * is a kill-safety measure and is deliberately NOT applied here — the metric
+ * reports current orphan RSS at collect time.
+ */
+export function parseOrphanChromeRss(output: string): OrphanBrowserMetrics {
+  let orphan_count = 0;
+  let rssKb = 0;
+  for (const line of output.split('\n')) {
+    const f = line.trim().split(/\s+/);
+    if (f.length < 4) continue;
+    const ppid = f[1];
+    const rss = f[2];
+    const comm = f[3];
+    if (ppid !== '1') continue;
+    if (!isOrphanBrowserComm(comm)) continue;
+    const kb = Number(rss);
+    if (!Number.isFinite(kb)) continue;
+    orphan_count += 1;
+    rssKb += kb;
+  }
+  return { orphan_count, rss_mb: Math.round((rssKb / 1024) * 10) / 10 };
+}
+
+/**
+ * Capture box-level orphaned-browser RSS via `ps`. Best-effort: returns null if
+ * ps fails or is absent (non-Linux) — a process scan must never break the report.
+ */
+export function collectOrphanBrowserMetrics(): OrphanBrowserMetrics | null {
+  try {
+    const out = execSync('ps -eo pid=,ppid=,rss=,comm=', { encoding: 'utf-8', timeout: 5000 });
+    return parseOrphanChromeRss(out);
   } catch {
     return null;
   }
@@ -355,6 +430,11 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
   // Best-effort: zeroed snapshot on non-Linux / read failure.
   const memory = collectAgentMemory('/proc');
 
+  // Box-level orphaned agent-browser chrome (PPID==1) — invisible to per-agent
+  // RSS attribution, so it's the monitor blind spot. The reaper auto-kills these;
+  // this line gives visibility. Best-effort: null on non-Linux / ps failure.
+  const orphanBrowser = collectOrphanBrowserMetrics();
+
   const report: MetricsReport = {
     timestamp,
     agents,
@@ -365,6 +445,7 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       approvals_pending: approvalsPending,
       ...(disk ? { disk } : {}),
       ...(memory.agents.length || memory.mem_total_mb ? { memory } : {}),
+      ...(orphanBrowser ? { orphan_browser: orphanBrowser } : {}),
     },
   };
 

@@ -8,6 +8,7 @@ import {
   storeUsageData,
   collectTelegramCommands,
   parseDfKOutput,
+  parseOrphanChromeRss,
   evaluateDiskAnomaly,
   DISK_ALERT_THRESHOLD,
 } from '../src/bus/metrics.js';
@@ -294,6 +295,38 @@ describe('Sprint 5: Observability & Metrics', () => {
       expect(parseDfKOutput('Filesystem 1024-blocks Used Available Capacity Mounted on', '/')).toBeNull();
       expect(parseDfKOutput('', '/')).toBeNull();
       expect(parseDfKOutput('garbage line', '/')).toBeNull();
+    });
+  });
+
+  describe('parseOrphanChromeRss (box-level orphaned browser)', () => {
+    // ps -eo pid=,ppid=,rss=,comm=  → "pid ppid rss(KB) comm"
+    it('counts only PPID==1 chrome-family procs and sums their RSS (MB)', () => {
+      const out = [
+        '  101     1 204800 chrome',            // orphan, 200 MB
+        '  102     1 102400 headless_shell',    // orphan, 100 MB
+        '  103   999 512000 chrome',            // LIVE (PPID!=1, parented to node) → ignored
+        '  104     1  10240 chrome_crashpad',   // orphan crashpad (comm truncated), 10 MB
+        '  105     1  51200 bash',              // orphan but not a browser → ignored
+      ].join('\n');
+      const m = parseOrphanChromeRss(out);
+      expect(m.orphan_count).toBe(3);
+      expect(m.rss_mb).toBeCloseTo(310.0, 1); // (204800+102400+10240)/1024
+    });
+
+    it('returns zeros on empty / no-orphan input', () => {
+      expect(parseOrphanChromeRss('')).toEqual({ orphan_count: 0, rss_mb: 0 });
+      expect(parseOrphanChromeRss('  200   999 300000 chrome')).toEqual({ orphan_count: 0, rss_mb: 0 });
+    });
+
+    it('skips malformed rows and non-numeric RSS without throwing', () => {
+      const out = [
+        'garbage',
+        '  300     1 notanumber chrome',
+        '  301     1 40960 chromium',           // valid orphan, 40 MB
+      ].join('\n');
+      const m = parseOrphanChromeRss(out);
+      expect(m.orphan_count).toBe(1);
+      expect(m.rss_mb).toBeCloseTo(40.0, 1);
     });
   });
 
