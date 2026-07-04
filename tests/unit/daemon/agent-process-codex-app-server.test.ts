@@ -130,15 +130,44 @@ describe('AgentProcess codex-app-server runtime', () => {
     expect(mockCodexAppServerPty.setTelegramHandle).toHaveBeenCalledWith(api, '12345');
   });
 
-  it('sends back-online Telegram directly from daemon on fresh start (issue #392)', async () => {
-    const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
-    const sendMessage = vi.fn().mockResolvedValue(undefined);
-    const api = { sendChatAction: vi.fn().mockResolvedValue(undefined), sendMessage };
+  it('sends back-online Telegram directly from daemon on fresh start in DAY mode (issue #392)', async () => {
+    // Pin the clock to a day-mode instant (noon UTC → detectDayNightMode('UTC')
+    // = day) so the boot-TG day/night gate is deterministic regardless of when
+    // the suite runs. Fake only Date so session setTimeout timers are untouched.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-04T12:00:00Z'));
+    try {
+      const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+      const sendMessage = vi.fn().mockResolvedValue(undefined);
+      const api = { sendChatAction: vi.fn().mockResolvedValue(undefined), sendMessage };
 
-    ap.setTelegramHandle(api as any, '12345');
-    await ap.start();
+      ap.setTelegramHandle(api as any, '12345');
+      await ap.start();
 
-    expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online');
+      expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('suppresses daemon-direct back-online Telegram in NIGHT mode (boot-TG day/night gate)', async () => {
+    // Night-mode silent boot: the day/night gate must suppress the codex
+    // daemon-direct ping too, so it is not the one path that still wakes the
+    // user at night. 03:00 UTC → detectDayNightMode('UTC') = night.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-04T03:00:00Z'));
+    try {
+      const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+      const sendMessage = vi.fn().mockResolvedValue(undefined);
+      const api = { sendChatAction: vi.fn().mockResolvedValue(undefined), sendMessage };
+
+      ap.setTelegramHandle(api as any, '12345');
+      await ap.start();
+
+      expect(sendMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('skips back-online Telegram on handoff restart (issue #392)', async () => {

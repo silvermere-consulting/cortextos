@@ -10,6 +10,7 @@ import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
+import { detectDayNightMode } from '../bus/heartbeat.js';
 import { resolvePaths } from '../utils/paths.js';
 
 type LogFn = (msg: string) => void;
@@ -695,6 +696,20 @@ export class AgentProcess {
     }
   }
 
+  /**
+   * Boot-time day/night gate. In night mode we suppress the routine boot
+   * Telegram ("Booting up... one moment" + "back online" status) so agents
+   * don't wake the user, and so specialists don't direct-ping outside day
+   * hours (strict-orchestrator-routing). Uses the shared detectDayNightMode so
+   * the daemon and the agents' own heartbeat logic agree on the window.
+   * Fixes the 4x night-boot-ping breach (task_1783122539810 / _1781221943016 /
+   * feedback_boot_telegram_night_mode) at the source, independent of whether a
+   * given agent's derived AGENTS.md Step 1 has been updated.
+   */
+  private isDayMode(): boolean {
+    return detectDayNightMode(this.env.timezone || this.config.timezone || 'UTC') === 'day';
+  }
+
   private buildStartupPrompt(): string {
     const onboardedPath = join(this.env.ctxRoot, 'state', this.name, '.onboarded');
     const onboardingPath = join(this.env.agentDir, 'ONBOARDING.md');
@@ -726,10 +741,19 @@ export class AgentProcess {
     const handoffUxOverride = isHandoffRestart
       ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing. Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
       : '';
-    const onlineMessage = isHandoffRestart
+    // NIGHT-MODE SILENT BOOT: outside day hours, suppress the routine boot
+    // Telegram entirely. This overrides AGENTS.md Step 1 regardless of whether a
+    // given agent's derived file has been updated, so it covers the whole fleet
+    // from one place. Placed early + prominently so it is not buried. Skipped on
+    // handoff restart (that path sends its own contextual "back — ..." pickup).
+    const nightSilentBoot = !isHandoffRestart && !this.isDayMode();
+    const bootSilenceBlock = nightSilentBoot
+      ? ' NIGHT MODE (your local timezone): This is a SILENT boot. Do NOT send ANY Telegram message during startup — skip the AGENTS.md "Booting up... one moment" ping AND do not send an online-status message. Record your boot via daily memory + event logging only. (The user is asleep outside day hours, and specialists must not direct-ping the user; route via the orchestrator if something genuinely needs surfacing.)'
+      : '';
+    const onlineMessage = (isHandoffRestart || nightSilentBoot)
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${bootSilenceBlock}${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
   }
 
   private buildContinuePrompt(): string {
@@ -738,7 +762,12 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     // Session refresh (--continue) is never a handoff restart.
     this.lastSpawnWasHandoff = false;
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After checking inbox, send a Telegram message to the user saying you are back online.`;
+    // Same night-mode gate as the cold-boot prompt: no routine online ping while
+    // the user is asleep. Day mode keeps the standard back-online notification.
+    const onlineTail = this.isDayMode()
+      ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
+      : ' NIGHT MODE (your local timezone): after checking inbox, do NOT send any online/boot Telegram — resume silently (daily memory + event logging only).';
+    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${onlineTail}`;
   }
 
   /**
@@ -817,6 +846,9 @@ export class AgentProcess {
   private maybeSendCodexBootNotification(): void {
     if (this.config.runtime !== 'codex-app-server') return;
     if (this.lastSpawnWasHandoff) return;
+    // Night-mode silent boot: match the prompt-level gate so the codex direct
+    // send does not become the one path that still pings the user at night.
+    if (!this.isDayMode()) return;
     if (!this.telegramApi || !this.telegramChatId) return;
     this.telegramApi
       .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`)

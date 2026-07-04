@@ -21,10 +21,13 @@ If `ONBOARDED`: continue with the session start protocol below.
 
 Complete the following in order. Do not skip steps.
 
-1. **Send boot message first** — before reading anything else. SKIP this step if your startup prompt says `CONTEXT HANDOFF` (that is a handoff restart, not a cold boot):
+1. **Check mode FIRST, then decide on a boot message** — do NOT send anything before this check. SKIP this step entirely if your startup prompt says `CONTEXT HANDOFF` (a handoff restart — you send your own "back — …" pickup later).
+   - Determine day/night from your local time: `date +'%H:%M %Z'`. **Day mode = 08:00–22:00** in `$CTX_TIMEZONE`; **night mode** = outside that.
+   - **Day mode** — send the boot ping:
    ```bash
    cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID 'Booting up... one moment'
    ```
+   - **Night mode** — send NOTHING. Boot silently (daily memory + event logging only). A night boot ping wakes the user and, for specialists, bypasses orchestrator routing. The daemon also strips the "back online" instruction from your startup prompt in night mode, so silence is the correct, expected behaviour — do not work around it.
 2. **Trigger-aware file loading** — check the startup prompt for a signal keyword before reading files:
    - **No signal** (cold boot or any unrecognised startup prompt): read all bootstrap files: IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md, USER.md, TOOLS.md, SYSTEM.md
    - **`HEARTBEAT CRON:` prefix**: minimal load — read HEARTBEAT.md + MEMORY.md only; skip SOUL, GUARDRAILS, IDENTITY, TOOLS, SYSTEM (already in session context or compaction summary)
@@ -336,8 +339,15 @@ The knowledge base is a semantic vector store (ChromaDB, Gemini Embedding 2). Th
 **memory-{agent} is automatic.** On every heartbeat cycle, re-ingest your memory files so they stay current and searchable:
 ```bash
 # Run on every heartbeat
+# (1) backfill any not-yet-indexed memory day cheaply (path-id skip, no --force) so no day is silently missed:
+cortextos bus kb-ingest ./memory/*.md \
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --collection memory-$CTX_AGENT_NAME
+# (2) refresh the actively-changing files (MEMORY.md + today's daily) into the SAME memory-{agent} collection.
+#     NO --force: content-hash dedup (mmrag should_skip) re-embeds only CHANGED/new chunks and skips unchanged ones,
+#     so hourly re-ingest is cheap instead of re-embedding ALL of memory every heartbeat (wasteful CPU under the local nomic
+#     backend; would also burn quota under a remote embed backend). Do NOT re-add --force to a routine re-ingest (2026-07-01):
 cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
-  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --collection memory-$CTX_AGENT_NAME --force
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --collection memory-$CTX_AGENT_NAME
 ```
 
 **When to query — before starting any task:**
