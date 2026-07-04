@@ -498,3 +498,64 @@ describe('AgentManager.startAgent — BUG-011 race prevention', () => {
     expect((am as any).agents.size).toBe(1);
   });
 });
+
+describe('AgentManager.discoverAndStart - .user-stop honored across daemon restart', () => {
+  // A `cortextos stop <agent>` writes a `.user-stop` marker but does NOT flip
+  // the enabled flag. Without honoring the marker here, a deliberately-stopped
+  // agent would silently resurrect on the next daemon boot. These tests lock in
+  // the fix: discoverAndStart skips agents carrying `.user-stop`, and an agent
+  // starts normally once the marker is gone (an explicit start clears it).
+  let testDir: string;
+  let ctxRoot: string;
+  let frameworkRoot: string;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-userstop-'));
+    ctxRoot = join(testDir, 'instance');
+    frameworkRoot = join(testDir, 'framework');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme', 'agents', 'bob'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('skips an enabled agent that carries a .user-stop marker', async () => {
+    // alice is deliberately stopped (marker present) but still enabled — the
+    // exact state left by `cortextos stop alice`, which does not disable her.
+    mkdirSync(join(ctxRoot, 'state', 'alice'), { recursive: true });
+    writeFileSync(join(ctxRoot, 'state', 'alice', '.user-stop'), 'stopped via cortextos stop');
+
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.discoverAndStart();
+
+    // alice skipped (deliberate stop survives reboot); bob started as normal.
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(startSpy).toHaveBeenCalledWith('bob', expect.any(String), expect.any(Object), 'acme');
+    const startedNames = startSpy.mock.calls.map(c => c[0]);
+    expect(startedNames).not.toContain('alice');
+  });
+
+  it('starts an agent again once its .user-stop marker is removed', async () => {
+    // Simulate an explicit start having cleared the marker: create then remove
+    // it. discoverAndStart must no longer skip alice.
+    mkdirSync(join(ctxRoot, 'state', 'alice'), { recursive: true });
+    const marker = join(ctxRoot, 'state', 'alice', '.user-stop');
+    writeFileSync(marker, 'stopped');
+    rmSync(marker, { force: true });
+
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.discoverAndStart();
+
+    // Both start — the skip is driven solely by the marker, and it's gone.
+    expect(startSpy).toHaveBeenCalledTimes(2);
+    const startedNames = startSpy.mock.calls.map(c => c[0]).sort();
+    expect(startedNames).toEqual(['alice', 'bob']);
+  });
+});

@@ -9,6 +9,10 @@ import { IPCClient } from '../daemon/ipc-server.js';
  * so the SessionEnd crash-alert hook (src/hooks/hook-crash-alert.ts) knows
  * the stop was intentional and does not fire a false 🚨 CRASH alarm.
  * Pattern matches src/cli/bus.ts:1285-1289.
+ *
+ * The marker is CLEARED centrally in AgentManager.startAgent() on the next
+ * explicit (re)start, so a stopped agent is not left carrying a stale marker
+ * that would make frozen-turn-watchdog.gateOk() refuse to recover it.
  */
 export function writeStopMarker(instanceId: string, agent: string, reason: string): void {
   try {

@@ -186,6 +186,9 @@ export const startCommand = new Command('start')
         console.log(`  Registered ${agent} in enabled-agents.json`);
       }
 
+      // Note: the stale-`.user-stop` clear is centralized in the daemon's
+      // AgentManager.startAgent() (covers cli-start, restart, enable, and
+      // daemon-boot discovery in one place) rather than done here.
       console.log(`Starting agent: ${agent}`);
       const response = await ipc.send({ type: 'start-agent', agent, source: 'cortextos start' });
       if (response.success) {

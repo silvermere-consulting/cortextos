@@ -133,6 +133,15 @@ export class AgentManager {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (enabled-agents.json)`);
         continue;
       }
+      // Honor an explicit `.user-stop` across daemon restarts. `cortextos stop`
+      // writes this marker but does NOT flip the enabled flag, so without this
+      // check a deliberately-stopped agent would silently resurrect on daemon
+      // reboot. Semantics: user-stop = stays down until an EXPLICIT start.
+      // Matches frozen-turn-watchdog.gateOk(), which also gates on this marker.
+      if (existsSync(join(this.ctxRoot, 'state', name, '.user-stop'))) {
+        console.log(`[agent-manager] Skipping user-stopped agent: ${name} (.user-stop present — explicit start required)`);
+        continue;
+      }
       // BUG-043 fix: pass the per-agent org so startAgent can use it instead
       // of falling back to `this.org` (the daemon's startup org).
       await this.startAgent(name, dir, config, org);
@@ -218,6 +227,24 @@ export class AgentManager {
    * spawn each agent in its correct org dir regardless of what
    * `CTX_ORG` the daemon was started with.
    */
+  /**
+   * Clear the `.user-stop` / `.user-disable` markers for an agent that is being
+   * explicitly (re)started. Best-effort — a failure here must never block a
+   * start. Centralizes what was previously an ad-hoc `rm .user-stop` workaround:
+   * stop/disable write these markers, and both frozen-turn-watchdog.gateOk() and
+   * discoverAndStart() refuse to run/recover an agent that carries one, so a
+   * lingering marker would strand a restarted agent enabled-but-not-running.
+   */
+  private clearUserMarkers(name: string): void {
+    const stateDir = join(this.ctxRoot, 'state', name);
+    for (const marker of ['.user-stop', '.user-disable']) {
+      const p = join(stateDir, marker);
+      try {
+        if (existsSync(p)) unlinkSync(p);
+      } catch { /* non-fatal — don't block start on marker-clear failure */ }
+    }
+  }
+
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
     const existing = this.agents.get(name);
     if (existing) {
@@ -264,6 +291,17 @@ export class AgentManager {
     if (!config) {
       config = this.loadAgentConfig(agentDir);
     }
+
+    // Centralized marker clear: reaching this point means we are committing to
+    // (re)start this agent — via cli `start`/`restart`/`enable`, dashboard, or a
+    // discovery pass that chose to start it. An explicit start is the user
+    // overriding any earlier `stop`/`disable`, so clear the `.user-stop` /
+    // `.user-disable` markers. Without this, a stopped-then-started agent keeps
+    // a stale marker and frozen-turn-watchdog.gateOk() refuses to recover it on
+    // the next freeze/PTY-death — stranding it enabled-but-not-running.
+    // (discoverAndStart() skips genuinely user-stopped agents BEFORE calling
+    // this, so it never clears a marker for an agent meant to stay down.)
+    this.clearUserMarkers(name);
 
     const env: CtxEnv = {
       instanceId: this.instanceId,

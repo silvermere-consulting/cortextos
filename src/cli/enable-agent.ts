@@ -134,6 +134,14 @@ export const enableAgentCommand = new Command('enable')
   .option('--instance <id>', 'Instance ID', 'default')
   .option('--org <org>', 'Organization name')
   .description('Enable an agent (register and start)')
+  // `enable` has no --restart flag by design — it already starts the agent, and
+  // restarting a running agent is a separate command. Point users there instead
+  // of leaving a bare "unknown option '--restart'" (a real papercut hit during
+  // the Sonnet-5 rollout).
+  .showHelpAfterError(
+    "Note: 'cortextos enable' has no --restart flag — it already starts the agent. " +
+    'To restart a running agent, use: cortextos restart <agent>',
+  )
   .action(async (agent: string, options: { instance: string; org?: string }) => {
     // Becky bug preflight: verify .env has BOT_TOKEN and CHAT_ID before registering.
     // Without this, the agent starts, inherits parent-process credentials silently,
