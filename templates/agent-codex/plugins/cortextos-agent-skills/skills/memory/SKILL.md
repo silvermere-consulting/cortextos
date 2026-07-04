@@ -104,8 +104,15 @@ Update at every heartbeat and session end. Ingest to KB after updating.
 
 Re-ingest MEMORY.md and today's daily memory on every heartbeat so they stay semantically searchable:
 ```bash
+# (1) backfill any not-yet-indexed memory day cheaply (path-id skip, no --force) so no day is silently missed:
+cortextos bus kb-ingest ./memory/*.md \
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --collection memory-$CTX_AGENT_NAME
+# (2) refresh the actively-changing files (MEMORY.md + today's daily) into the SAME memory-{agent} collection.
+#     NO --force: content-hash dedup (mmrag should_skip) re-embeds only CHANGED/new chunks and skips unchanged ones,
+#     so hourly re-ingest is cheap instead of re-embedding ALL of memory every heartbeat (wasteful CPU under the local nomic
+#     backend; would also burn quota under a remote embed backend). Do NOT re-add --force to a routine re-ingest (2026-07-01):
 cortextos bus kb-ingest ./MEMORY.md ./memory/$(date -u +%Y-%m-%d).md \
-  --org $CTX_ORG --agent $CTX_AGENT_NAME --scope private --collection memory-$CTX_AGENT_NAME --force
+  --org $CTX_ORG --agent $CTX_AGENT_NAME --collection memory-$CTX_AGENT_NAME
 ```
 
 ---
