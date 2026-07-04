@@ -34,10 +34,49 @@ import sys
 import tempfile
 import zipfile
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 SECRETS_FILE = Path("/home/cortext/cortextos/orgs/silvermere-tech/secrets.env")
 BACKUP_SUBJECT_PREFIX = "[BACKUP]"
+
+# Folders to search for [BACKUP] messages. Daily backups are self-sent
+# (bertha → bertha); Hostinger's spam filter routes most of them to Junk, so
+# INBOX alone would silently restore a stale backup. Search Junk + Archive too
+# and always pick the globally-newest by Date header, not the newest INBOX UID.
+#
+# DO NOT REMOVE "INBOX.Junk" — it is the PRIMARY recovery guarantee, not
+# redundant with backup.py's relocate_from_junk(). That relocate is best-effort
+# and non-fatal: if it ever no-ops (delivery lag beyond its retry window, IMAP
+# hiccup), the newest backup sits in Junk and ONLY this Junk-aware search
+# recovers it. The spam-filing at source is unchanged; we handle the consequence.
+SEARCH_FOLDERS = ["INBOX", "INBOX.Junk", "INBOX.Archive"]
+
+
+def _msg_datetime(msg) -> datetime:
+    """Best-effort parse of a message's Date header to an aware datetime.
+    Falls back to epoch so undated messages sort oldest."""
+    try:
+        dt = parsedate_to_datetime(msg.get("Date", ""))
+        if dt is None:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _search_folder(imap, folder: str) -> list[bytes]:
+    """Select a folder read-only and return UIDs of [BACKUP] messages ([] if
+    the folder is missing/unselectable)."""
+    status, _ = imap.select(f'"{folder}"', readonly=True)
+    if status != "OK":
+        return []
+    status, data = imap.search(None, f'SUBJECT "{BACKUP_SUBJECT_PREFIX}"')
+    if status != "OK" or not data or not data[0]:
+        return []
+    return data[0].split()
 
 # Files that must be present in a valid backup
 REQUIRED_PATHS = [
@@ -61,53 +100,51 @@ def load_secrets():
     return secrets
 
 
-def list_backups(imap) -> list[tuple[bytes, str, str]]:
-    """Return list of (uid, subject, date) for [BACKUP] messages, newest first."""
-    imap.select("INBOX")
-    status, data = imap.search(None, f'SUBJECT "{BACKUP_SUBJECT_PREFIX}"')
-    if status != "OK" or not data[0]:
-        return []
-    uids = data[0].split()
+def list_backups(imap) -> list[tuple[str, str, str]]:
+    """Return list of (folder, subject, date) for [BACKUP] messages across all
+    search folders, globally newest first."""
     results = []
-    for uid in reversed(uids):  # newest first
-        status2, msg_data = imap.fetch(uid, "(ENVELOPE)")
-        if status2 != "OK":
-            continue
-        # Parse enough to get subject and date
-        status3, header_data = imap.fetch(uid, "(BODY[HEADER.FIELDS (SUBJECT DATE)])")
-        if status3 != "OK":
-            continue
-        raw = header_data[0][1] if isinstance(header_data[0], tuple) else b""
-        msg = email.message_from_bytes(raw)
-        subj = msg.get("Subject", "")
-        date = msg.get("Date", "")
-        results.append((uid, subj, date))
-    return results
+    for folder in SEARCH_FOLDERS:
+        for uid in _search_folder(imap, folder):
+            status, header_data = imap.fetch(uid, "(BODY[HEADER.FIELDS (SUBJECT DATE)])")
+            if status != "OK":
+                continue
+            raw = header_data[0][1] if isinstance(header_data[0], tuple) else b""
+            msg = email.message_from_bytes(raw)
+            results.append((folder, msg.get("Subject", ""), msg.get("Date", ""),
+                            _msg_datetime(msg)))
+    results.sort(key=lambda r: r[3], reverse=True)  # newest first
+    return [(folder, subj, date) for folder, subj, date, _dt in results]
 
 
-def fetch_latest_zip(imap) -> tuple[bytes, str] | None:
-    """Fetch the most recent [BACKUP] zip attachment. Returns (zip_bytes, filename) or None."""
-    imap.select("INBOX")
-    status, data = imap.search(None, f'SUBJECT "{BACKUP_SUBJECT_PREFIX}"')
-    if status != "OK" or not data[0]:
+def fetch_latest_zip(imap) -> tuple[bytes, str, str] | None:
+    """Fetch the globally-newest [BACKUP] zip attachment across all search
+    folders (INBOX may be stale — recent daily backups land in Junk).
+    Returns (zip_bytes, filename, source_folder) or None."""
+    candidates = []  # (datetime, zip_bytes, filename, folder)
+    for folder in SEARCH_FOLDERS:
+        for uid in _search_folder(imap, folder):
+            status, msg_data = imap.fetch(uid, "(RFC822)")
+            if status != "OK":
+                continue
+            raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else b""
+            msg = email.message_from_bytes(raw)
+            for part in msg.walk():
+                if part.get_content_maintype() == "multipart":
+                    continue
+                if part.get("Content-Disposition") is None:
+                    continue
+                filename = part.get_filename()
+                if filename and filename.endswith(".zip"):
+                    candidates.append((_msg_datetime(msg),
+                                       part.get_payload(decode=True),
+                                       filename, folder))
+                    break
+    if not candidates:
         return None
-    uids = data[0].split()
-    # Iterate from newest to oldest looking for one with an attachment
-    for uid in reversed(uids):
-        status2, msg_data = imap.fetch(uid, "(RFC822)")
-        if status2 != "OK":
-            continue
-        raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else b""
-        msg = email.message_from_bytes(raw)
-        for part in msg.walk():
-            if part.get_content_maintype() == "multipart":
-                continue
-            if part.get("Content-Disposition") is None:
-                continue
-            filename = part.get_filename()
-            if filename and filename.endswith(".zip"):
-                return part.get_payload(decode=True), filename
-    return None
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    _dt, zip_bytes, filename, folder = candidates[0]
+    return zip_bytes, filename, folder
 
 
 def verify_restore(dest_dir: str) -> tuple[bool, list[str], list[str]]:
@@ -154,12 +191,12 @@ def main():
         backups = list_backups(imap)
         imap.logout()
         if not backups:
-            print("No [BACKUP] emails found in bertha's inbox.")
+            print("No [BACKUP] emails found in bertha's mailbox.")
             return
-        print(f"{'UID':<10} {'Date':<35} Subject")
-        print("-" * 90)
-        for uid, subj, date in backups:
-            print(f"{uid.decode():<10} {date:<35} {subj}")
+        print(f"{'Folder':<16} {'Date':<35} Subject")
+        print("-" * 96)
+        for folder, subj, date in backups:
+            print(f"{folder:<16} {date:<35} {subj}")
         return
 
     print("Fetching latest backup zip from bertha IMAP...")
@@ -167,12 +204,16 @@ def main():
     imap.logout()
 
     if result is None:
-        print("ERROR: no [BACKUP] zip attachment found in bertha's inbox.", file=sys.stderr)
+        print("ERROR: no [BACKUP] zip attachment found in bertha's mailbox "
+              f"(searched {', '.join(SEARCH_FOLDERS)}).", file=sys.stderr)
         sys.exit(1)
 
-    zip_bytes, zip_filename = result
+    zip_bytes, zip_filename, source_folder = result
     size_mb = len(zip_bytes) / (1024 * 1024)
-    print(f"Fetched: {zip_filename} ({size_mb:.2f} MB)")
+    print(f"Fetched: {zip_filename} ({size_mb:.2f} MB) from {source_folder}")
+    if source_folder != "INBOX":
+        print(f"  NOTE: latest backup was in {source_folder}, not INBOX "
+              f"(daily self-sent backups are spam-filtered — see prune note).")
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     dest_dir = args.dest or f"/tmp/cortextos-restore-{ts}"

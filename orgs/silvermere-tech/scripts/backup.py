@@ -448,24 +448,80 @@ def upload_to_gateway(secrets, zip_path: str) -> str:
                 pass
 
 
-def prune_imap(host, port, user, password, keep_n=KEEP_DAILY):
-    """Delete oldest [BACKUP] emails in bertha's inbox, keeping the last keep_n."""
+def relocate_from_junk(host, port, user, password, subject, attempts=6, delay=5):
+    """Move a self-sent daily backup from INBOX.Junk back to INBOX.
+
+    Hostinger's spam filter heuristically files bertha->bertha automated mail
+    (base64 zip + automated pattern) into Junk — it is NOT an auth failure (SPF
+    passes). ManageSieve (port 4190) is TCP-open but resets real sessions
+    (firewalled to Hostinger's own hosts), so a server-side filter is not
+    reachable from here. Instead, after the send, find the message by exact
+    subject and IMAP UID-MOVE it to INBOX so retention + restore see it where
+    expected. Best-effort with a short retry for LDA delivery lag; failure is
+    non-fatal — restore.py also searches Junk as a safety net."""
+    import time
     try:
         with imaplib.IMAP4_SSL(host, port) as imap:
             imap.login(user, password)
-            imap.select("INBOX")
-            # Search for messages with BACKUP prefix
-            status, data = imap.search(None, f'SUBJECT "{BACKUP_SUBJECT_PREFIX}"')
-            if status != "OK":
-                return
-            uids = data[0].split()
-            # uids are in ascending order (oldest first)
-            to_delete = uids[:-keep_n] if len(uids) > keep_n else []
-            for uid in to_delete:
-                imap.store(uid, "+FLAGS", "\\Deleted")
-            if to_delete:
-                imap.expunge()
-                print(f"IMAP prune: deleted {len(to_delete)} old backup(s), kept {min(len(uids), keep_n)}")
+            typ, caps = imap.capability()
+            has_move = b"MOVE" in caps[0].upper()
+            for _ in range(attempts):
+                imap.select("INBOX.Junk")
+                status, data = imap.search(None, f'SUBJECT "{subject}"')
+                seqs = data[0].split() if status == "OK" and data and data[0] else []
+                if seqs:
+                    moved = 0
+                    for seq in seqs:
+                        st, u = imap.fetch(seq, "(UID)")
+                        m = re.search(rb"UID (\d+)", (u[0] or b"") if u else b"")
+                        if not m:
+                            continue
+                        uid = m.group(1).decode()
+                        if has_move:
+                            imap.uid("MOVE", uid, "INBOX")
+                        else:
+                            imap.uid("COPY", uid, "INBOX")
+                            imap.uid("STORE", uid, "+FLAGS", "\\Deleted")
+                            imap.expunge()
+                        moved += 1
+                    if moved:
+                        print(f"IMAP relocate: moved {moved} backup(s) Junk -> INBOX")
+                        return True
+                time.sleep(delay)
+            print("IMAP relocate: backup not found in Junk "
+                  "(delivered straight to INBOX, or LDA lag > wait window)")
+            return False
+    except Exception as e:
+        print(f"WARN: IMAP relocate failed — {e} "
+              "(non-fatal; restore.py also searches Junk)", file=sys.stderr)
+        return False
+
+
+def prune_imap(host, port, user, password, keep_n=KEEP_DAILY):
+    """Delete oldest [BACKUP] emails, keeping the last keep_n in each folder.
+
+    Self-sent daily backups (bertha -> bertha) are spam-filtered into INBOX.Junk
+    by Hostinger, so retention must be enforced there too — pruning INBOX alone
+    leaves Junk to grow unbounded. restore.py reads both folders."""
+    try:
+        with imaplib.IMAP4_SSL(host, port) as imap:
+            imap.login(user, password)
+            for folder in ("INBOX", "INBOX.Junk"):
+                status, _ = imap.select(f'"{folder}"')
+                if status != "OK":
+                    continue  # folder may not exist on this mailbox
+                # Search for messages with BACKUP prefix (seq nums, oldest first)
+                status, data = imap.search(None, f'SUBJECT "{BACKUP_SUBJECT_PREFIX}"')
+                if status != "OK" or not data or not data[0]:
+                    continue
+                uids = data[0].split()
+                to_delete = uids[:-keep_n] if len(uids) > keep_n else []
+                for uid in to_delete:
+                    imap.store(uid, "+FLAGS", "\\Deleted")
+                if to_delete:
+                    imap.expunge()
+                    print(f"IMAP prune [{folder}]: deleted {len(to_delete)} old "
+                          f"backup(s), kept {min(len(uids), keep_n)}")
     except Exception as e:
         print(f"WARN: IMAP prune failed — {e} (backup still sent)", file=sys.stderr)
 
@@ -618,7 +674,11 @@ def main():
         send_backup(smtp_host, smtp_port, sender, password, DAILY_DEST, subject, body, attach)
         print(f"OK  daily backup sent ({size_mb:.2f} MB {'+ attachment' if attach else 'no attachment'})")
 
-        # IMAP prune — keep last KEEP_DAILY daily backups
+        # Relocate self-sent backup out of Junk (Hostinger spam-files it) so it
+        # lands in INBOX where retention + restore expect it. Best-effort.
+        relocate_from_junk(imap_host, imap_port, sender, password, subject)
+
+        # IMAP prune — keep last KEEP_DAILY daily backups (INBOX + Junk)
         prune_imap(imap_host, imap_port, sender, password, keep_n=KEEP_DAILY)
 
         # Weekly send → Steven: NOTIFICATION ONLY (no attachment).
