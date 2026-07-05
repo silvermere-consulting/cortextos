@@ -527,27 +527,36 @@ def prune_imap(host, port, user, password, keep_n=KEEP_DAILY):
 
 
 def dump_umami_db() -> str:
-    """Dump the self-host Umami postgres into ORG_ROOT/backups/umami so the
+    """Pull the newest .10 umami pg_dump into ORG_ROOT/backups/umami so the
     file-collection step rides it into the daily zip. Best-effort: NEVER raises —
-    a dump failure must not break the org file backup. Added 2026-06-29."""
+    a pull failure must not break the org file backup.
+
+    Umami was cut over .135 -> .10 (docker01) on 2026-07-04; the DB now lives on
+    .10, so the old local `docker exec silvermere-umami-db pg_dump` here went dead
+    (container removed 2026-07-05). A nightly pg_dump timer on .10 writes gzipped
+    dumps to /home/deploy/umami/backups/; we scp-pull the newest via the deploy@
+    key so the .10 analytics DB inherits the org backup's off-host tiers.
+    Added 2026-06-29, repointed to .10 pull 2026-07-05 (task_1783219218170)."""
     out_dir = ORG_ROOT / "backups" / "umami"
     out_file = out_dir / "umami-db.sql.gz"
-    env = {**os.environ,
-           "DOCKER_HOST": os.environ.get("DOCKER_HOST", "unix:///run/user/1001/docker.sock")}
+    remote = "deploy@10.10.10.10"
+    remote_dir = "/home/deploy/umami/backups"
+    ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+                "-o", "StrictHostKeyChecking=accept-new"]
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
-        with open(out_file, "wb") as fh:
-            p1 = subprocess.Popen(
-                ["docker", "exec", "silvermere-umami-db", "pg_dump", "-U", "umami", "umami"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-            p2 = subprocess.Popen(["gzip", "-9"], stdin=p1.stdout, stdout=fh)
-            p1.stdout.close()
-            p2.communicate(timeout=180)
-            p1.wait(timeout=10)
-        if p1.returncode == 0 and out_file.exists() and out_file.stat().st_size > 0:
-            return f"OK ({out_file.stat().st_size:,} bytes)"
-        err = (p1.stderr.read().decode()[:160] if p1.stderr else "")
-        return f"FAILED (rc={p1.returncode}) {err}"
+        newest = subprocess.run(
+            ["ssh", *ssh_opts, remote,
+             f"ls -1t {remote_dir}/umami-*.sql.gz 2>/dev/null | head -1"],
+            capture_output=True, text=True, timeout=40).stdout.strip()
+        if not newest:
+            return f"skipped (no remote dump at {remote}:{remote_dir})"
+        subprocess.run(
+            ["scp", *ssh_opts, f"{remote}:{newest}", str(out_file)],
+            check=True, capture_output=True, timeout=180)
+        if out_file.exists() and out_file.stat().st_size > 0:
+            return f"OK pulled {os.path.basename(newest)} ({out_file.stat().st_size:,} bytes) from .10"
+        return "FAILED (pulled file empty/missing)"
     except Exception as e:  # noqa: BLE001 — best-effort, never break the file backup
         return f"skipped (error: {e})"
 
