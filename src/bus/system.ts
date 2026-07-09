@@ -42,6 +42,15 @@ const BINARY_TEMP_EXTENSIONS = new Set([
   '.log', '.tmp', '.pid', '.pyc', '.pyo', '.class', '.o', '.so', '.dylib',
 ]);
 
+// Database dumps and snapshots. NEVER version these: they carry production data
+// and they are large. Caught 2026-07-09 — a 5.5 MB pg_dump of the live silvermere
+// Odoo tenant sat in an agent workspace/, passed the 10 MB gate, and was committed
+// into that agent's snapshot repo. It was one `git bundle` away from riding the
+// nightly off-site email backup.
+const DATA_DUMP_EXTENSIONS = new Set([
+  '.dump', '.sql', '.sqlite', '.sqlite3', '.db', '.bak', '.pgdump', '.mdb',
+]);
+
 const EXCLUDED_DIR_PREFIXES = [
   'telegram-images/',
   'node_modules/',
@@ -74,8 +83,25 @@ const CREDENTIAL_KEY_SHAPES = new RegExp(
 const CREDENTIAL_ASSIGNMENT =
   /\b(?:token|api[_-]?key|password|secret)\s*[=:]\s*["']?[A-Za-z0-9_\-]{6,}/i;
 
+// htpasswd / basicAuth hashes. A DIFFERENT shape entirely: no `key=` prefix and
+// no vendor prefix, so neither of the patterns above can see it. Measured
+// 2026-07-09: a value-bearing scan pronounced a Traefik routes.yml "clean" while
+// it held six of these, and the same blind spot let apr1 hashes reach agent
+// memory files — which ship off-box in the nightly backup email.
+// Two distinct layouts, and a single character class cannot express both:
+//   apr1:   $apr1$<salt>$<hash>
+//   bcrypt: $2y$<cost>$<salt+hash>   <- the `10$` cost field breaks a naive class
+// A redacted marker like `$apr1$<REDACTED>` matches neither, by design, so
+// memory files stay committable once their hash bodies are stripped.
+const CREDENTIAL_HTPASSWD =
+  /\$apr1\$[A-Za-z0-9./]{6,}|\$2[aby]\$\d{2}\$[A-Za-z0-9./]{20,}/;
+
 function hasCredential(content: string): boolean {
-  return CREDENTIAL_KEY_SHAPES.test(content) || CREDENTIAL_ASSIGNMENT.test(content);
+  return (
+    CREDENTIAL_KEY_SHAPES.test(content) ||
+    CREDENTIAL_ASSIGNMENT.test(content) ||
+    CREDENTIAL_HTPASSWD.test(content)
+  );
 }
 
 const SCRIPT_EXTENSIONS = new Set(['.sh', '.py', '.js']);
@@ -284,8 +310,9 @@ export function screenFile(fullPath: string, relPath: string): string | null {
   if (relPath.endsWith('.env') || relPath.includes('/.env')) return 'contains_credentials';
   if (relPath === '.cortextos-env' || relPath.endsWith('/.cortextos-env')) return 'runtime_env';
 
-  const ext = extname(relPath);
+  const ext = extname(relPath).toLowerCase();
   if (BINARY_TEMP_EXTENSIONS.has(ext)) return 'binary_or_temp';
+  if (DATA_DUMP_EXTENSIONS.has(ext)) return 'data_dump';
   if (EXCLUDED_DIR_PREFIXES.some(p => relPath.startsWith(p) || relPath.includes(`/${p}`))) {
     return 'excluded_directory';
   }

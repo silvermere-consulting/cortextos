@@ -431,6 +431,36 @@ describe('Bus System', () => {
       expect(report.reason).toMatch(/0 stageable/);
     });
 
+    it('blocks database dumps — they carry production data and must never be versioned', () => {
+      mkdirSync(join(agentDir, 'workspace', 'snapshots'), { recursive: true });
+      writeFileSync(join(agentDir, 'workspace', 'snapshots', 'tenant.dump'), 'PGDMP fake');
+      writeFileSync(join(agentDir, 'workspace', 'snapshots', 'old.sql'), 'DROP TABLE x;');
+      writeFileSync(join(agentDir, 'workspace', 'notes.md'), 'safe');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.blocked.some(b => b.includes('tenant.dump') && b.includes('data_dump'))).toBe(true);
+      expect(report.blocked.some(b => b.includes('old.sql') && b.includes('data_dump'))).toBe(true);
+      expect(report.staged).toContain('workspace/notes.md');
+    });
+
+    it('blocks apr1/bcrypt htpasswd hashes — the shape the value-bearing scan misses', () => {
+      writeFileSync(join(agentDir, 'memory', 'leak.md'), 'users: liwa:$apr1$BzMCNgXQ$FDHg0T5wwiXVY1eJg');
+      writeFileSync(join(agentDir, 'memory', 'leak2.md'), 'hash: $2y$10$abcdefghijklmnopqrstuv');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.blocked.some(b => b.includes('leak.md') && b.includes('credential'))).toBe(true);
+      expect(report.blocked.some(b => b.includes('leak2.md') && b.includes('credential'))).toBe(true);
+    });
+
+    it('still stages MEMORY.md once its hashes are redacted', () => {
+      // Redaction keeps the $apr1$ marker so the lesson reads, but drops the body.
+      writeFileSync(join(agentDir, 'MEMORY.md'), 'we used $apr1$<REDACTED> for basic auth');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.staged).toContain('MEMORY.md');
+      expect(report.blocked.some(b => b.includes('MEMORY.md'))).toBe(false);
+    });
+
     it('commits for real and reports a hash, with no remote configured', () => {
       writeFileSync(join(agentDir, 'MEMORY.md'), 'long-term memory');
 
