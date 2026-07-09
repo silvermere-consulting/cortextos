@@ -73,6 +73,15 @@ BACKUP_SUBJECT_PREFIX = "[BACKUP]"
 GATEWAY_REMOTE_DIR = "/home/cortext/backups/silvermere-org"
 KEEP_GATEWAY = 7
 
+# Step 2c — git history off-host. EXCLUDE_DIRS strips every .git dir and the
+# framework tree lives outside ORG_ROOT, so without this NO repo history ever
+# leaves the box. Bundles go straight to the gateway and NEVER into the zip:
+# adding them measured 30.67 MB against a 20 MB email limit, which silently
+# drops the attachment — and the email tier is the documented restore path.
+GIT_BUNDLE_DIR = ORG_ROOT / "backups" / "git"
+GATEWAY_BUNDLE_DIR = "/home/cortext/backups/silvermere-git"
+KEEP_BUNDLES = 7
+
 # Paths to include in the zip (relative to ORG_ROOT).
 # Explicit inclusion list keeps the zip predictable and avoids accidental
 # credential leaks (secrets.env, gsc-service-account.json are excluded).
@@ -101,6 +110,14 @@ INCLUDE_PATTERNS = [
     "projects/foundry",
     "projects/clearspeak-studio",  # node_modules/build/dist/.next stripped by EXCLUDE_DIRS
     "backups/umami",               # self-host Umami DB dump (written fresh by dump_umami_db() each run)
+    # NOTE (2026-07-09): git bundles are deliberately NOT included here.
+    # EXCLUDE_DIRS strips every .git dir, so no repo history leaves this box —
+    # a real DR gap. The obvious fix (add "backups/git") was measured and
+    # REJECTED: it takes the zip from 13.3 MB to 30.67 MB, past SIZE_LIMIT_MB,
+    # so the email tier silently drops its attachment. That tier is also the
+    # documented restore path (restore.py fetches from IMAP), so we would have
+    # traded a history gap for a restore gap and been told nothing.
+    # Bundles go off-host via the gateway instead. See task_1783575583… .
 ]
 
 # Always exclude these patterns even if matched above
@@ -384,6 +401,146 @@ def _run_ssh(cmd_args, env, timeout=120):
     return p.returncode, p.stdout, p.stderr
 
 
+def _discover_repos() -> dict:
+    """Every local git repo whose history exists ONLY on this box.
+
+    Agent snapshot repos are enumerated, never hardcoded — the auto-commit cron
+    creates one per agent, so a hardcoded list silently misses new agents.
+    """
+    repos = {}
+    fw = Path("/home/cortext/cortextos")
+    if (fw / ".git").is_dir():
+        repos["cortextos-framework"] = fw / ".git"
+    prod = Path("/home/cortext/.silvermere-prod.git")
+    if prod.is_dir():
+        repos["silvermere-prod"] = prod
+    for agent_git in sorted(Path("/home/cortext/cortextos/orgs").glob("*/agents/*/.git")):
+        if agent_git.is_dir():
+            repos[f"agent-{agent_git.parent.name}"] = agent_git
+    for proj_git in sorted(Path("/home/cortext/cortextos/orgs").glob("*/projects/*/.git")):
+        if proj_git.is_dir():
+            repos[f"project-{proj_git.parent.name}"] = proj_git
+    return repos
+
+
+def make_git_bundles() -> tuple:
+    """Regenerate a fresh bundle per repo, then VERIFY each one.
+
+    Returns (ok, status). Fails loudly: a corrupt or empty bundle that copies
+    cleanly is a silent-null wearing a success badge, and a stale bundle that
+    is merely re-shipped is the same bug slowed down. Both are why this
+    rebuilds every run and verifies before anything leaves the box.
+    """
+    repos = _discover_repos()
+    if not repos:
+        return False, "Bundles: FAILED — no git repos discovered"
+
+    GIT_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    made, failed = [], []
+
+    for name, git_dir in repos.items():
+        dest = GIT_BUNDLE_DIR / f"{name}-{stamp}.bundle"
+        try:
+            r = subprocess.run(["git", f"--git-dir={git_dir}", "bundle", "create", str(dest), "--all"],
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
+                failed.append(f"{name}(create)")
+                continue
+            v = subprocess.run(["git", "bundle", "verify", str(dest)],
+                               capture_output=True, text=True, timeout=120)
+            if v.returncode != 0:
+                failed.append(f"{name}(verify)")
+                dest.unlink(missing_ok=True)
+                continue
+            made.append(dest)
+        except Exception as e:  # noqa: BLE001 - report, never mask
+            failed.append(f"{name}({type(e).__name__})")
+
+    # Prune old local bundles per repo by LEXICAL name sort. Names carry an
+    # ISO-basic UTC stamp so lexical == chronological, which is immune to the
+    # mtime churn that bites `ls -t` when files are restored or re-copied.
+    for name in repos:
+        old = sorted(GIT_BUNDLE_DIR.glob(f"{name}-*.bundle"))
+        for stale in old[:-KEEP_BUNDLES]:
+            stale.unlink(missing_ok=True)
+
+    if failed:
+        return False, f"Bundles: FAILED — {', '.join(failed)} (made {len(made)})"
+    total_mb = sum(p.stat().st_size for p in made) / (1024 * 1024)
+    return True, f"Bundles: {len(made)} repo(s) bundled + verified ({total_mb:.2f} MB), keep last {KEEP_BUNDLES}"
+
+
+def upload_git_bundles(secrets) -> tuple:
+    """Ship this run's bundles to the gateway. Returns (ok, status).
+
+    Never touches the zip or the email attachment. Verifies remote byte-size
+    per file before reporting success, then prunes to KEEP_BUNDLES per repo.
+    """
+    host = secrets.get("TRAEFIK_GATEWAY_HOST", "").strip()
+    user = secrets.get("TRAEFIK_GATEWAY_SSH_USER", "").strip()
+    password = secrets.get("TRAEFIK_GATEWAY_SSH_PASSWORD", "").strip()
+    if not (host and user and password):
+        return False, "Bundles->gateway: FAILED (TRAEFIK_GATEWAY_* not configured)"
+
+    bundles = sorted(GIT_BUNDLE_DIR.glob("*.bundle"))
+    if not bundles:
+        return False, "Bundles->gateway: FAILED (nothing to upload)"
+
+    askpass_path = None
+    try:
+        fd, askpass_path = tempfile.mkstemp(prefix="bk_askpass_", suffix=".sh")
+        with os.fdopen(fd, "w") as f:
+            f.write('#!/bin/sh\necho "$GW_SSH_PW"\n')
+        os.chmod(askpass_path, 0o700)
+        env = os.environ.copy()
+        env["GW_SSH_PW"] = password
+        env["SSH_ASKPASS"] = askpass_path
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env["DISPLAY"] = env.get("DISPLAY", ":0")
+
+        ssh_opts = ["-o", "StrictHostKeyChecking=accept-new",
+                    "-o", "ConnectTimeout=30", "-o", "BatchMode=no"]
+        target = f"{user}@{host}"
+
+        rc, _o, err = _run_ssh(["ssh"] + ssh_opts + [target, f"mkdir -p {GATEWAY_BUNDLE_DIR}"], env)
+        if rc != 0:
+            return False, f"Bundles->gateway: FAILED (mkdir) — {err.strip() or rc}"
+
+        rc, _o, err = _run_ssh(
+            ["scp"] + ssh_opts + [str(b) for b in bundles] + [f"{target}:{GATEWAY_BUNDLE_DIR}/"],
+            env, timeout=600)
+        if rc != 0:
+            return False, f"Bundles->gateway: FAILED (scp) — {err.strip() or rc}"
+
+        for b in bundles:
+            rc, out, _e = _run_ssh(
+                ["ssh"] + ssh_opts + [target, f"stat -c %s {GATEWAY_BUNDLE_DIR}/{b.name}"], env)
+            remote = out.strip()
+            if rc != 0 or not remote.isdigit() or int(remote) != b.stat().st_size:
+                return False, (f"Bundles->gateway: FAILED (size mismatch on {b.name}: "
+                               f"local={b.stat().st_size} remote={remote or '?'})")
+
+        # Lexical prune per repo prefix — same reasoning as the local prune.
+        prefixes = sorted({b.name.rsplit("-", 1)[0] for b in bundles})
+        for pref in prefixes:
+            prune = (f"ls -1 {GATEWAY_BUNDLE_DIR}/{pref}-*.bundle 2>/dev/null "
+                     f"| sort | head -n -{KEEP_BUNDLES} | xargs -r rm -f")
+            _run_ssh(["ssh"] + ssh_opts + [target, prune], env)
+
+        total_mb = sum(b.stat().st_size for b in bundles) / (1024 * 1024)
+        return True, (f"Bundles->gateway: {len(bundles)} file(s) ({total_mb:.2f} MB) -> "
+                      f"{host}:{GATEWAY_BUNDLE_DIR} (size-verified, keep last {KEEP_BUNDLES})")
+    except Exception as e:  # noqa: BLE001
+        return False, f"Bundles->gateway: FAILED — {e}"
+    finally:
+        if askpass_path:
+            try:
+                os.unlink(askpass_path)
+            except OSError:
+                pass
+
+
 def upload_to_gateway(secrets, zip_path: str) -> str:
     """Step 2b — off-host copy of the zip to the OVH gateway over SSH/scp.
     Internal infra (our own box), so no spend/approval gate. Verifies the remote
@@ -642,6 +799,25 @@ def main():
             gw_status = upload_to_gateway(secrets, zip_path)
             print(gw_status)
 
+        # Step 2c — git history off-host. Rebuilt + verified EVERY run: a stale
+        # bundle re-shipped nightly is a backup that reports success while
+        # archiving frozen history. Failure here fails the run.
+        bundles_failed = False
+        if args.no_gateway:
+            bundle_status = "Bundles: skipped (--no-gateway)"
+        elif args.dry_run:
+            bundle_status = f"Bundles: dry-run — would rebuild + copy to {GATEWAY_BUNDLE_DIR}"
+        else:
+            ok_make, bundle_status = make_git_bundles()
+            print(bundle_status)
+            if ok_make:
+                ok_up, up_status = upload_git_bundles(secrets)
+                print(up_status)
+                bundle_status = f"{bundle_status}\n  {up_status}"
+                bundles_failed = not ok_up
+            else:
+                bundles_failed = True
+
         over_limit = size_mb > SIZE_LIMIT_MB
         if over_limit:
             print(f"WARN: zip ({size_mb:.1f} MB) exceeds {SIZE_LIMIT_MB} MB limit — sending without attachment")
@@ -665,7 +841,8 @@ def main():
                 f"doc-to-pdf.js on restore); orphan/external PDFs are kept.\n"
                 f"Excluded credentials: secrets.env, gsc-service-account.json, .env files.\n\n"
                 f"Excluded {len(skipped)} additional credential/binary/derived file(s).\n\n"
-                f"Retained copies:\n  {local_status}\n  {ftp_status}\n  {gw_status}\n\n"
+                f"Retained copies:\n  {local_status}\n  {ftp_status}\n  {gw_status}\n"
+                f"  {bundle_status}\n\n"
                 f"Restore: use scripts/restore.py to fetch + unzip from IMAP.\n"
             )
             attach = zip_path
@@ -715,6 +892,14 @@ def main():
             send_backup(smtp_host, smtp_port, sender, password, WEEKLY_DEST,
                         weekly_subject, weekly_body, None)
             print(f"OK  weekly status notice sent to {WEEKLY_DEST} (no attachment)")
+
+    # Fail loudly. A backup that reports success while shipping no history is
+    # worse than no backup: it buys false confidence and nobody looks again.
+    # The zip/email path has already succeeded by here, so this exit code says
+    # precisely "the git-history tier failed", and the cron surfaces it.
+    if bundles_failed:
+        print("ERROR: git-bundle tier FAILED — history did NOT reach the gateway", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
