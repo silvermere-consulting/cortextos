@@ -173,10 +173,30 @@ export function queryKnowledgeBase(
       case 'all':
         collections.push(`shared-${org}`);
         if (agent) collections.push(`agent-${agent}`);
+        // `memory-{agent}` is where the daily-memory recipe ingests (see the
+        // kb-ingest line in every agent's AGENTS.md / HEARTBEAT.md), yet before
+        // 2026-07-09 scope 'all' never searched it. An agent asking "what was I
+        // doing?" mid-session got a confident zero from collections that had
+        // never held its diary, while its own memory sat indexed and unread.
+        // Boot reads memory from disk, so this only ever bit MID-SESSION recall
+        // — which is precisely when it is least likely to be noticed.
+        // 'all' must mean all.
+        if (agent) collections.push(`memory-${agent}`);
         break;
     }
   }
 
+  // A FAILED QUERY AND AN EMPTY ONE ARE DIFFERENT FACTS.
+  // This used to `catch { return null }`, and parseOutput(null) returned [], so a
+  // missing collection, a python crash and a 30s timeout all became "0 results"
+  // — identical to a healthy search that matched nothing. On 2026-07-09 that shape
+  // produced a fleet-wide false alarm ("several agents' memory is unsearchable")
+  // that survived until the byte layer contradicted it. A semantic miss is not
+  // absence, and an error is not a miss.
+  //
+  // Note a missing `memory-{agent}` collection is NORMAL for an agent that has
+  // never ingested a diary, so a failure here is reported, not thrown.
+  const failed: Array<{ collection: string; reason: string }> = [];
   const runQuery = (col: string): string | null => {
     try {
       return execFileSync(pythonPath, [
@@ -190,17 +210,33 @@ export function queryKnowledgeBase(
         timeout: 30000,
         env,
       });
-    } catch {
+    } catch (err) {
+      const e = err as { code?: string; signal?: string; message?: string };
+      failed.push({
+        collection: col,
+        reason: e.signal === 'SIGTERM' ? 'timeout after 30s' : (e.message?.split('\n')[0] ?? 'unknown error'),
+      });
       return null;
     }
   };
 
-  const parseOutput = (output: string | null): KBQueryResult[] => {
+  const parseOutput = (output: string | null, col: string): KBQueryResult[] => {
     if (!output) return [];
     // mmrag.py --json outputs pretty-printed JSON; find and parse the JSON block
     const trimmed = output.trim();
     const jsonStart = trimmed.indexOf('{');
-    if (jsonStart === -1) return [];
+    if (jsonStart === -1) {
+      // MEASURED 2026-07-09, not assumed: for a collection that does not exist,
+      // mmrag.py EXITS 0 and prints the plain sentence
+      //   "Knowledge base is empty. Ingest some files first."
+      // to stdout. execFileSync therefore never throws, so the catch above never
+      // records it, and this function used to `return []` — a silent zero for the
+      // single most likely real failure. The throw-based guard I wrote first
+      // covered the RARE case (python crash, timeout) and missed the common one.
+      // Only probing the real binary surfaced this; the unit test mocked a throw.
+      failed.push({ collection: col, reason: `non-JSON output: ${trimmed.slice(0, 60)}` });
+      return [];
+    }
     try {
       const raw = JSON.parse(trimmed.slice(jsonStart)) as {
         results?: Array<{ content?: string; result?: string; similarity?: number; source?: string; type?: string }>;
@@ -217,29 +253,44 @@ export function queryKnowledgeBase(
         doc_type: r.type || 'markdown',
       }));
     } catch {
+      failed.push({ collection: col, reason: 'unparseable JSON from mmrag' });
       return [];
     }
   };
 
-  try {
-    let allResults: KBQueryResult[] = [];
-    let lastCollection = `shared-${org}`;
-    for (const col of collections) {
-      const output = runQuery(col);
-      allResults = allResults.concat(parseOutput(output));
-      lastCollection = col;
-    }
+  let allResults: KBQueryResult[] = [];
+  let lastCollection = `shared-${org}`;
+  for (const col of collections) {
+    const output = runQuery(col);
+    allResults = allResults.concat(parseOutput(output, col));
+    lastCollection = col;
+  }
 
-    if (allResults.length > 0) {
-      return {
-        results: allResults,
-        total: allResults.length,
-        query: question,
-        collection: collections.length === 1 ? lastCollection : `shared-${org}`,
-      };
+  // Report the zero, never merely return it. If every collection we consulted
+  // errored, "0 results" says nothing about the knowledge base and everything
+  // about the query failing — the caller must be able to tell those apart.
+  if (failed.length > 0) {
+    const detail = failed.map((f) => `${f.collection} (${f.reason})`).join(', ');
+    if (failed.length === collections.length && allResults.length === 0) {
+      console.warn(
+        `[kb] ALL ${collections.length} collection(s) failed to query: ${detail}. ` +
+          `This is a FAILED SEARCH, not an empty one — do not read the 0 results as "nothing indexed".`,
+      );
+    } else {
+      console.warn(
+        `[kb] ${failed.length} of ${collections.length} collection(s) failed: ${detail}. ` +
+          `Results below are PARTIAL and exclude those collections.`,
+      );
     }
-  } catch {
-    // Failed — return empty
+  }
+
+  if (allResults.length > 0) {
+    return {
+      results: allResults,
+      total: allResults.length,
+      query: question,
+      collection: collections.length === 1 ? lastCollection : `shared-${org}`,
+    };
   }
 
   return { results: [], total: 0, query: question, collection: `shared-${org}` };

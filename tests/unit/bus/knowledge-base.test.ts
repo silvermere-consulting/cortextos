@@ -266,3 +266,112 @@ describe('kb warn messages — UX invariants', () => {
     expect(specificOrgWarns.every((m) => /run setup/i.test(m))).toBe(true);
   });
 });
+
+// ── 2026-07-09: mid-session recall bug + the silent-failure zero ─────────────
+// Both regressions below were INVISIBLE to the existing suite: deleting either
+// fix left all 1,883 tests green. Mutation-checked when written.
+describe('queryKnowledgeBase — scope "all" must mean all', () => {
+  it('scope "all" queries memory-{agent}, not just shared-{org} and agent-{agent}', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('{"results": [], "result_count": 0}');
+
+    queryKnowledgeBase(dummyPaths, 'what was I doing?', { ...baseOptions, scope: 'all' });
+
+    // The daily-memory recipe ingests into memory-{agent}. Before this fix,
+    // scope 'all' never searched it, so an agent's own diary was unreachable
+    // mid-session while the boot-time disk read masked the gap.
+    const collections = execFileSyncMock.mock.calls.map((call) => {
+      const args = call[1] as string[];
+      return args[args.indexOf('--collection') + 1];
+    });
+    expect(collections).toContain('shared-TestOrg');
+    expect(collections).toContain('agent-tester');
+    expect(collections).toContain('memory-tester');
+  });
+
+  it('scope "private" is unchanged — still agent-{agent} only', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('{"results": [], "result_count": 0}');
+
+    queryKnowledgeBase(dummyPaths, 'q', { ...baseOptions, scope: 'private' });
+
+    const collections = execFileSyncMock.mock.calls.map((call) => {
+      const args = call[1] as string[];
+      return args[args.indexOf('--collection') + 1];
+    });
+    expect(collections).toEqual(['agent-tester']);
+  });
+});
+
+describe('queryKnowledgeBase — a failed search is not an empty one', () => {
+  it('ALL collections erroring → loud warn that the zero is a FAILED search', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockImplementation(() => {
+      throw Object.assign(new Error('chromadb connection refused'), { code: 'ECONNREFUSED' });
+    });
+
+    const result = queryKnowledgeBase(dummyPaths, 'q', { ...baseOptions, scope: 'all' });
+
+    expect(result.total).toBe(0);
+    // The whole point: 0 results must NOT be reportable as "nothing indexed".
+    expect(warnLog.some((m) => /ALL 3 collection\(s\) failed/.test(m))).toBe(true);
+    expect(warnLog.some((m) => /FAILED SEARCH, not an empty one/i.test(m))).toBe(true);
+    expect(warnLog.some((m) => /connection refused/.test(m))).toBe(true);
+  });
+
+  it('SOME collections erroring → warn that results are PARTIAL', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockImplementation((_py: unknown, args: unknown) => {
+      const argv = args as string[];
+      const col = argv[argv.indexOf('--collection') + 1];
+      if (col === 'memory-tester') throw new Error('no such collection');
+      return '{"results": [{"content": "hit", "similarity": 0.9}], "result_count": 1}';
+    });
+
+    const result = queryKnowledgeBase(dummyPaths, 'q', { ...baseOptions, scope: 'all' });
+
+    expect(result.total).toBeGreaterThan(0);
+    expect(warnLog.some((m) => /1 of 3 collection\(s\) failed/.test(m))).toBe(true);
+    expect(warnLog.some((m) => /PARTIAL/.test(m))).toBe(true);
+    // A partial result must not masquerade as a complete one.
+    expect(warnLog.some((m) => /memory-tester/.test(m))).toBe(true);
+  });
+
+  it('a healthy empty search stays quiet — no false alarm', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('{"results": [], "result_count": 0}');
+
+    const result = queryKnowledgeBase(dummyPaths, 'q', { ...baseOptions, scope: 'all' });
+
+    expect(result.total).toBe(0);
+    // known-negative: the warning must not fire when nothing actually failed,
+    // or it becomes noise and gets ignored — a slower way of having no warning.
+    expect(warnLog.some((m) => /failed/i.test(m))).toBe(false);
+  });
+});
+
+describe('queryKnowledgeBase — mmrag exits 0 on a missing collection', () => {
+  it('non-JSON stdout (the REAL missing-collection output) is a failure, not an empty result', () => {
+    mockConfiguredKb();
+    // Measured against the real binary 2026-07-09: exit 0, plain text on stdout.
+    // The first version of this guard only caught THROWS and missed this entirely.
+    execFileSyncMock.mockReturnValue('Knowledge base is empty. Ingest some files first.\n');
+
+    const result = queryKnowledgeBase(dummyPaths, 'q', { ...baseOptions, scope: 'all' });
+
+    expect(result.total).toBe(0);
+    expect(warnLog.some((m) => /ALL 3 collection\(s\) failed/.test(m))).toBe(true);
+    expect(warnLog.some((m) => /non-JSON output/.test(m))).toBe(true);
+    expect(warnLog.some((m) => /FAILED SEARCH, not an empty one/i.test(m))).toBe(true);
+  });
+
+  it('valid JSON with zero results stays quiet (known-negative)', () => {
+    mockConfiguredKb();
+    execFileSyncMock.mockReturnValue('{"results": [], "result_count": 0}');
+
+    const result = queryKnowledgeBase(dummyPaths, 'q', { ...baseOptions, scope: 'all' });
+
+    expect(result.total).toBe(0);
+    expect(warnLog.some((m) => /failed/i.test(m))).toBe(false);
+  });
+});
