@@ -444,7 +444,7 @@ describe('Bus System', () => {
     });
 
     it('blocks apr1/bcrypt htpasswd hashes — the shape the value-bearing scan misses', () => {
-      writeFileSync(join(agentDir, 'memory', 'leak.md'), 'users: liwa:$apr1$BzMCNgXQ$FDHg0T5wwiXVY1eJg');
+      writeFileSync(join(agentDir, 'memory', 'leak.md'), 'users: liwa:$apr1$SYNTH000$0000000000000000000000');
       writeFileSync(join(agentDir, 'memory', 'leak2.md'), 'hash: $2y$10$abcdefghijklmnopqrstuv');
 
       const report = autoCommitAgentRepo(agentDir, true);
