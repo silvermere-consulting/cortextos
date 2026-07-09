@@ -24,6 +24,15 @@ import { join } from 'path';
 import { tmpdir, homedir } from 'os';
 import { addAgentCommand } from '../../../src/cli/add-agent';
 
+// Derived from the template, never hardcoded: the assertion that matters is
+// "the scaffolder copies EVERY codex skill", not "it copies exactly N". A magic
+// number here goes stale the moment a skill is added and fails the next author
+// for a bug they did not write.
+const CODEX_TEMPLATE_SKILLS = readdirSync(
+  join(__dirname, '..', '..', '..', 'templates', 'agent-codex', 'plugins', 'cortextos-agent-skills', 'skills'),
+  { withFileTypes: true },
+).filter(d => d.isDirectory()).length;
+
 describe('PR-02: add-agent --runtime codex-app-server', () => {
   let tempRoot: string;
   let tempHome: string;
@@ -111,7 +120,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     expect(cfg.agent_name).toBe('codex-cfg');
   });
 
-  it('copies the 25 codex skills into plugins/cortextos-agent-skills/skills', async () => {
+  it('copies every codex skill into plugins/cortextos-agent-skills/skills', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -128,7 +137,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     const skills = readdirSync(skillsDir, { withFileTypes: true })
       .filter(d => d.isDirectory())
       .map(d => d.name);
-    expect(skills.length).toBe(25);
+    expect(skills.length).toBe(CODEX_TEMPLATE_SKILLS);
     // Spot check: comms is the skill that teaches the Telegram reply pattern.
     expect(skills).toContain('comms');
     expect(skills).toContain('onboarding');
@@ -146,7 +155,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     const codexSkillsDir = join(tempHome, '.codex', 'skills');
     expect(existsSync(codexSkillsDir)).toBe(true);
     const links = readdirSync(codexSkillsDir).filter(n => n.startsWith('codex-links__'));
-    expect(links.length).toBe(25);
+    expect(links.length).toBe(CODEX_TEMPLATE_SKILLS);
 
     // Each entry must be a symlink (not a copy), pointing at the agent's local skill dir.
     for (const link of links) {
