@@ -8,7 +8,7 @@ import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTa
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
+import { selfRestart, hardRestart, autoCommit, autoCommitAgentRepo, checkGoalStaleness, postActivity } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands, evaluateDiskAnomaly } from '../bus/metrics.js';
@@ -697,14 +697,21 @@ busCommand
   .action((opts: { dryRun?: boolean; agentFilter?: boolean }) => {
     const env = resolveEnv();
     const projectDir = env.projectRoot || env.frameworkRoot || process.cwd();
-    // Default: filter to the agent's own dir so a scheduled auto-commit cannot
-    // claim authorship of cross-agent or framework-level orphans. Disable with
-    // --no-agent-filter for repo-wide staging (e.g. manual one-off commits).
-    let agentPathPrefix: string | undefined;
+
+    // Default path: snapshot the agent's own memory/ + workspace/ into a
+    // separate local repo rooted at the agent dir. The shared tree ignores
+    // `orgs/` wholesale, so staging agent files there was always a silent
+    // no-op — git status never listed them. --no-agent-filter keeps the old
+    // repo-wide behaviour for manual one-off staging in the framework tree.
     if (opts.agentFilter !== false && env.agentName && env.org) {
-      agentPathPrefix = `orgs/${env.org}/agents/${env.agentName}/`;
+      const agentDir = join(projectDir, 'orgs', env.org, 'agents', env.agentName);
+      const report = autoCommitAgentRepo(agentDir, opts.dryRun ?? false);
+      console.log(JSON.stringify(report));
+      if (report.status === 'failed') process.exitCode = 1;
+      return;
     }
-    const report = autoCommit(projectDir, opts.dryRun ?? false, agentPathPrefix);
+
+    const report = autoCommit(projectDir, opts.dryRun ?? false);
     console.log(JSON.stringify(report));
   });
 

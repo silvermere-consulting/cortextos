@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../../../src/bus/system';
+import { selfRestart, hardRestart, autoCommit, autoCommitAgentRepo, checkGoalStaleness, postActivity } from '../../../src/bus/system';
 import type { BusPaths } from '../../../src/types';
 
 function makePaths(testDir: string, agent: string = 'test-agent'): BusPaths {
@@ -362,6 +362,86 @@ describe('Bus System', () => {
 
       const result = await postActivity(orgDir, testDir, 'myorg', 'hello');
       expect(result).toBe(false);
+    });
+  });
+
+  describe('autoCommitAgentRepo', () => {
+    let agentDir: string;
+
+    beforeEach(() => {
+      agentDir = mkdtempSync(join(tmpdir(), 'cortextos-agentrepo-test-'));
+      // Reproduce the real agent dir: its own .gitignore hides memory/.
+      writeFileSync(join(agentDir, '.gitignore'), 'local/\n.env\nmemory/\n*.log\n.cache/\n');
+      mkdirSync(join(agentDir, 'memory'), { recursive: true });
+      mkdirSync(join(agentDir, 'workspace'), { recursive: true });
+    });
+
+    afterEach(() => {
+      rmSync(agentDir, { recursive: true, force: true });
+    });
+
+    it('stages memory/ and MEMORY.md despite the agent .gitignore hiding memory/', () => {
+      writeFileSync(join(agentDir, 'memory', '2026-07-09.md'), 'daily log');
+      writeFileSync(join(agentDir, 'MEMORY.md'), 'long-term memory');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.status).toBe('dry_run');
+      expect(report.staged).toContain('memory/2026-07-09.md');
+      expect(report.staged).toContain('MEMORY.md');
+    });
+
+    it('never stages .env even though it sits in the agent dir', () => {
+      writeFileSync(join(agentDir, '.env'), 'BOT_TOKEN=supersecretvalue');
+      writeFileSync(join(agentDir, 'workspace', 'note.md'), 'safe');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.staged).toContain('workspace/note.md');
+      expect(report.staged.some(f => f.endsWith('.env'))).toBe(false);
+    });
+
+    it('does not block prose containing "task-list" or "disk-beats-memory"', () => {
+      // The old unanchored /sk-/ blocked 22 of 54 real memory files on these words.
+      writeFileSync(
+        join(agentDir, 'memory', 'prose.md'),
+        'the task-list truncates ids; see disk-beats-memory. risk-free.',
+      );
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.staged).toContain('memory/prose.md');
+      expect(report.blocked.some(b => b.includes('credential'))).toBe(false);
+    });
+
+    it('STILL blocks a real sk- key and a real token= assignment', () => {
+      writeFileSync(join(agentDir, 'memory', 'leak.md'), 'sk-abcdefghij0123456789ABCDEFGH');
+      writeFileSync(join(agentDir, 'memory', 'leak2.md'), 'token=abc123');
+      writeFileSync(join(agentDir, 'memory', 'clean.md'), 'nothing sensitive');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.blocked.some(b => b.includes('leak.md') && b.includes('credential'))).toBe(true);
+      expect(report.blocked.some(b => b.includes('leak2.md') && b.includes('credential'))).toBe(true);
+      expect(report.staged).toContain('memory/clean.md');
+    });
+
+    it('returns failed (not clean) when changes exist but everything is screened out', () => {
+      writeFileSync(join(agentDir, 'memory', 'only.md'), 'sk-abcdefghij0123456789ABCDEFGH');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.status).toBe('failed');
+      expect(report.staged).toHaveLength(0);
+      expect(report.reason).toMatch(/0 stageable/);
+    });
+
+    it('commits for real and reports a hash, with no remote configured', () => {
+      writeFileSync(join(agentDir, 'MEMORY.md'), 'long-term memory');
+
+      const report = autoCommitAgentRepo(agentDir, false);
+      expect(report.status).toBe('committed');
+      expect(report.commit).toMatch(/^[0-9a-f]{7,}$/);
+
+      const logged = execSync('git log --name-only --format= -1', { cwd: agentDir, encoding: 'utf-8' });
+      expect(logged).toContain('MEMORY.md');
+      // Structurally incapable of pushing.
+      expect(execSync('git remote', { cwd: agentDir, encoding: 'utf-8' }).trim()).toBe('');
     });
   });
 });
