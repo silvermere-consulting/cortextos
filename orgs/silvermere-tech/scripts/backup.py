@@ -437,9 +437,30 @@ def make_git_bundles() -> tuple:
 
     GIT_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    made, failed = [], []
+    made, failed, skipped = [], [], []
 
     for name, git_dir in repos.items():
+        # A repo with zero refs has no history to bundle: `git bundle create --all`
+        # refuses it (exit 128, writes no file). That is not a backup failure —
+        # there is nothing to protect — and failing the tier for it strands the
+        # HEALTHY repos' bundles on the box, unshipped.
+        #
+        # But an UNREADABLE repo also lists no refs, and that IS a failure. Both
+        # print nothing; only the exit code tells them apart (measured 2026-07-10):
+        #     zero-ref  -> for-each-ref rc=0,   stdout empty
+        #     corrupt   -> for-each-ref rc=128, stdout empty
+        # So skip only on a POSITIVE proof of readability: rc==0 AND no refs.
+        # Gating on empty output alone would silently skip a corrupted repo.
+        try:
+            probe = subprocess.run(["git", f"--git-dir={git_dir}", "for-each-ref", "--count=1"],
+                                   capture_output=True, text=True, timeout=60)
+        except Exception as e:  # noqa: BLE001 - an unprobeable repo is a failure, not a skip
+            failed.append(f"{name}(probe:{type(e).__name__})")
+            continue
+        if probe.returncode == 0 and not probe.stdout.strip():
+            skipped.append(name)
+            continue
+
         dest = GIT_BUNDLE_DIR / f"{name}-{stamp}.bundle"
         try:
             r = subprocess.run(["git", f"--git-dir={git_dir}", "bundle", "create", str(dest), "--all"],
@@ -465,10 +486,19 @@ def make_git_bundles() -> tuple:
         for stale in old[:-KEEP_BUNDLES]:
             stale.unlink(missing_ok=True)
 
+    skip_note = f", skipped {len(skipped)} empty ({', '.join(sorted(skipped))})" if skipped else ""
+
     if failed:
-        return False, f"Bundles: FAILED — {', '.join(failed)} (made {len(made)})"
+        return False, f"Bundles: FAILED — {', '.join(failed)} (made {len(made)}{skip_note})"
+    if not made:
+        # Every repo skipped => nothing fresh to ship. Returning True here would let
+        # upload_git_bundles() re-scp the RETAINED bundles and call it a success —
+        # a stale bundle wearing a success badge, which this tier exists to prevent.
+        return False, f"Bundles: FAILED — no repo produced a bundle{skip_note}"
+
     total_mb = sum(p.stat().st_size for p in made) / (1024 * 1024)
-    return True, f"Bundles: {len(made)} repo(s) bundled + verified ({total_mb:.2f} MB), keep last {KEEP_BUNDLES}"
+    return True, (f"Bundles: {len(made)} repo(s) bundled + verified ({total_mb:.2f} MB), "
+                  f"keep last {KEEP_BUNDLES}{skip_note}")
 
 
 def upload_git_bundles(secrets) -> tuple:
