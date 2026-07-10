@@ -375,10 +375,27 @@ export function autoCommit(projectDir: string, dryRun: boolean = false, agentPat
       continue;
     }
 
-    // Block binary/temp extensions
-    const ext = extname(file);
+    // screenFile() below carries a comment claiming it holds "the same rules the
+    // shared-tree autoCommit applies, in one place so the two paths cannot drift
+    // apart." They HAD drifted, and the drift was precisely the rule added after a
+    // 5.5MB pg_dump of the live Odoo tenant was committed on 2026-07-09:
+    //   - this path never consulted DATA_DUMP_EXTENSIONS at all;
+    //   - it called extname() without .toLowerCase(), so `.DUMP` walked past the
+    //     binary gate too — the same bug wearing a different case.
+    // The agent-repo path routes through screenFile() and so got the 07-09 fix.
+    // This one never had it. Fixed the instance, left the class open.
+    //
+    // Decodability does NOT subsume this rule and must not be thought to: a pg_dump
+    // decodes as perfectly clean text, contains no credential, and is every customer
+    // record we hold. "Can I read it?" and "does this belong in a snapshot?" are
+    // different questions, and only the second one stops a dump.
+    const ext = extname(file).toLowerCase();
     if (BINARY_TEMP_EXTENSIONS.has(ext)) {
       blocked.push(`${file}:binary_or_temp`);
+      continue;
+    }
+    if (DATA_DUMP_EXTENSIONS.has(ext)) {
+      blocked.push(`${file}:data_dump`);
       continue;
     }
 
