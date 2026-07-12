@@ -25,18 +25,88 @@ export interface AutoCommitReport {
   reason?: string;
 }
 
+/**
+ * AGE axis, read from goals.json `updated_at`.
+ *   ok           — within the threshold
+ *   aged         — older than the threshold
+ *   no_timestamp — goals.json exists but has no usable updated_at (e.g. never cascaded)
+ *   missing      — no goals.json at all
+ */
+export type GoalAgeStatus = 'ok' | 'aged' | 'no_timestamp' | 'missing';
+
+/**
+ * CURRENCY axis. Deliberately NOT a fresh/stale binary. A script cannot verify
+ * that a free-text goal still reflects reality, so this check NEVER certifies a
+ * goal as "current". It reports only what it can stand behind:
+ *   has_dead_goal — at least one goal names a COMPLETED ticket (dead at any age)
+ *   unverified    — currency could not be checked. A REFUSAL, not an all-clear:
+ *                   a goal can be false and recent (age says nothing about truth).
+ */
+export type GoalCurrency = 'has_dead_goal' | 'unverified';
+
+export interface DeadGoal {
+  /** Truncated goal text. */
+  goal: string;
+  /** The completed ticket id from the goal's DECLARED done_when. */
+  handle: string;
+}
+
+/**
+ * A goal that DECLARES a done_when handle which did not resolve. Surfaced as its
+ * own signal, not folded into 'unverified' — because a bad handle looks exactly
+ * like a good one until something tries to resolve it, and an honest UNVERIFIED
+ * would otherwise mask a real state (chief, 2026-07-13). The upstream fix is the
+ * cascade refusing to WRITE an unresolvable handle; this is the read-side backstop.
+ */
+export interface UnresolvableHandle {
+  goal: string;
+  handle: string;
+}
+
 export interface AgentGoalStatus {
   agent: string;
   org: string;
-  status: 'fresh' | 'stale' | 'missing' | 'no_timestamp' | 'parse_error';
-  updated?: string;
+  // AGE axis — measurable from goals.json updated_at.
+  updated_at?: string;
   age_days?: number;
-  stale: boolean;
-  reason?: string;
+  age_status: GoalAgeStatus;
+  // DEADNESS axis — reads ONLY a goal's declared structured done_when field.
+  // Never scrapes ticket ids from goal prose: a goal that CITES a completed ticket
+  // as context is not a goal whose done-when IS that ticket, and prose cannot tell
+  // them apart (that was the fuzzy-matcher failure, one layer down).
+  goals_total: number;
+  goals_with_done_when: number;
+  dead_goals: DeadGoal[];
+  unresolvable_handles: UnresolvableHandle[];
+  // CURRENCY axis — the refusal state. Never 'current'/'fresh'.
+  currency: GoalCurrency;
+  /**
+   * Does a human need to look? A dead goal, an over-threshold age, or an
+   * absent/never-cascaded timestamp all demand attention. `unverified` currency
+   * on its own does NOT flip this true — but it is still not an all-clear, which
+   * is why the report never emits a "fresh"/"current" verdict anywhere.
+   */
+  needs_attention: boolean;
+  reason: string;
 }
 
 export interface GoalStalenessReport {
-  summary: { total: number; stale: number; fresh: number; threshold_days: number };
+  summary: {
+    total: number;
+    needs_attention: number;
+    dead: number;
+    aged: number;
+    no_goals: number;
+    unverified: number;
+    unresolvable_handles: number;
+    goals_total: number;
+    goals_with_done_when: number;
+    threshold_days: number;
+    /** The refusal principle AND the honest denominator, stated in the output so
+     *  a reader cannot mistake 'unverified' for 'all clear' — nor this tool for a
+     *  fix to stale goals. */
+    note: string;
+  };
   agents: AgentGoalStatus[];
 }
 
@@ -648,18 +718,76 @@ export function autoCommitAgentRepo(agentDir: string, dryRun: boolean = false): 
  * Check goal staleness for all agents across all orgs.
  * Mirrors bash bus/check-goal-staleness.sh.
  */
+export interface CheckGoalStalenessOptions {
+  /** Override the clock (for testing). */
+  now?: number;
+  /**
+   * Resolve a ticket id to its status string ('completed', 'in_progress', ...),
+   * 'missing' if the ticket cannot be found, or null if the task store is
+   * unavailable. Injected by the CLI, which holds the task-store paths.
+   *
+   * The deadness axis only ever declares a goal DEAD on a POSITIVE 'completed'.
+   * If this is absent, or returns anything else, the goal stays UNVERIFIED — the
+   * check never guesses a goal is dead, and never guesses it is current either.
+   */
+  resolveTaskStatus?: (taskId: string) => string | null;
+}
+
+/** A goal is either free text or an object that can declare a structured done_when. */
+interface StructuredGoal {
+  text: string;
+  done_when?: { type?: string; id?: string };
+}
+
+function normalizeGoal(g: unknown): StructuredGoal {
+  if (typeof g === 'string') return { text: g };
+  if (g && typeof g === 'object') {
+    const o = g as { text?: unknown; done_when?: unknown };
+    return {
+      text: typeof o.text === 'string' ? o.text : JSON.stringify(g),
+      done_when:
+        o.done_when && typeof o.done_when === 'object'
+          ? (o.done_when as { type?: string; id?: string })
+          : undefined,
+    };
+  }
+  return { text: String(g) };
+}
+
+function goalStalenessNote(goalsTotal: number, goalsWithDoneWhen: number): string {
+  return (
+    'This check reports independent axes and NEVER certifies a goal as "fresh"/"current". ' +
+    '(1) AGE from goals.json updated_at. (2) DEADNESS reads ONLY a goal\'s declared ' +
+    'structured done_when field — never ticket ids scraped from prose (a goal that cites a ' +
+    'completed ticket as context is not a goal whose done-when IS that ticket). A done_when ' +
+    'task that resolves to completed is dead at any age; a declared handle that does not ' +
+    'resolve is surfaced as unresolvable, not guessed. (3) CURRENCY is UNVERIFIED wherever ' +
+    'done-state cannot be checked — a REFUSAL, not an all-clear: a goal can be false and recent. ' +
+    `DENOMINATOR: ${goalsWithDoneWhen}/${goalsTotal} goals declare a done_when handle, so ` +
+    'deadness can only fire on those. This tool does NOT fix stale goals — it stops issuing ' +
+    'verdicts it has not earned. Until goals carry a resolvable done_when, the fleet still has ' +
+    'goals nothing can check; the numerator is honest and the denominator is what it is.'
+  );
+}
+
 export function checkGoalStaleness(
   projectRoot: string,
   thresholdDays: number = 7,
+  opts: CheckGoalStalenessOptions = {},
 ): GoalStalenessReport {
   const agents: AgentGoalStatus[] = [];
   const thresholdMs = thresholdDays * 86400 * 1000;
-  const now = Date.now();
+  const now = opts.now ?? Date.now();
+  const resolveTaskStatus = opts.resolveTaskStatus;
 
   const orgsDir = join(projectRoot, 'orgs');
   if (!existsSync(orgsDir)) {
     return {
-      summary: { total: 0, stale: 0, fresh: 0, threshold_days: thresholdDays },
+      summary: {
+        total: 0, needs_attention: 0, dead: 0, aged: 0, no_goals: 0, unverified: 0,
+        unresolvable_handles: 0, goals_total: 0, goals_with_done_when: 0,
+        threshold_days: thresholdDays, note: goalStalenessNote(0, 0),
+      },
       agents: [],
     };
   }
@@ -697,104 +825,149 @@ export function checkGoalStaleness(
     }
 
     for (const agentName of agentNames) {
-      const goalsFile = join(agentsDir, agentName, 'GOALS.md');
+      const goalsJson = join(agentsDir, agentName, 'goals.json');
 
-      if (!existsSync(goalsFile)) {
+      // Source of truth is goals.json, NOT the rendered GOALS.md. GOALS.md is a
+      // generated view whose "## Updated" line carries a "(by <who>)" suffix that
+      // `new Date()` rejects as Invalid Date — parsing the rendering was the
+      // original bug: it failed CLOSED and reported every cascaded agent as stale
+      // (only an un-cascaded agent, with a bare timestamp, ever parsed).
+      if (!existsSync(goalsJson)) {
         agents.push({
-          agent: agentName,
-          org: orgName,
-          status: 'missing',
-          stale: true,
-          reason: 'no GOALS.md file',
+          agent: agentName, org: orgName,
+          updated_at: undefined, age_days: undefined, age_status: 'missing',
+          goals_total: 0, goals_with_done_when: 0, dead_goals: [], unresolvable_handles: [],
+          currency: 'unverified', needs_attention: true,
+          reason: 'no goals.json',
         });
         continue;
       }
 
-      // Read and parse GOALS.md
-      let content: string;
+      let parsed: { updated_at?: unknown; goals?: unknown };
       try {
-        content = readFileSync(goalsFile, 'utf-8');
+        parsed = JSON.parse(readFileSync(goalsJson, 'utf-8'));
       } catch {
         agents.push({
-          agent: agentName,
-          org: orgName,
-          status: 'missing',
-          stale: true,
-          reason: 'could not read GOALS.md',
+          agent: agentName, org: orgName,
+          updated_at: undefined, age_days: undefined, age_status: 'missing',
+          goals_total: 0, goals_with_done_when: 0, dead_goals: [], unresolvable_handles: [],
+          currency: 'unverified', needs_attention: true,
+          reason: 'goals.json unreadable or malformed',
         });
         continue;
       }
 
-      // Find "## Updated" section and get the next line
-      const lines = content.split('\n');
-      let updatedLine: string | null = null;
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].trim().startsWith('## Updated')) {
-          // Get next non-empty line
-          for (let j = i + 1; j < lines.length; j++) {
-            const trimmed = lines[j].trim();
-            if (trimmed && !trimmed.startsWith('##')) {
-              updatedLine = trimmed;
-              break;
-            }
-          }
-          break;
+      const updatedAt = typeof parsed.updated_at === 'string' ? parsed.updated_at.trim() : '';
+      const goals: StructuredGoal[] = Array.isArray(parsed.goals)
+        ? parsed.goals.map(normalizeGoal)
+        : [];
+
+      // AGE axis — from the authoritative ISO timestamp in goals.json.
+      let ageStatus: GoalAgeStatus;
+      let ageDays: number | undefined;
+      if (!updatedAt) {
+        ageStatus = 'no_timestamp'; // e.g. never cascaded (empty updated_at)
+      } else {
+        const t = Date.parse(updatedAt);
+        if (isNaN(t)) {
+          ageStatus = 'no_timestamp';
+        } else {
+          ageDays = Math.floor((now - t) / 86400000);
+          ageStatus = now - t > thresholdMs ? 'aged' : 'ok';
         }
       }
 
-      if (!updatedLine) {
-        agents.push({
-          agent: agentName,
-          org: orgName,
-          status: 'no_timestamp',
-          stale: true,
-          reason: 'no Updated timestamp in GOALS.md',
-        });
-        continue;
+      // DEADNESS axis — reads ONLY a goal's DECLARED structured done_when field.
+      // A done_when task that resolves to 'completed' is dead at any age. A declared
+      // handle that does not resolve is surfaced (unresolvable_handles), not guessed.
+      // Anything else — no done_when, a non-completed status, a done_when type we
+      // cannot evaluate — leaves the goal UNVERIFIED. Prose is never scraped: a goal
+      // that cites a completed ticket as context is NOT a goal whose done-when is it.
+      const truncate = (s: string) => (s.length > 100 ? s.slice(0, 97) + '...' : s);
+      const deadGoals: DeadGoal[] = [];
+      const unresolvableHandles: UnresolvableHandle[] = [];
+      let goalsWithDoneWhen = 0;
+      for (const g of goals) {
+        const dw = g.done_when;
+        if (!dw) continue; // no declared done-when -> UNVERIFIED (never scrape prose)
+        goalsWithDoneWhen++;
+        if (dw.type !== 'task' || typeof dw.id !== 'string' || !dw.id) continue; // unevaluable type -> unverified
+        if (!resolveTaskStatus) continue; // cannot verify here -> unverified
+        const status = resolveTaskStatus(dw.id);
+        if (status === 'completed') {
+          deadGoals.push({ goal: truncate(g.text), handle: dw.id });
+        } else if (status === 'missing' || status === null) {
+          unresolvableHandles.push({ goal: truncate(g.text), handle: dw.id });
+        }
+        // else: a real status that is not completed -> the goal is verifiably NOT
+        // done, i.e. legitimately live. Not dead; currency stays unverified (being
+        // un-done does not make the goal the RIGHT goal — we do not certify that).
       }
 
-      // Parse ISO 8601 timestamp
-      const parsedDate = new Date(updatedLine);
-      if (isNaN(parsedDate.getTime())) {
-        agents.push({
-          agent: agentName,
-          org: orgName,
-          status: 'parse_error',
-          updated: updatedLine,
-          stale: true,
-          reason: 'could not parse timestamp',
-        });
-        continue;
-      }
+      // CURRENCY axis — the refusal state. Never 'current'/'fresh'.
+      const currency: GoalCurrency = deadGoals.length > 0 ? 'has_dead_goal' : 'unverified';
+      const needsAttention =
+        deadGoals.length > 0 ||
+        unresolvableHandles.length > 0 ||
+        ageStatus === 'aged' ||
+        ageStatus === 'no_timestamp';
 
-      const ageMs = now - parsedDate.getTime();
-      const ageDays = Math.floor(ageMs / 86400000);
-      const isStale = ageMs > thresholdMs;
+      const reasonParts: string[] = [];
+      if (deadGoals.length > 0) {
+        reasonParts.push(
+          `${deadGoals.length} goal(s) whose done_when is a COMPLETED ticket (${deadGoals.map(d => d.handle).join(', ')}) — dead at any age`,
+        );
+      }
+      if (unresolvableHandles.length > 0) {
+        reasonParts.push(
+          `${unresolvableHandles.length} declared done_when handle(s) did NOT resolve (${unresolvableHandles.map(h => h.handle).join(', ')}) — bad handle, surfaced not guessed`,
+        );
+      }
+      if (ageStatus === 'aged') {
+        reasonParts.push(`goals.json updated ${ageDays}d ago (threshold ${thresholdDays}d)`);
+      } else if (ageStatus === 'no_timestamp') {
+        reasonParts.push('goals.json has no usable updated_at (never cascaded?)');
+      } else if (ageStatus === 'ok') {
+        reasonParts.push(`age ok (${ageDays}d)`);
+      }
+      if (currency === 'unverified') {
+        reasonParts.push(
+          `currency UNVERIFIED — ${goalsWithDoneWhen}/${goals.length} goals declare a done_when, the rest cannot be verified (not an all-clear)`,
+        );
+      }
 
       agents.push({
-        agent: agentName,
-        org: orgName,
-        status: isStale ? 'stale' : 'fresh',
-        updated: updatedLine,
+        agent: agentName, org: orgName,
+        updated_at: updatedAt || undefined,
         age_days: ageDays,
-        stale: isStale,
-        reason: isStale
-          ? `${ageDays} days since last update (threshold: ${thresholdDays})`
-          : undefined,
+        age_status: ageStatus,
+        goals_total: goals.length,
+        goals_with_done_when: goalsWithDoneWhen,
+        dead_goals: deadGoals,
+        unresolvable_handles: unresolvableHandles,
+        currency,
+        needs_attention: needsAttention,
+        reason: reasonParts.join('; '),
       });
     }
   }
 
-  const total = agents.length;
-  const staleCount = agents.filter(a => a.stale).length;
-  const freshCount = agents.filter(a => !a.stale).length;
+  const goalsTotal = agents.reduce((n, a) => n + a.goals_total, 0);
+  const goalsWithDoneWhen = agents.reduce((n, a) => n + a.goals_with_done_when, 0);
 
   return {
     summary: {
-      total,
-      stale: staleCount,
-      fresh: freshCount,
+      total: agents.length,
+      needs_attention: agents.filter(a => a.needs_attention).length,
+      dead: agents.filter(a => a.dead_goals.length > 0).length,
+      aged: agents.filter(a => a.age_status === 'aged').length,
+      no_goals: agents.filter(a => a.age_status === 'missing' || a.age_status === 'no_timestamp').length,
+      unverified: agents.filter(a => a.currency === 'unverified').length,
+      unresolvable_handles: agents.filter(a => a.unresolvable_handles.length > 0).length,
+      goals_total: goalsTotal,
+      goals_with_done_when: goalsWithDoneWhen,
       threshold_days: thresholdDays,
+      note: goalStalenessNote(goalsTotal, goalsWithDoneWhen),
     },
     agents,
   };

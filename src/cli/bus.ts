@@ -4,7 +4,7 @@ import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -713,12 +713,27 @@ busCommand
 
 busCommand
   .command('check-goal-staleness')
-  .description('Detect agents with stale GOALS.md')
-  .option('--threshold <days>', 'Staleness threshold in days', '7')
+  .description('Report goal currency per agent (age + dead-goal + unverified). Never certifies "fresh".')
+  .option('--threshold <days>', 'Age threshold in days', '7')
   .action((opts: { threshold: string }) => {
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
-    const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10));
+    // Inject the task-status resolver: the deadness axis declares a goal dead
+    // only on a POSITIVE 'completed'. A missing/unresolvable ticket stays
+    // UNVERIFIED — the store living under ctxRoot must never fail us into a
+    // false "current".
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const resolveTaskStatus = (taskId: string): string | null => {
+      try {
+        const file = findTaskFile(paths, taskId);
+        if (!file) return 'missing';
+        const task = JSON.parse(readFileSync(file, 'utf-8')) as { status?: string };
+        return typeof task.status === 'string' ? task.status : null;
+      } catch {
+        return null;
+      }
+    };
+    const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10), { resolveTaskStatus });
     console.log(JSON.stringify(report, null, 2));
   });
 
