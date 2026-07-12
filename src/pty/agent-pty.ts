@@ -25,6 +25,45 @@ interface IPtySpawnOptions {
 type SpawnFn = (file: string, args: string[], options: IPtySpawnOptions) => IPty;
 
 /**
+ * Environment variables an agent must NEVER receive, from ANY source (org secrets.env,
+ * agent .env, or the daemon's process env). Cherry-picked onto main 2026-07-12 as the DENY
+ * portion of the env chokepoint — the full allow-list keep-set is unsettled and is NOT shipped
+ * here. WHY: Claude Code PREFERS an ANTHROPIC_API_KEY over the claude.ai subscription whenever
+ * one is present, so forwarding it makes every agent bill per-token and a key revocation
+ * fleet-fatal — a P1 violation (all model calls go through the ai-gateway). The key STAYS in
+ * secrets.env (the gateway needs it); it must simply never reach an agent. DO NOT REMOVE.
+ */
+const AGENT_ENV_DENY = new Set([
+  'ANTHROPIC_API_KEY',
+  'CLAUDE_API_KEY',
+  'OPENAI_API_KEY',
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'MISTRAL_API_KEY',
+  'COHERE_API_KEY',
+  'GROQ_API_KEY',
+  'XAI_API_KEY',
+  'DEEPSEEK_API_KEY',
+  'PERPLEXITY_API_KEY',
+  'TOGETHER_API_KEY',
+  'FIREWORKS_API_KEY',
+  'REPLICATE_API_TOKEN',
+  'HUGGINGFACE_API_KEY',
+  'AZURE_OPENAI_API_KEY',
+]);
+
+// Net for a provider key we have not enumerated yet — denied on arrival, not on the next
+// incident. Enumerating names alone is how GEMINI_API_KEY once sailed through; the pattern
+// closes the provider-key CLASS so a new provider is denied before it is added by name.
+const PROVIDER_KEY_RE =
+  /^(ANTHROPIC|CLAUDE|OPENAI|GEMINI|GOOGLE_?(AI|GENAI)?|VERTEX|MISTRAL|COHERE|GROQ|XAI|DEEPSEEK|PERPLEXITY|TOGETHER|FIREWORKS|REPLICATE|HUGGINGFACE|HF|AZURE_OPENAI|BEDROCK|OLLAMA|AI21|STABILITY)[A-Z0-9_]*_(API_)?(KEY|TOKEN|SECRET)$/;
+
+/** True when this env var must never reach an agent process. Applied at EVERY env door. */
+function isDeniedAgentEnv(name: string): boolean {
+  return AGENT_ENV_DENY.has(name) || PROVIDER_KEY_RE.test(name);
+}
+
+/**
  * Manages a single Claude Code PTY session.
  * Replaces the tmux session management in agent-wrapper.sh.
  */
@@ -95,7 +134,9 @@ export class AgentPTY {
           if (!trimmed || trimmed.startsWith('#')) continue;
           const eqIdx = trimmed.indexOf('=');
           if (eqIdx > 0) {
-            ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+            const k = trimmed.slice(0, eqIdx).trim();
+            if (isDeniedAgentEnv(k)) continue;  // never forward a model-provider key to an agent (P1)
+            ptyEnv[k] = trimmed.slice(eqIdx + 1).trim();
           }
         }
       }
@@ -111,7 +152,9 @@ export class AgentPTY {
         if (!trimmed || trimmed.startsWith('#')) continue;
         const eqIdx = trimmed.indexOf('=');
         if (eqIdx > 0) {
-          ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+          const k = trimmed.slice(0, eqIdx).trim();
+          if (isDeniedAgentEnv(k)) continue;  // never forward a model-provider key to an agent (P1)
+          ptyEnv[k] = trimmed.slice(eqIdx + 1).trim();
         }
       }
     }
@@ -395,7 +438,10 @@ export class AgentPTY {
     // Copy essential env vars
     const keepVars = [
       'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL',
-      'TMPDIR', 'TEMP', 'TMP', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY',
+      'TMPDIR', 'TEMP', 'TMP',
+      // ANTHROPIC_API_KEY / CLAUDE_API_KEY DELIBERATELY REMOVED 2026-07-12 — a provider key
+      // must never reach an agent (see AGENT_ENV_DENY). isDeniedAgentEnv also strips them from
+      // the secrets.env + agent .env loops above, so this is one of THREE doors, all closed.
       'NODE_PATH', 'COMSPEC', 'USERPROFILE',
       // Windows path-expansion essentials. Stripping these causes phantom
       // %SystemDrive% directories from inherited Search Indexer processes
