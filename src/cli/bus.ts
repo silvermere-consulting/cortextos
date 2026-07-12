@@ -17,6 +17,7 @@ import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
+import { formatTaskRow, taskTableHeader } from './task-table.js';
 import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, deleteKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
@@ -384,18 +385,13 @@ busCommand
     const STATUS_ICON: Record<string, string> = { pending: '○', in_progress: '●', blocked: '◑', completed: '✓', done: '✓', cancelled: '✗' };
 
     console.log(`\n  Tasks (${tasks.length})\n`);
-    const header = '  Status  Pri  ID                        Assignee         Title';
+    const header = taskTableHeader();
     const separator = '  ' + '-'.repeat(header.length - 2);
     console.log(header);
     console.log(separator);
 
     for (const t of tasks) {
-      const statusIcon = (STATUS_ICON[t.status] || '?').padEnd(8);
-      const priIcon = (PRIORITY_ICON[t.priority] || '·').padEnd(5);
-      const id = t.id.substring(0, 26).padEnd(26);
-      const assignee = (t.assigned_to || '-').substring(0, 16).padEnd(17);
-      const title = t.title.substring(0, 50);
-      console.log(`  ${statusIcon}${priIcon}${id}${assignee}${title}`);
+      console.log(formatTaskRow(t, PRIORITY_ICON[t.priority] || '·'));
     }
     console.log('');
   });
