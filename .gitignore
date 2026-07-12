@@ -60,3 +60,4 @@ dashboard/test-*.py
 !community/agents/research-agent/
 !community/agents/research-agent/**
 knowledge-base/models/
+.vitest-report.json
