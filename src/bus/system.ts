@@ -12,7 +12,11 @@ export interface AutoCommitReport {
   // 'failed' means: candidate changes existed but nothing could be staged.
   // Previously that case returned 'nothing_to_stage', which reads as success —
   // that conflation is what let the staging bug hide for months.
-  status: 'staged' | 'committed' | 'clean' | 'nothing_to_stage' | 'dry_run' | 'failed';
+  // 'committed_partial': the commit succeeded but blocked[] is NON-EMPTY, so the
+  // snapshot is incomplete. A partial snapshot reporting 'committed' is a success
+  // badge on an unfinished job — the same inversion as a stale bundle re-shipped
+  // as fresh. Callers must be able to tell the two apart without reading blocked[].
+  status: 'staged' | 'committed' | 'committed_partial' | 'clean' | 'nothing_to_stage' | 'dry_run' | 'failed';
   staged: string[];
   blocked: string[];
   diff_stat?: string;
@@ -66,22 +70,128 @@ const EXCLUDED_DIR_PREFIXES = [
 // input and reports success is the failure mode auto-commit already had once.
 // Each alternative below requires an actual secret-shaped VALUE, not a word.
 // Literal key shapes are case-SENSITIVE by definition (AIza…, AKIA…, sk-…).
+// Vendor shapes are never prefixed, so `\b` would in fact serve here; this spells
+// the same intent explicitly. The REAL `\b` defect is on the ASSIGNMENT key below,
+// where the guard is simply ABSENT — `\bTOKEN` can never fire inside `BOT_TOKEN`
+// because `_` is a word character, so no boundary exists between `_` and `T`.
+// Measured 2026-07-10: a mutation of THIS constant left the suite green, which is
+// how I learned it was not the line doing the work. The isolating case is
+// `xxxpassword=abc123def456`, which only the assignment key can catch.
+const NOT_IDENT_BEFORE = '(?:^|[^A-Za-z0-9_])';
+
+// A Telegram bot token is <bot_id>:<35-char secret>. It carries NO vendor prefix
+// and it is not an assignment, so none of the other patterns can see it. This is
+// the exact shape that reached a MEMORY.md on 2026-07-09.
+const BARE_TELEGRAM_TOKEN = new RegExp(
+  `${NOT_IDENT_BEFORE}\\d{6,12}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])`,
+);
+
 const CREDENTIAL_KEY_SHAPES = new RegExp(
   [
-    'AIza[0-9A-Za-z_\\-]{35}',    // Google API key
-    '\\bsk-[A-Za-z0-9]{20,}',     // OpenAI-style key
-    '\\bghp_[A-Za-z0-9]{20,}',    // GitHub PAT
-    '\\bxoxb-[0-9A-Za-z-]{10,}',  // Slack bot token
-    '\\bAKIA[0-9A-Z]{16}\\b',     // AWS access key id
+    'AIza[0-9A-Za-z_\\-]{35}',                        // Google API key
+    `${NOT_IDENT_BEFORE}sk-[A-Za-z0-9]{20,}`,         // OpenAI-style key
+    `${NOT_IDENT_BEFORE}github_pat_[A-Za-z0-9_]{20,}`, // GitHub fine-grained PAT
+    `${NOT_IDENT_BEFORE}ghp_[A-Za-z0-9]{20,}`,        // GitHub classic PAT
+    `${NOT_IDENT_BEFORE}xoxb-[0-9A-Za-z-]{10,}`,      // Slack bot token
+    `${NOT_IDENT_BEFORE}AKIA[0-9A-Z]{16}(?![A-Z0-9])`, // AWS access key id
+    // A JWT is DOTTED, and looksLikeSecretValue() excuses dotted values as
+    // property access. It must be caught as a shape or it slips that exemption.
+    `${NOT_IDENT_BEFORE}eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}`,
+    BARE_TELEGRAM_TOKEN.source,                        // Telegram bot token
   ].join('|'),
 );
 
-// An assignment carrying an opaque value: token=…, api_key: "…", SECRET=…
-// The {6,} floor is measured, not guessed: across all 54 agent memory files a
-// floor of 4 false-positives on the prose "UPDATE password=NULL", while 6 gives
-// zero false positives and still blocks a short real value like token=abc123.
-const CREDENTIAL_ASSIGNMENT =
-  /\b(?:token|api[_-]?key|password|secret)\s*[=:]\s*["']?[A-Za-z0-9_\-]{6,}/i;
+// An assignment carrying an opaque value: token=…, api_key: "…", BOT_TOKEN=…
+//
+// THE KEY IS NOT THE DISCRIMINATOR. THE VALUE IS.
+// The old pattern gated on `\b<key>\s*[=:]\s*<6 word chars>`, which is satisfied
+// by ordinary English. Measured 2026-07-10, all three BLOCKED on the live screen:
+//     "The bot token = single point of failure"     -> token = single
+//     "Status of the token: REVOKED as of ..."      -> token: REVOKED
+//     "Treat the secret = permanent once ..."       -> secret = permanent
+// A screen that cannot tell a credential from PROSE ABOUT a credential drops
+// exactly the files that document the incident it exists to prevent.
+//
+// So: the key gets LOOSER (any identifier prefix — BOT_TOKEN, GITHUB_TOKEN,
+// xxxpassword), and the VALUE must look like a secret rather than like a word.
+const ASSIGNMENT_CANDIDATE =
+  /(?:token|api[_-]?key|passwd|password|secret)\s*[=:]\s*(?:"([^"\r\n]{1,256})"|'([^'\r\n]{1,256})'|([A-Za-z0-9_\-./+:]{1,256}))/gi;
+
+/**
+ * Does this assigned value look like a secret, as opposed to a WORD or a CODE
+ * REFERENCE?
+ *
+ * The corpus that defines this function is not hypothetical. It is
+ * memory/phase2-diffs/8719612.patch — a TypeScript lexer diff that the old
+ * screen ate on 2026-06-02 and that nobody missed for three weeks, because the
+ * status said "committed". It matched on `token: string`, `token: process…`,
+ * `token = parsed…`. Its three sibling .patch files, larger and tracked, matched
+ * nothing. Content was the only discriminator. So the false positives that
+ * matter are not prose about secrets — they are ORDINARY SOURCE CODE containing
+ * the word `token`. Any agent committing a diff, a grammar, a tokeniser, a JWT
+ * helper or an OAuth snippet loses that file silently.
+ *
+ * Rules, in order:
+ *   - a vendor or bare-token SHAPE is a secret whatever its length     -> block
+ *   - a value containing `.` or `/` is a property access, module path
+ *     or filesystem path (`crypto.randomBytes`, `process.env.KEY`)     -> stage
+ *   - otherwise it must carry BOTH a letter and a digit, at >=6 chars   -> block
+ *
+ * The digit is what saves `string`, `parsed`, `process`, `single`, `REVOKED`,
+ * `permanent` — every value the old screen actually ate, none of which has one.
+ *
+ * STATED LIMITATIONS, because an unstated one is worse than a stated one:
+ *   - an all-alphabetic secret stages, short or long (`password = letmein`,
+ *     `secret = correcthorsebatterystaple`);
+ *   - a digit-bearing IDENTIFIER blocks (`const token = sha256Hash`), a false
+ *     positive shared with `token=abc123`, which this repo has always required
+ *     to block. The two are indistinguishable by content and a length floor
+ *     cannot separate them — raising it to 12 to spare `sha256Hash` unblocks
+ *     `token=abc123`. Measured: it broke two existing tests.
+ * Every credential this fleet actually handles — Telegram, Google, GitHub, AWS,
+ * Slack, JWT, bcrypt, apr1 — is caught by its own SHAPE rule above and does not
+ * depend on this heuristic at all.
+ */
+export function looksLikeSecretValue(value: string): boolean {
+  // A vendor/bare-token shape is a secret regardless of length or charset.
+  // Checked FIRST, because a JWT is dotted and would be excused as a path below.
+  if (new RegExp(CREDENTIAL_KEY_SHAPES.source).test(value)) return true;
+
+  // Interpolation, placeholder, or redaction marker — never a literal secret:
+  //   "${GEMINI_API_KEY:-}"  shell/CI expansion   (memory/phase2-diffs/a89cee2.patch:372)
+  //   "<REDACTED>"           deliberate redaction, must stay committable
+  // Loosening the key so `GEMINI_API_KEY=` matches is what surfaced these; the
+  // value side has to know a reference from a literal.
+  if (/[$<>{}]/.test(value)) return false;
+
+  // Property access, module path, or file path -> a reference, not a literal.
+  //   crypto.randomBytes · process.env.OPENAI_API_KEY · req.body.password
+  if (/[./]/.test(value)) return false;
+
+  // THE DIGIT IS THE DISCRIMINATOR, NOT THE LENGTH.
+  // The values the old screen ate are English words and bare identifiers —
+  // `string`, `parsed`, `process`, `single`, `REVOKED`, `permanent` — and not one
+  // of them carries a digit. The values it must catch — `abc123`, `abc123def456` —
+  // all do. The pre-existing {6,} floor is kept, so `token=abc123` still blocks
+  // exactly as tests/unit/bus/system.test.ts has always asserted.
+  //
+  // A length floor CANNOT do this job: raising it to 12 to spare an invented
+  // `sha256Hash` silently unblocks `token=abc123`. Measured 2026-07-10 — it broke
+  // two existing tests, which is the only reason I found out.
+  const hasAlpha = /[A-Za-z]/.test(value);
+  const hasDigit = /[0-9]/.test(value);
+  return hasAlpha && hasDigit && value.length >= 6;
+}
+
+function hasCredentialAssignment(content: string): boolean {
+  ASSIGNMENT_CANDIDATE.lastIndex = 0; // /g regexes carry state between calls
+  let m: RegExpExecArray | null;
+  while ((m = ASSIGNMENT_CANDIDATE.exec(content)) !== null) {
+    const value = m[1] ?? m[2] ?? m[3] ?? '';
+    if (looksLikeSecretValue(value)) return true;
+  }
+  return false;
+}
 
 // htpasswd / basicAuth hashes. A DIFFERENT shape entirely: no `key=` prefix and
 // no vendor prefix, so neither of the patterns above can see it. Measured
@@ -96,15 +206,56 @@ const CREDENTIAL_ASSIGNMENT =
 const CREDENTIAL_HTPASSWD =
   /\$apr1\$[A-Za-z0-9./]{6,}|\$2[aby]\$\d{2}\$[A-Za-z0-9./]{20,}/;
 
-function hasCredential(content: string): boolean {
+export function hasCredential(content: string): boolean {
   return (
     CREDENTIAL_KEY_SHAPES.test(content) ||
-    CREDENTIAL_ASSIGNMENT.test(content) ||
+    hasCredentialAssignment(content) ||
     CREDENTIAL_HTPASSWD.test(content)
   );
 }
 
-const SCRIPT_EXTENSIONS = new Set(['.sh', '.py', '.js']);
+/**
+ * Can this file's bytes be screened at all?
+ *
+ * Classify by DECODABILITY, never by extension. An extension blocklist is a
+ * proxy that always lags the thing it proxies: it needs .webp, .heic, .avif,
+ * .odt, .parquet appended forever, and it still mis-files a cleartext PDF as
+ * unscreenable when the regexes read it perfectly well.
+ *
+ * Measured 2026-07-10 against the live screen:
+ *   PDF, secret in cleartext        -> regexes SAW it  (so PDFs are screenable)
+ *   PDF, secret DEFLATE-compressed  -> regexes saw nothing, file staged
+ *   PNG, secret in a tEXt chunk     -> depends purely on the bytes around it
+ *
+ * So binaryness was never the property that mattered. ENCODING is. A file whose
+ * bytes do not decode as text cannot be meaningfully screened, and staging it
+ * with a clean bill of health is the same success-badge inversion as reporting
+ * "committed" over a non-empty blocked[].
+ */
+export function isUnscreenableBinary(buf: Buffer): boolean {
+  const n = Math.min(buf.length, 8192);
+  if (n === 0) return false;
+  for (let i = 0; i < n; i++) {
+    if (buf[i] === 0) return true; // a NUL byte is never text
+  }
+  const decoded = buf.subarray(0, n).toString('utf-8');
+  let replacements = 0;
+  for (const ch of decoded) {
+    if (ch === '�') replacements++;
+  }
+  return decoded.length > 0 && replacements / decoded.length > 0.02;
+}
+
+// RETIRED 2026-07-10. `.sh`, `.py` and `.js` were exempted from the credential
+// check entirely (old system.ts:256 and :325), so a .md holding
+// `password=abc123def456` was blocked while a .py holding THE SAME BYTES was
+// staged. Scripts are the likeliest place on this box for a hardcoded
+// credential. This was a SCOPE gap; no regex could have closed it.
+//
+// The exemption existed because source code trips the assignment pattern
+// (`token: string`). That is now handled where it belongs — in
+// looksLikeSecretValue() — so the scope fix and the value fix must ship
+// together. Shipping scope without value would block most scripts on the fleet.
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
@@ -224,10 +375,27 @@ export function autoCommit(projectDir: string, dryRun: boolean = false, agentPat
       continue;
     }
 
-    // Block binary/temp extensions
-    const ext = extname(file);
+    // screenFile() below carries a comment claiming it holds "the same rules the
+    // shared-tree autoCommit applies, in one place so the two paths cannot drift
+    // apart." They HAD drifted, and the drift was precisely the rule added after a
+    // 5.5MB pg_dump of the live Odoo tenant was committed on 2026-07-09:
+    //   - this path never consulted DATA_DUMP_EXTENSIONS at all;
+    //   - it called extname() without .toLowerCase(), so `.DUMP` walked past the
+    //     binary gate too — the same bug wearing a different case.
+    // The agent-repo path routes through screenFile() and so got the 07-09 fix.
+    // This one never had it. Fixed the instance, left the class open.
+    //
+    // Decodability does NOT subsume this rule and must not be thought to: a pg_dump
+    // decodes as perfectly clean text, contains no credential, and is every customer
+    // record we hold. "Can I read it?" and "does this belong in a snapshot?" are
+    // different questions, and only the second one stops a dump.
+    const ext = extname(file).toLowerCase();
     if (BINARY_TEMP_EXTENSIONS.has(ext)) {
       blocked.push(`${file}:binary_or_temp`);
+      continue;
+    }
+    if (DATA_DUMP_EXTENSIONS.has(ext)) {
+      blocked.push(`${file}:data_dump`);
       continue;
     }
 
@@ -252,19 +420,26 @@ export function autoCommit(projectDir: string, dryRun: boolean = false, agentPat
       }
     }
 
-    // Check credential patterns in non-script file content
-    if (existsSync(fullPath) && !SCRIPT_EXTENSIONS.has(ext)) {
+    // Screen EVERY file's content — scripts included. Classify by decodability,
+    // and never let an unreadable file through wearing a clean bill of health.
+    if (existsSync(fullPath)) {
       try {
         const stat = statSync(fullPath);
         if (stat.isFile() && stat.size < MAX_FILE_SIZE) {
-          const content = readFileSync(fullPath, 'utf-8');
-          if (hasCredential(content)) {
+          const buf = readFileSync(fullPath);
+          if (isUnscreenableBinary(buf)) {
+            blocked.push(`${file}:unscreenable_binary`);
+            continue;
+          }
+          if (hasCredential(buf.toString('utf-8'))) {
             blocked.push(`${file}:credential_pattern_detected`);
             continue;
           }
         }
       } catch {
-        // Binary files may throw on utf-8 read - skip credential check
+        // A file we cannot even read is a file we cannot screen. Name it.
+        blocked.push(`${file}:unreadable`);
+        continue;
       }
     }
 
@@ -322,13 +497,15 @@ export function screenFile(fullPath: string, relPath: string): string | null {
     const stat = statSync(fullPath);
     if (!stat.isFile()) return null;
     if (stat.size > MAX_FILE_SIZE) return 'over_10MB';
-    if (!SCRIPT_EXTENSIONS.has(ext) && stat.size < MAX_FILE_SIZE) {
-      if (hasCredential(readFileSync(fullPath, 'utf-8'))) {
-        return 'credential_pattern_detected';
-      }
+    if (stat.size < MAX_FILE_SIZE) {
+      const buf = readFileSync(fullPath);
+      if (isUnscreenableBinary(buf)) return 'unscreenable_binary';
+      if (hasCredential(buf.toString('utf-8'))) return 'credential_pattern_detected';
     }
   } catch {
-    // unreadable/binary — fall through and allow; the ext + size gates already ran
+    // A file we cannot read is a file we cannot screen. Refusing to stage it is
+    // the only honest answer; "fall through and allow" reported a check it never ran.
+    return 'unreadable';
   }
   return null;
 }
@@ -459,7 +636,12 @@ export function autoCommitAgentRepo(agentDir: string, dryRun: boolean = false): 
   execFileSync('git', ['commit', '-q', '-m', msg], { cwd: agentDir, stdio: 'pipe' });
   const commit = execSync('git rev-parse --short HEAD', { cwd: agentDir, encoding: 'utf-8' }).trim();
 
-  return { status: 'committed', staged, blocked, diff_stat: diffStat, commit, repo: agentDir };
+  // A commit that left files behind is NOT a completed snapshot. Reporting
+  // 'committed' over a non-empty blocked[] is why memory/phase2-diffs/8719612.patch
+  // went missing on 2026-07-09 and nobody noticed for three weeks: the badge said
+  // the job was done. Same inversion as a stale bundle re-shipped as fresh.
+  const status = blocked.length > 0 ? 'committed_partial' : 'committed';
+  return { status, staged, blocked, diff_stat: diffStat, commit, repo: agentDir };
 }
 
 /**
