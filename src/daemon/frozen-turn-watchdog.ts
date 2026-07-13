@@ -366,9 +366,12 @@ export class FrozenTurnWatchdog {
    * Latest moment the agent demonstrably processed something (ms), via:
    *   (a) heartbeat.json.last_heartbeat with the agent's OWN status (not the
    *       FastChecker idle-stamp), OR
-   *   (b) the newest analytics event row.
-   * The idle-stamp advances (a)'s timestamp but with a `[watchdog]` status, so
-   * it is excluded; it never writes an event, so (b) stays clean.
+   *   (b) the newest AGENT-AUTHORED analytics event row (observer rows —
+   *       watchdog_*, `observer: true` — are excluded; see below).
+   * The idle-stamp advances (a)'s timestamp but with a `[watchdog]` status,
+   * so it is excluded. Arm (a) additionally relies on observer events not
+   * bumping last_heartbeat (LogEventOptions.observer) — a bump that merely
+   * preserves the agent's old status is not attributable to the agent.
    */
   private readLastRealResponse(agent: string): number {
     let last = 0;
@@ -388,11 +391,20 @@ export class FrozenTurnWatchdog {
       }
     }
 
-    // (b) newest analytics event — events are appended chronologically, so the
-    // last non-empty line of today's (and, near midnight, yesterday's) file is
-    // the latest. Note: logEvent() also bumps heartbeat.json.last_heartbeat,
-    // but the status is left intact, so (a) already captures agent-written
-    // statuses; (b) covers the case where the only signal is an event row.
+    // (b) newest analytics event row WRITTEN BY THE AGENT'S OWN PROCESS.
+    // Events are appended chronologically, so scan each file from the end —
+    // but skip rows that were written ABOUT the agent by an observer:
+    //   - rows stamped `observer: true` (logObserverEvent — watchdog,
+    //     inbound-telegram logger), and
+    //   - rows named watchdog_* regardless of stamp, covering rows written
+    //     before the observer flag existed.
+    // Before this filter existed, the watchdog's own watchdog_auto_restart
+    // row was the newest line at every verify pass, so the watchdog read its
+    // own breadcrumb as the agent's pulse and reported recovery_ok against
+    // still-frozen agents; the same logEvent also bumped last_heartbeat with
+    // the agent's own status preserved, poisoning arm (a). Observer events
+    // no longer bump the heartbeat (see LogEventOptions.observer), so both
+    // arms now only see agent-authored signals.
     const org = this.opt.resolveOrg(agent);
     const analyticsBase = org ? join(this.opt.ctxRoot, 'orgs', org, 'analytics') : join(this.opt.ctxRoot, 'analytics');
     const eventsDir = join(analyticsBase, 'events', agent);
@@ -402,13 +414,20 @@ export class FrozenTurnWatchdog {
       try {
         const raw = readFileSync(file, 'utf-8');
         const lines = raw.split('\n').filter((l) => l.trim());
-        const lastLine = lines[lines.length - 1];
-        if (lastLine) {
-          const row = JSON.parse(lastLine) as { timestamp?: string };
+        for (let i = lines.length - 1; i >= 0; i--) {
+          let row: { timestamp?: string; event?: string; observer?: boolean };
+          try {
+            row = JSON.parse(lines[i]) as { timestamp?: string; event?: string; observer?: boolean };
+          } catch {
+            continue; // malformed line — keep scanning for an older valid row
+          }
+          if (row.observer === true) continue;
+          if (typeof row.event === 'string' && row.event.startsWith('watchdog_')) continue;
           if (row.timestamp) {
             const ms = Date.parse(row.timestamp);
             if (!Number.isNaN(ms)) last = Math.max(last, ms);
           }
+          break; // newest agent-authored row found for this file
         }
       } catch {
         /* ignore */

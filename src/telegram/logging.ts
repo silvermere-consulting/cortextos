@@ -6,7 +6,7 @@
 
 import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
-import { logEvent } from '../bus/event.js';
+import { logObserverEvent } from '../bus/event.js';
 import type { BusPaths, TelegramMessage } from '../types/index.js';
 
 /**
@@ -106,7 +106,11 @@ export function recordInboundTelegram(
 
   const hasMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
   try {
-    logEvent(paths, agentName, org, 'message', 'telegram_received', 'info', {
+    // Observer variant: this is the DAEMON recording that a message ARRIVED
+    // for the agent — delivery, not handling. It must not bump the agent's
+    // heartbeat nor read as the agent's pulse: a frozen agent that keeps
+    // receiving messages would otherwise look alive to liveness readers.
+    logObserverEvent(paths, agentName, org, 'message', 'telegram_received', 'info', {
       chat_id: String(msg.chat?.id ?? ''),
       message_id: msg.message_id,
       from_id: msg.from?.id,

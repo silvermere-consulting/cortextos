@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { FrozenTurnWatchdog } from '../../../src/daemon/frozen-turn-watchdog';
+import { logEvent } from '../../../src/bus/event';
+import type { BusPaths } from '../../../src/types';
 
 /**
  * Acceptance criteria from the spec (§8):
@@ -77,8 +79,18 @@ interface Harness {
   setNow: (ms: number) => void;
 }
 
-function makeWatchdog(running: string[] = [AGENT]): Harness {
-  let nowMs = T0;
+/** Minimal BusPaths pointing at the temp ctxRoot — only the fields logEvent
+ *  touches (analyticsDir for the row, stateDir for the heartbeat refresh),
+ *  laid out exactly where the watchdog's on-disk readers look. */
+function realPaths(agent: string): BusPaths {
+  return {
+    analyticsDir: join(ctxRoot, 'orgs', ORG, 'analytics'),
+    stateDir: join(ctxRoot, 'state', agent),
+  } as BusPaths;
+}
+
+function makeWatchdog(running: string[] = [AGENT], opts: { realEvents?: boolean; startNow?: number } = {}): Harness {
+  let nowMs = opts.startNow ?? T0;
   const restarts: string[] = [];
   const events: Array<{ event: string; meta: Record<string, unknown> }> = [];
   const escalations: Array<{ agent: string; attempt: number }> = [];
@@ -87,7 +99,20 @@ function makeWatchdog(running: string[] = [AGENT]): Harness {
     getRunningAgents: () => running,
     resolveOrg: () => ORG,
     restartAgent: async (a) => { restarts.push(a); },
-    recordEvent: ({ event, meta }) => { events.push({ event, meta }); },
+    recordEvent: ({ agent, org, category, event, severity, meta }) => {
+      events.push({ event, meta });
+      // realEvents mirrors the daemon wiring (index.ts): the watchdog's
+      // events REALLY land in the target's analytics JSONL and REALLY hit
+      // logEvent's heartbeat side-effect path. The spy-only harness this
+      // replaces made the 2026-07-13 self-proof bug structurally
+      // unreachable: 8/8 green while production read its own breadcrumbs.
+      if (opts.realEvents) {
+        // Same call logObserverEvent delegates to. Written as plain logEvent
+        // + options so this harness stays a behavioural (not compile-time)
+        // gate against the pre-fix code, whose logEvent ignores the options.
+        logEvent(realPaths(agent), agent, org, category, event, severity, meta, { observer: true });
+      }
+    },
     escalate: (d) => { escalations.push({ agent: d.agent, attempt: d.attempt }); },
     logger: () => {},
     now: () => nowMs,
@@ -235,5 +260,85 @@ describe('FrozenTurnWatchdog — recovery ladder + loop-safety', () => {
     await h.wd.tick();
     expect(h.restarts.length).toBe(1); // no further restart
     expect(h.events.some((e) => e.event === 'watchdog_recovery_ok')).toBe(true);
+  });
+});
+
+describe('FrozenTurnWatchdog — observer-event pollution (2026-07-13 both-arms fix)', () => {
+  // These tests wire recordEvent to the REAL logEvent against the temp
+  // analytics dir, exactly as the daemon does. The previous spy-only harness
+  // never wrote the JSONL row nor touched heartbeat.json, so the watchdog
+  // reading its own watchdog_auto_restart breadcrumb as the agent's pulse —
+  // and passing every recovery verify against a still-frozen agent — was
+  // structurally unreachable here: 8/8 green with the bug live in production.
+  //
+  // Real logEvent stamps rows with the REAL wall clock into TODAY's real
+  // file, so these tests run the injected clock at Date.now() rather than
+  // the fixed T0 the older tests use — otherwise the watchdog would be
+  // reading a different day's file and the pollution would be invisible,
+  // which is precisely the blindness this block exists to end.
+
+  it('arm (b): does not read its own watchdog event row as the agent pulse — verify FAILS while the agent is still silent', async () => {
+    const N0 = Date.now();
+    writeFires(AGENT, [N0 - 10 * MIN, N0 - 5 * MIN]);
+    writeHeartbeat(AGENT, N0 - 3 * 60 * MIN, '[watchdog] idle'); // arm (a) excluded by prefix — this test isolates arm (b)
+    const h = makeWatchdog([AGENT], { realEvents: true, startNow: N0 });
+
+    await h.wd.tick(); // rung 1 restart; REAL watchdog_auto_restart row now in today's JSONL
+    expect(h.restarts.length).toBe(1);
+
+    // Agent stays a brick. The ONLY new signal since the fires is the
+    // watchdog's own row. Verify must NOT read it as recovery.
+    h.setNow(N0 + 2_000); // past verify window
+    await h.wd.tick();
+
+    expect(h.events.some((e) => e.event === 'watchdog_recovery_ok')).toBe(false);
+    expect(h.events.some((e) => e.event === 'watchdog_recovery_failed')).toBe(true);
+    expect(h.restarts.length).toBe(2); // ladder proceeded to rung 2
+    expect(existsSync(join(ctxRoot, 'state', AGENT, '.force-fresh'))).toBe(true); // rung 2 = cold
+  });
+
+  it('arm (a): recording a watchdog event does not bump the frozen target heartbeat', async () => {
+    const N0 = Date.now();
+    const STALE = N0 - 3 * 60 * MIN;
+    writeFires(AGENT, [N0 - 10 * MIN, N0 - 5 * MIN]);
+    // The agent's OWN status (no [watchdog] prefix): the arm-(a) guard trusts
+    // this status, so a bump that preserves it forges a fresh "real response".
+    writeHeartbeat(AGENT, STALE, 'healthy — working on conformance batch');
+    const h = makeWatchdog([AGENT], { realEvents: true, startNow: N0 });
+
+    await h.wd.tick(); // rung 1 restart + real observer event
+    expect(h.restarts.length).toBe(1);
+
+    // The direct arm-(a) probe: the watchdog's own logEvent must NOT have
+    // refreshed last_heartbeat (pre-fix it did, preserving the own-status
+    // string that walks through the idle-prefix guard).
+    const hb = JSON.parse(readFileSync(join(ctxRoot, 'state', AGENT, 'heartbeat.json'), 'utf-8'));
+    expect(hb.last_heartbeat).toBe(iso(STALE));
+
+    h.setNow(N0 + 2_000);
+    await h.wd.tick();
+    expect(h.events.some((e) => e.event === 'watchdog_recovery_ok')).toBe(false);
+    expect(h.events.some((e) => e.event === 'watchdog_recovery_failed')).toBe(true);
+  });
+
+  it('control: a genuinely recovered agent (real agent-authored event) still yields recovery_ok', async () => {
+    // Known-negative for the filter itself: if the observer filter over-skips
+    // agent-authored rows, THIS goes red while the two above stay green.
+    const N0 = Date.now();
+    writeFires(AGENT, [N0 - 10 * MIN, N0 - 5 * MIN]);
+    writeHeartbeat(AGENT, N0 - 3 * 60 * MIN, '[watchdog] idle');
+    const h = makeWatchdog([AGENT], { realEvents: true, startNow: N0 });
+
+    await h.wd.tick();
+    expect(h.restarts.length).toBe(1);
+
+    // The fresh PTY answers: an agent-authored event (NO observer flag),
+    // appended AFTER the watchdog's own row in the same real file.
+    logEvent(realPaths(AGENT), AGENT, ORG, 'action', 'session_start', 'info', {});
+
+    h.setNow(N0 + 2_000);
+    await h.wd.tick();
+    expect(h.events.some((e) => e.event === 'watchdog_recovery_ok')).toBe(true);
+    expect(h.restarts.length).toBe(1); // no second restart
   });
 });
