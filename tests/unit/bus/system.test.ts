@@ -521,6 +521,24 @@ describe('Bus System', () => {
       expect(report.blocked_text).toHaveLength(0); // healthy steady state is VISIBLE as empty, not inferred from status
     });
 
+    it('FLEET-EDIT CASE (analyst acceptance, 2026-07-14): a bootstrap file MODIFIED after a prior commit is picked up by the NEXT auto-commit — no hand-commit needed', () => {
+      // Live proof this encodes: the noon add-cron class-fix propagated to 5 fleet
+      // AGENTS.md files and left 3 agents silently drifted, because zone 2 was not
+      // yet in the allowlist. A fleet-wide doc edit must never depend on N agents
+      // each remembering a manual git add.
+      writeFileSync(join(agentDir, 'AGENTS.md'), 'original bootstrap text');
+      const first = autoCommitAgentRepo(agentDir, false);
+      expect(first.status).toBe('committed');
+      expect(first.staged).toContain('AGENTS.md');
+
+      // The fleet-wide edit arrives (another agent's propagation script writes the file).
+      writeFileSync(join(agentDir, 'AGENTS.md'), 'corrected bootstrap text — propagated fleet-wide');
+      const second = autoCommitAgentRepo(agentDir, false);
+      expect(second.status).toBe('committed');
+      expect(second.staged).toContain('AGENTS.md'); // picked up as a MODIFICATION, not only on creation
+      expect(second.blocked_text).toHaveLength(0);
+    });
+
     it('reports its denominator: covered_paths present, absent_paths named (never silently skipped)', () => {
       writeFileSync(join(agentDir, 'MEMORY.md'), 'x');
       const report = autoCommitAgentRepo(agentDir, false);
