@@ -303,6 +303,29 @@ export class AgentManager {
     // this, so it never clears a marker for an agent meant to stay down.)
     this.clearUserMarkers(name);
 
+    // User-timezone + day-window from org context.json. 2026-07-15 deploy fix:
+    // the daemon HAND-BUILDS this env and does NOT call resolveEnv(), so the
+    // context.json read that populates these fields (added to resolveEnv for the
+    // user-tz feature) never ran for daemon-spawned agents — CTX_USER_TIMEZONE
+    // injected empty and the whole arm silently no-op'd (verified absent on all
+    // 8 fresh spawns). Read them HERE, where the agent env is actually built,
+    // mirroring how agent-pty reads context.json for the orchestrator. Falls back
+    // to undefined (→ agent tz, pre-fix behaviour) on any read failure.
+    let userTimezone: string | undefined;
+    let userTimezoneUntil: string | undefined;
+    let dayModeStart: string | undefined;
+    let dayModeEnd: string | undefined;
+    try {
+      const ctxPath = join(this.frameworkRoot, 'orgs', resolvedOrg, 'context.json');
+      if (existsSync(ctxPath)) {
+        const ctx = JSON.parse(stripBom(readFileSync(ctxPath, 'utf-8')));
+        userTimezone = ctx.user_timezone || undefined;
+        userTimezoneUntil = ctx.user_timezone_until || undefined;
+        dayModeStart = ctx.day_mode_start || undefined;
+        dayModeEnd = ctx.day_mode_end || undefined;
+      }
+    } catch { /* leave undefined — isDayMode falls back to agent tz (pre-fix behaviour) */ }
+
     const env: CtxEnv = {
       instanceId: this.instanceId,
       ctxRoot: this.ctxRoot,
@@ -311,6 +334,10 @@ export class AgentManager {
       agentDir,
       org: resolvedOrg,
       projectRoot: this.frameworkRoot,
+      userTimezone,
+      userTimezoneUntil,
+      dayModeStart,
+      dayModeEnd,
     };
 
     const paths = resolvePaths(name, this.instanceId, resolvedOrg);
