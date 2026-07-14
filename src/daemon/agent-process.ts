@@ -10,7 +10,7 @@ import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
-import { detectDayNightMode } from '../bus/heartbeat.js';
+import { detectDayNightMode, resolveUserTimezone } from '../bus/heartbeat.js';
 import { resolvePaths } from '../utils/paths.js';
 
 type LogFn = (msg: string) => void;
@@ -707,7 +707,45 @@ export class AgentProcess {
    * given agent's derived AGENTS.md Step 1 has been updated.
    */
   private isDayMode(): boolean {
-    return detectDayNightMode(this.env.timezone || this.config.timezone || 'UTC') === 'day';
+    // "Is the USER awake?" — answered in the USER's timezone, not the agents' infra
+    // clock (2026-07-14: CTX_TIMEZONE=Asia/Dubai while Steve was on UK time; the
+    // window was anchored to a clock he does not live in). resolveUserTimezone
+    // carries a dated expiry so a trip override cannot silently outlive the trip.
+    const fallback = this.env.timezone || this.config.timezone || 'UTC';
+    const resolved = resolveUserTimezone(fallback, {
+      userTimezone: this.env.userTimezone,
+      userTimezoneUntil: this.env.userTimezoneUntil,
+    });
+    this.noteUserTimezoneExpiry(resolved);
+    return detectDayNightMode(resolved.timezone, {
+      start: this.env.dayModeStart,
+      end: this.env.dayModeEnd,
+    }) === 'day';
+  }
+
+  /**
+   * Surface a user-timezone override expiry ONCE (never silently keep or silently
+   * drop a stale override). Marker-gated so repeated isDayMode() calls do not spam.
+   * Deliberately NOT logEvent(): a daemon-side write attributed to an agent bumps
+   * that agent's heartbeat (the 2026-07-13 watchdog self-proof class). Until the
+   * observer-event primitive lands (task_1783942300598), the record is the marker
+   * file + a loud daemon-log line.
+   */
+  private noteUserTimezoneExpiry(resolved: { source: string }): void {
+    if (resolved.source !== 'override-expired') return;
+    try {
+      const until = this.env.userTimezoneUntil || 'unset';
+      const markerDir = join(this.env.ctxRoot, 'state');
+      const marker = join(markerDir, `.user-tz-override-expired-${until.replace(/[^0-9A-Za-z-]/g, '')}`);
+      if (existsSync(marker)) return;
+      writeFileSync(marker, new Date().toISOString(), 'utf-8');
+      // eslint-disable-next-line no-console
+      console.error(
+        `[agent-process] CTX_USER_TIMEZONE override expired (until=${until}); ` +
+        `day/night now computed from ${this.env.timezone || this.config.timezone || 'UTC'}. ` +
+        `Update org context.json user_timezone if the user has NOT returned to the org timezone.`,
+      );
+    } catch { /* never let the expiry note break the day/night gate */ }
   }
 
   private buildStartupPrompt(): string {

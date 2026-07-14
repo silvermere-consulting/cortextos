@@ -974,6 +974,14 @@ export class CodexAppServerPTY {
       env['CTX_TIMEZONE'] = this._config.timezone;
       env['TZ'] = this._config.timezone;
     }
+    // Parity with agent-pty: the HUMAN's clock (+ dated expiry) and day window,
+    // so "is the user awake?" reasoning matches the daemon gate.
+    if (this._env.userTimezone) {
+      env['CTX_USER_TIMEZONE'] = this._env.userTimezone;
+      if (this._env.userTimezoneUntil) env['CTX_USER_TIMEZONE_UNTIL'] = this._env.userTimezoneUntil;
+    }
+    if (this._env.dayModeStart) env['CTX_DAY_MODE_START'] = this._env.dayModeStart;
+    if (this._env.dayModeEnd) env['CTX_DAY_MODE_END'] = this._env.dayModeEnd;
 
     return env;
   }

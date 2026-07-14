@@ -123,19 +123,101 @@ export function updateHeartbeat(
 
 /**
  * Detect day/night mode based on timezone.
- * Day: 8:00 - 22:00, Night: 22:00 - 8:00
+ * Default window: 08:00 - 22:00 (minute-precise when a window is passed).
+ *
+ * The window is configurable via org context.json day_mode_start/day_mode_end —
+ * fields that existed (and were displayed by get-config) but were never read by
+ * this decision until 2026-07-14: the org config asserted 06:00 while this
+ * function hardcoded 8, which is where the SOUL/SYSTEM-vs-AGENTS doc split
+ * came from. Callers answering "is the USER awake?" must pass the timezone
+ * from resolveUserTimezone(), never the agent's CTX_TIMEZONE directly.
  */
-export function detectDayNightMode(timezone: string): 'day' | 'night' {
+export function detectDayNightMode(
+  timezone: string,
+  window?: { start?: string; end?: string },
+): 'day' | 'night' {
+  const startMin = parseHhMm(window?.start) ?? 8 * 60;
+  const endMin = parseHhMm(window?.end) ?? 22 * 60;
+  let nowMin: number;
   try {
-    const now = new Date();
-    const formatted = now.toLocaleString('en-US', { timeZone: timezone, hour12: false, hour: '2-digit' });
-    const hour = parseInt(formatted, 10);
-    return (hour >= 8 && hour < 22) ? 'day' : 'night';
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone, hour12: false, hour: '2-digit', minute: '2-digit',
+    }).formatToParts(new Date());
+    const hour = parseInt(parts.find(p => p.type === 'hour')?.value ?? '', 10);
+    const minute = parseInt(parts.find(p => p.type === 'minute')?.value ?? '', 10);
+    if (Number.isNaN(hour) || Number.isNaN(minute)) throw new Error('unparseable');
+    nowMin = (hour % 24) * 60 + minute;
   } catch {
     // Fallback to UTC
-    const hour = new Date().getUTCHours();
-    return (hour >= 8 && hour < 22) ? 'day' : 'night';
+    const now = new Date();
+    nowMin = now.getUTCHours() * 60 + now.getUTCMinutes();
   }
+  return (nowMin >= startMin && nowMin < endMin) ? 'day' : 'night';
+}
+
+/** "HH:MM" (or "HH") -> minutes since midnight; undefined on malformed input. */
+function parseHhMm(value?: string): number | undefined {
+  if (!value) return undefined;
+  const m = /^(\d{1,2})(?::(\d{2}))?$/.exec(value.trim());
+  if (!m) return undefined;
+  const hh = parseInt(m[1], 10);
+  const mm = m[2] ? parseInt(m[2], 10) : 0;
+  if (hh > 24 || mm > 59) return undefined;
+  return hh * 60 + mm;
+}
+
+export interface ResolvedUserTimezone {
+  timezone: string;
+  /**
+   * override          - CTX_USER_TIMEZONE in force
+   * override-expired  - an override existed but its UNTIL date has passed (or was
+   *                     malformed) -> fell back; callers should surface this ONCE
+   * default           - no (usable) override configured
+   */
+  source: 'override' | 'override-expired' | 'default';
+}
+
+/**
+ * Resolve the timezone in which "is the USER awake?" must be answered.
+ *
+ * The user's timezone is a MUTABLE FACT, not a config constant (2026-07-14:
+ * Steve on a UK trip 12-21 Jul; a bare CTX_USER_TIMEZONE=Europe/London would be
+ * correct until the 21st and silently wrong forever after). So the override
+ * carries an optional expiry:
+ *
+ *   userTimezone      (CTX_USER_TIMEZONE)        IANA tz of the human
+ *   userTimezoneUntil (CTX_USER_TIMEZONE_UNTIL)  YYYY-MM-DD; the override is valid
+ *     THROUGH that date AS EXPERIENCED IN THE OVERRIDE TZ (the user's own calendar
+ *     day), and expires at the first midnight after it. Fail-safe by construction:
+ *     a stale override cannot outlive its date and needs no human to remember it.
+ *     A malformed date or unusable tz also falls back - never honour an override
+ *     whose end nobody can compute.
+ */
+export function resolveUserTimezone(
+  fallbackTz: string,
+  opts?: { userTimezone?: string; userTimezoneUntil?: string },
+): ResolvedUserTimezone {
+  const override = opts?.userTimezone?.trim();
+  if (!override) return { timezone: fallbackTz, source: 'default' };
+
+  // en-CA yields YYYY-MM-DD, string-comparable with the UNTIL date.
+  let todayInOverrideTz: string;
+  try {
+    todayInOverrideTz = new Date().toLocaleDateString('en-CA', { timeZone: override });
+  } catch {
+    return { timezone: fallbackTz, source: 'override-expired' }; // unusable tz string
+  }
+
+  const until = opts?.userTimezoneUntil?.trim();
+  if (until) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+      return { timezone: fallbackTz, source: 'override-expired' }; // uncomputable end
+    }
+    if (todayInOverrideTz > until) {
+      return { timezone: fallbackTz, source: 'override-expired' };
+    }
+  }
+  return { timezone: override, source: 'override' };
 }
 
 /**

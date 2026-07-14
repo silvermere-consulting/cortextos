@@ -172,6 +172,15 @@ export class AgentPTY {
     } else if (process.env.TZ) {
       ptyEnv['CTX_TIMEZONE'] = process.env.TZ;
     }
+    // CTX_USER_TIMEZONE(+_UNTIL): the HUMAN's clock, distinct from the agents' infra
+    // clock above. Injected so in-session "is the user awake?" reasoning uses the same
+    // fact the daemon gate uses (resolveUserTimezone applies the dated expiry).
+    if (this.env.userTimezone) {
+      ptyEnv['CTX_USER_TIMEZONE'] = this.env.userTimezone;
+      if (this.env.userTimezoneUntil) ptyEnv['CTX_USER_TIMEZONE_UNTIL'] = this.env.userTimezoneUntil;
+    }
+    if (this.env.dayModeStart) ptyEnv['CTX_DAY_MODE_START'] = this.env.dayModeStart;
+    if (this.env.dayModeEnd) ptyEnv['CTX_DAY_MODE_END'] = this.env.dayModeEnd;
     // CTX_ORCHESTRATOR_AGENT: read from org context.json so agents can route to orchestrator
     if (this.env.projectRoot && this.env.org) {
       try {

@@ -605,6 +605,15 @@ export interface CtxEnv {
   projectRoot: string;
   timezone?: string;
   orchestrator?: string;
+  /** IANA tz of the HUMAN the org serves (a mutable fact — may differ from `timezone`,
+   *  which is the agents' infra clock). From CTX_USER_TIMEZONE / context.json user_timezone. */
+  userTimezone?: string;
+  /** YYYY-MM-DD expiry for userTimezone: valid THROUGH this date in the override tz,
+   *  then resolution fails safe back to `timezone`. See resolveUserTimezone(). */
+  userTimezoneUntil?: string;
+  /** Day-mode window "HH:MM" bounds (org context.json day_mode_start / day_mode_end). */
+  dayModeStart?: string;
+  dayModeEnd?: string;
 }
 
 // Bus Path Types
