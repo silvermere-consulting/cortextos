@@ -702,8 +702,25 @@ busCommand
     if (opts.agentFilter !== false && env.agentName && env.org) {
       const agentDir = join(projectDir, 'orgs', env.org, 'agents', env.agentName);
       const report = autoCommitAgentRepo(agentDir, opts.dryRun ?? false);
+      // BLOCKED TEXT IS AN INCIDENT, NOT POLICY — and the alarm must not depend
+      // on any cron prompt reading `status` (measured 2026-07-14, N=2:
+      // `committed_partial` is the healthy steady state of every agent with a
+      // workspace, so a "report if failed" rule is structurally unable to fire;
+      // that silence is how an 18h-unversioned MEMORY.md went unnoticed).
+      // Named lines FIRST, then an error-severity event, then nonzero exit —
+      // three independent paths to the same alarm.
+      if (report.blocked_text.length && !opts.dryRun) {
+        for (const entry of report.blocked_text) {
+          console.error(`🔴 BLOCKED TEXT FILE (unversioned until redacted): ${entry}`);
+        }
+        const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+        logEvent(paths, env.agentName, env.org, 'error', 'autocommit_text_blocked', 'error', JSON.stringify({
+          blocked_text: report.blocked_text,
+          hint: 'redact the VALUE via the $<>{} hatch (token=<REDACTED> stages); never weaken the screen',
+        }));
+      }
       console.log(JSON.stringify(report));
-      if (report.status === 'failed') process.exitCode = 1;
+      if (report.status === 'failed' || (report.blocked_text.length > 0 && !opts.dryRun)) process.exitCode = 1;
       return;
     }
 
