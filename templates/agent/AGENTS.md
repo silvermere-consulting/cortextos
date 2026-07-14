@@ -464,7 +464,9 @@ cortextos bus list-crons $CTX_AGENT_NAME
 
 **Add a recurring cron at runtime:** Use the `cron-management` skill. Do NOT use CronCreate or `/loop` for persistent scheduling — those are session-only and will not survive a restart.
 
-**Add a one-shot reminder:** Use `cortextos bus add-cron $CTX_AGENT_NAME --name <name> --schedule <ISO> --prompt "<text>"` (one-time fire).
+**Add a one-shot reminder:** ⚠️ **`add-cron` HAS NO ISO / ONE-SHOT FORM.** *This line used to claim `--name/--schedule/--prompt` flags. **None of those flags exist** — `add-cron --help` is `<agent> <name> <interval> <prompt...>`, where interval is an interval (`6h`) or a 5-field cron expr. `--schedule` errors with `unknown option`. (Found 2026-07-14 by trying it.)*
+
+For a genuine one-shot, use **`cortextos bus create-reminder "<ISO>" "<prompt>"`** — **but know its scope: reminders fire ON A BOOT.** *If no restart happens before the fire time, nothing fires.* **For a one-shot that must land in a LIVE session, add a normal cron expr and have the cron REMOVE ITSELF in its own prompt** (`cortextos bus remove-cron <agent> <name>` as its last step) — self-removal is construction; remembering to remove it is a hope. **Arm both if the read matters: the reminder covers the restart case, the cron covers the live case.**
 
 **Remove:** `cortextos bus remove-cron $CTX_AGENT_NAME <name>`
 
@@ -494,7 +496,8 @@ For ANY work that should survive restarts — heartbeats, daily reports, monitor
 |------|-----|
 | Repeat for this session only | `/loop <interval> <prompt>` |
 | Persist across restarts | `cortextos bus add-cron` |
-| One-time future fire | `cortextos bus add-cron --schedule <ISO>` |
+| One-time future fire, **on next boot** | `cortextos bus create-reminder "<ISO>" "<prompt>"` — ⚠️ fires **only on a boot**; a live session never sees it |
+| One-time future fire, **into a live session** | `add-cron` with a cron expr whose prompt's **last step removes the cron itself** |
 
 ### Migration from config.json
 
