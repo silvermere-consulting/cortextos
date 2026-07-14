@@ -9,6 +9,10 @@ import { execSync } from 'child_process';
 import { ensureDir } from '../utils/atomic.js';
 import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
 import { collectAgentMemory, type MemorySnapshot } from './agent-memory.js';
+import {
+  appendHistory, collectSessionKeys, evaluateAllSlopes, slopeThresholdsFromEnv,
+  type SlopeVerdict,
+} from './memory-slope.js';
 
 // --- Types ---
 
@@ -52,6 +56,8 @@ export interface SystemMetrics {
   disk?: DiskMetrics;
   /** Per-agent RSS + RAM headroom (OOM monitor). Optional so old reports / non-Linux don't break consumers. */
   memory?: MemorySnapshot;
+  /** Per-agent RSS slope verdicts (leak = a SLOPE, not a LEVEL; identity-free). Optional as above. */
+  memory_slope?: SlopeVerdict[];
   /** Box-level orphaned agent-browser chrome (PPID==1). Optional so old reports / non-Linux don't break consumers. */
   orphan_browser?: OrphanBrowserMetrics;
 }
@@ -430,6 +436,18 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
   // Best-effort: zeroed snapshot on non-Linux / read failure.
   const memory = collectAgentMemory('/proc');
 
+  // Slope arm: sample into history, evaluate per-agent rise within the CURRENT
+  // process session (see memory-slope.ts — identity-free, restart-aware by
+  // construction). Best-effort: an IO failure here must never break the report.
+  let memorySlope: SlopeVerdict[] = [];
+  try {
+    if (memory.agents.length) {
+      const t = slopeThresholdsFromEnv();
+      const history = appendHistory(ctxRoot, memory, collectSessionKeys('/proc'), t);
+      memorySlope = evaluateAllSlopes(history, memory, t);
+    }
+  } catch { /* slope is additive; never fatal */ }
+
   // Box-level orphaned agent-browser chrome (PPID==1) — invisible to per-agent
   // RSS attribution, so it's the monitor blind spot. The reaper auto-kills these;
   // this line gives visibility. Best-effort: null on non-Linux / ps failure.
@@ -445,6 +463,7 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
       approvals_pending: approvalsPending,
       ...(disk ? { disk } : {}),
       ...(memory.agents.length || memory.mem_total_mb ? { memory } : {}),
+      ...(memorySlope.length ? { memory_slope: memorySlope } : {}),
       ...(orphanBrowser ? { orphan_browser: orphanBrowser } : {}),
     },
   };

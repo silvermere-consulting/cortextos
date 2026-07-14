@@ -12,7 +12,11 @@ import { selfRestart, hardRestart, autoCommit, autoCommitAgentRepo, checkGoalSta
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands, evaluateDiskAnomaly } from '../bus/metrics.js';
-import { evaluateMemoryAnomalies, memoryThresholdsFromEnv } from '../bus/agent-memory.js';
+import { evaluateMemoryAnomalies, memoryThresholdsFromEnv, collectAgentMemory, type MemorySnapshot } from '../bus/agent-memory.js';
+import {
+  appendHistory as appendMemoryHistory, collectSessionKeys, evaluateAllSlopes,
+  slopeThresholdsFromEnv, applySlopeToAnomalies, type SlopeVerdict, type MemorySlopeAnomaly,
+} from '../bus/memory-slope.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
@@ -1005,27 +1009,82 @@ busCommand
     // a distinct failure class from a frozen turn — this only FLAGS so a human
     // can right-size RAM/agents; it must never be wired to a restart.
     if (report.system.memory) {
-      const anomalies = evaluateMemoryAnomalies(report.system.memory, memoryThresholdsFromEnv());
-      if (anomalies.length) {
-        const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-        for (const a of anomalies) {
-          logEvent(paths, env.agentName, env.org, 'metric', 'anomaly_detected', a.severity, JSON.stringify({
-            kind: 'memory',
-            class: 'memory_pressure',
-            scope: a.scope,
-            tier: a.tier,
-            agent: a.agent,
-            rss_mb: a.rss_mb,
-            threshold_mb: a.threshold_mb,
-            mem_available_mb: a.mem_available_mb,
-            mem_total_mb: a.mem_total_mb,
-            available_pct: a.available_pct,
-          }));
-        }
-      }
+      emitMemoryAnomalies(env, report.system.memory, report.system.memory_slope ?? []);
     }
 
     console.log(JSON.stringify(report, null, 2));
+  });
+
+/**
+ * Shared memory-anomaly emitter — the ONLY path from a snapshot+slope to the
+ * event log, used by both collect-metrics and collect-memory-sample so the two
+ * cannot drift (the screenFile-vs-autoCommit lesson, applied prospectively).
+ *
+ * Slope semantics (identity-free — replaces the 2026-06-22 prose routing
+ * contract): warning-tier LEVEL anomalies with a FLAT same-session slope are
+ * folded to an informational memory_trend event for ANY agent; RISING slopes
+ * emit class:memory_slope for ANY agent even below every level threshold.
+ * Elevated/critical/headroom are never suppressed. Insufficient history passes
+ * level anomalies through untouched (fail toward noise, never silence).
+ */
+function emitMemoryAnomalies(
+  env: ReturnType<typeof resolveEnv>,
+  memory: MemorySnapshot,
+  verdicts: SlopeVerdict[],
+): { emitted: number; suppressed: number } {
+  const level = evaluateMemoryAnomalies(memory, memoryThresholdsFromEnv());
+  const { anomalies, suppressed_flat } = applySlopeToAnomalies(level, verdicts);
+  if (!anomalies.length && !suppressed_flat.length) return { emitted: 0, suppressed: 0 };
+  const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+  for (const a of anomalies) {
+    if (a.kind === 'memory_slope') {
+      const s = a as MemorySlopeAnomaly;
+      logEvent(paths, env.agentName, env.org, 'metric', 'anomaly_detected', s.severity, JSON.stringify({
+        kind: 'memory', class: 'memory_slope', scope: s.scope, tier: s.tier, agent: s.agent,
+        rise_mb: s.rise_mb, rate_mb_per_h: s.rate_mb_per_h, span_h: s.span_h,
+        samples: s.samples, session_key: s.session_key,
+      }));
+    } else {
+      logEvent(paths, env.agentName, env.org, 'metric', 'anomaly_detected', a.severity, JSON.stringify({
+        kind: 'memory', class: 'memory_pressure', scope: a.scope, tier: a.tier, agent: a.agent,
+        rss_mb: a.rss_mb, threshold_mb: a.threshold_mb, mem_available_mb: a.mem_available_mb,
+        mem_total_mb: a.mem_total_mb, available_pct: a.available_pct,
+      }));
+    }
+  }
+  // Suppressed-flat is folded, not hidden: an info event per agent so the
+  // nightly trend can show what the slope arm absorbed (never a silent drop).
+  for (const a of suppressed_flat) {
+    logEvent(paths, env.agentName, env.org, 'metric', 'memory_trend', 'info', JSON.stringify({
+      kind: 'memory', class: 'memory_pressure', scope: a.scope, tier: a.tier, agent: a.agent,
+      rss_mb: a.rss_mb, threshold_mb: a.threshold_mb,
+      suppressed: 'flat_baseline_same_session',
+    }));
+  }
+  return { emitted: anomalies.length, suppressed: suppressed_flat.length };
+}
+
+busCommand
+  .command('collect-memory-sample')
+  .description('Lightweight per-agent RSS sample: append history, evaluate slope (leak = slope, not level), emit anomalies. Run hourly.')
+  .action(() => {
+    const env = resolveEnv();
+    const memory = collectAgentMemory('/proc');
+    if (!memory.agents.length) {
+      console.log(JSON.stringify({ sampled: 0, note: 'no agent processes visible in /proc' }));
+      return;
+    }
+    const t = slopeThresholdsFromEnv();
+    const history = appendMemoryHistory(env.ctxRoot, memory, collectSessionKeys('/proc'), t);
+    const verdicts = evaluateAllSlopes(history, memory, t);
+    const { emitted, suppressed } = emitMemoryAnomalies(env, memory, verdicts);
+    console.log(JSON.stringify({
+      sampled: memory.agents.length,
+      history_samples: history.length,
+      verdicts,
+      anomalies_emitted: emitted,
+      suppressed_flat: suppressed,
+    }, null, 2));
   });
 
 busCommand
