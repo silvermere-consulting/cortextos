@@ -69,11 +69,19 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
     agentDir = join(projectRoot, 'agents', agentName);
   }
 
-  // Resolve timezone and orchestrator from org context.json
+  // Resolve timezone and orchestrator from org context.json.
+  // userTimezone / userTimezoneUntil: the HUMAN's clock (a mutable fact — Steve on a
+  // dated trip, 2026-07-14), distinct from `timezone` which is the agents' infra clock.
+  // "Is the user awake?" decisions must go through resolveUserTimezone(), never read
+  // CTX_TIMEZONE for that question.
   let timezone = overrides?.timezone || process.env.CTX_TIMEZONE || '';
   let orchestrator = overrides?.orchestrator || process.env.CTX_ORCHESTRATOR || '';
+  let userTimezone = overrides?.userTimezone || process.env.CTX_USER_TIMEZONE || '';
+  let userTimezoneUntil = overrides?.userTimezoneUntil || process.env.CTX_USER_TIMEZONE_UNTIL || '';
+  let dayModeStart = overrides?.dayModeStart || process.env.CTX_DAY_MODE_START || '';
+  let dayModeEnd = overrides?.dayModeEnd || process.env.CTX_DAY_MODE_END || '';
 
-  if ((!timezone || !orchestrator) && org && projectRoot) {
+  if ((!timezone || !orchestrator || !userTimezone || !dayModeStart) && org && projectRoot) {
     try {
       const contextPath = join(projectRoot, 'orgs', org, 'context.json');
       if (existsSync(contextPath)) {
@@ -83,6 +91,10 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
         const ctx = JSON.parse(stripBom(readFileSync(contextPath, 'utf-8')));
         if (!timezone && ctx.timezone) timezone = ctx.timezone;
         if (!orchestrator && ctx.orchestrator) orchestrator = ctx.orchestrator;
+        if (!userTimezone && ctx.user_timezone) userTimezone = ctx.user_timezone;
+        if (!userTimezoneUntil && ctx.user_timezone_until) userTimezoneUntil = ctx.user_timezone_until;
+        if (!dayModeStart && ctx.day_mode_start) dayModeStart = ctx.day_mode_start;
+        if (!dayModeEnd && ctx.day_mode_end) dayModeEnd = ctx.day_mode_end;
       }
     } catch { /* ignore */ }
   }
@@ -106,7 +118,10 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
     }
   }
 
-  return { instanceId, ctxRoot, frameworkRoot, agentName, agentDir, org, projectRoot, timezone, orchestrator };
+  return {
+    instanceId, ctxRoot, frameworkRoot, agentName, agentDir, org, projectRoot,
+    timezone, orchestrator, userTimezone, userTimezoneUntil, dayModeStart, dayModeEnd,
+  };
 }
 
 /**
