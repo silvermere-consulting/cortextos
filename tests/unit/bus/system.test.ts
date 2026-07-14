@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
-import { selfRestart, hardRestart, autoCommit, autoCommitAgentRepo, checkGoalStaleness, postActivity } from '../../../src/bus/system';
+import { selfRestart, hardRestart, autoCommit, autoCommitAgentRepo, checkGoalStaleness, postActivity, classifyBlockedText } from '../../../src/bus/system';
 import type { BusPaths } from '../../../src/types';
 
 function makePaths(testDir: string, agent: string = 'test-agent'): BusPaths {
@@ -540,6 +540,91 @@ describe('Bus System', () => {
       expect(logged).toContain('MEMORY.md');
       // Structurally incapable of pushing.
       expect(execSync('git remote', { cwd: agentDir, encoding: 'utf-8' }).trim()).toBe('');
+    });
+
+    // ── Three-zone allowlist (2026-07-14, task_1783990536465) ────────────────
+    // Before this, only memory/ + workspace/ + MEMORY.md were versioned and the
+    // operating definition had no history — and, because screening happens at
+    // staging, no credential screen either (the two exemptions hid each other).
+
+    it('stages the operating definition: root *.md, config.json, goals.json', () => {
+      writeFileSync(join(agentDir, 'GUARDRAILS.md'), 'red flag table');
+      writeFileSync(join(agentDir, 'config.json'), '{"timezone":"Asia/Dubai"}');
+      writeFileSync(join(agentDir, 'goals.json'), '{"goals":[]}');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.staged).toContain('GUARDRAILS.md');
+      expect(report.staged).toContain('config.json');
+      expect(report.staged).toContain('goals.json');
+    });
+
+    it('stages .claude skills and experiments (zone 3 — where the dead-token payload lived)', () => {
+      mkdirSync(join(agentDir, '.claude', 'skills', 'comms'), { recursive: true });
+      writeFileSync(join(agentDir, '.claude', 'skills', 'comms', 'SKILL.md'), 'message handling');
+      mkdirSync(join(agentDir, 'experiments'), { recursive: true });
+      writeFileSync(join(agentDir, 'experiments', 'learnings.md'), 'notes');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.staged).toContain('.claude/skills/comms/SKILL.md');
+      expect(report.staged).toContain('experiments/learnings.md');
+    });
+
+    it('an operating file with a credential-shaped value is BLOCKED and lands in blocked_text', () => {
+      writeFileSync(join(agentDir, 'GUARDRAILS.md'), 'never do token=abc123def456 again');
+      writeFileSync(join(agentDir, 'MEMORY.md'), 'clean');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.blocked.some(b => b.includes('GUARDRAILS.md'))).toBe(true);
+      expect(report.blocked_text.some(b => b.includes('GUARDRAILS.md'))).toBe(true);
+      expect(report.staged).toContain('MEMORY.md');
+    });
+
+    it('policy blocks (dumps/binaries) do NOT land in blocked_text — a blocked .png is policy, a blocked .md is an incident', () => {
+      mkdirSync(join(agentDir, 'workspace', 'snaps'), { recursive: true });
+      writeFileSync(join(agentDir, 'workspace', 'snaps', 'db.dump'), 'PGDMP fake');
+      writeFileSync(join(agentDir, 'workspace', 'note.md'), 'safe');
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.blocked.some(b => b.includes('db.dump'))).toBe(true);
+      expect(report.blocked_text).toHaveLength(0); // healthy steady state is VISIBLE as empty, not inferred from status
+    });
+
+    it('FLEET-EDIT CASE (analyst acceptance, 2026-07-14): a bootstrap file MODIFIED after a prior commit is picked up by the NEXT auto-commit — no hand-commit needed', () => {
+      // Live proof this encodes: the noon add-cron class-fix propagated to 5 fleet
+      // AGENTS.md files and left 3 agents silently drifted, because zone 2 was not
+      // yet in the allowlist. A fleet-wide doc edit must never depend on N agents
+      // each remembering a manual git add.
+      writeFileSync(join(agentDir, 'AGENTS.md'), 'original bootstrap text');
+      const first = autoCommitAgentRepo(agentDir, false);
+      expect(first.status).toBe('committed');
+      expect(first.staged).toContain('AGENTS.md');
+
+      // The fleet-wide edit arrives (another agent's propagation script writes the file).
+      writeFileSync(join(agentDir, 'AGENTS.md'), 'corrected bootstrap text — propagated fleet-wide');
+      const second = autoCommitAgentRepo(agentDir, false);
+      expect(second.status).toBe('committed');
+      expect(second.staged).toContain('AGENTS.md'); // picked up as a MODIFICATION, not only on creation
+      expect(second.blocked_text).toHaveLength(0);
+    });
+
+    it('reports its denominator: covered_paths present, absent_paths named (never silently skipped)', () => {
+      writeFileSync(join(agentDir, 'MEMORY.md'), 'x');
+      const report = autoCommitAgentRepo(agentDir, false);
+      expect(report.covered_paths).toContain('MEMORY.md');
+      expect(report.covered_paths).toContain('memory');
+      expect(report.absent_paths).toContain('GUARDRAILS.md'); // this fixture agent has none — named, not omitted
+    });
+  });
+
+  describe('classifyBlockedText', () => {
+    it('keeps credential-class entries, drops policy-class, tolerates odd shapes', () => {
+      expect(classifyBlockedText([
+        'a.md:credential_pattern_detected',
+        'b.pyc:binary_or_temp',
+        'c.dump:data_dump',
+        'd.md:some_future_reason',
+      ])).toEqual(['a.md:credential_pattern_detected', 'd.md:some_future_reason']);
+      expect(classifyBlockedText([])).toEqual([]);
     });
   });
 });

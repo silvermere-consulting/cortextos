@@ -17,8 +17,28 @@ export interface AutoCommitReport {
   // badge on an unfinished job — the same inversion as a stale bundle re-shipped
   // as fresh. Callers must be able to tell the two apart without reading blocked[].
   status: 'staged' | 'committed' | 'committed_partial' | 'clean' | 'nothing_to_stage' | 'dry_run' | 'failed';
+  /**
+   * Blocked TEXT files — every blocked entry whose reason is NOT a by-design
+   * policy block (binary_or_temp / data_dump). A BLOCKED .png IS POLICY; A
+   * BLOCKED .md IS AN INCIDENT (chief, 2026-07-14). 2026-07-13: chief's
+   * MEMORY.md sat unversioned for 18 hours inside a `committed_partial` whose
+   * blocked[] held ~120 by-design binary rows — the one line that mattered was
+   * furniture in a field that is non-empty EVERY night. Measured N=2: a
+   * perfectly healthy snapshot also reads `committed_partial` (engineer,
+   * ce15462, zero text blocks, 4 policy rows), so the status carries NO health
+   * information and "report if failed" can never fire. THIS field is the
+   * signal: empty = healthy steady state regardless of status; non-empty =
+   * someone's operating file or memory is silently unversioned RIGHT NOW.
+   * First in the struct so it is first in every serialized report.
+   */
+  blocked_text: string[];
   staged: string[];
   blocked: string[];
+  /** Allowlist paths present in this agent dir (the snapshot's DENOMINATOR — a
+   *  versioning arm that checks one file must not assert a category). */
+  covered_paths?: string[];
+  /** Allowlist paths absent in this agent dir (named, not silently skipped). */
+  absent_paths?: string[];
   diff_stat?: string;
   commit?: string;
   repo?: string;
@@ -61,6 +81,18 @@ export interface DeadGoal {
 export interface UnresolvableHandle {
   goal: string;
   handle: string;
+}
+
+/**
+ * Blocked-reason suffixes that are BY-DESIGN policy blocks: expected every
+ * night, carrying no health signal. Everything else (credential shapes, etc.)
+ * on a screened file is incident-class and lands in blocked_text.
+ */
+const POLICY_BLOCK_REASONS = new Set(['binary_or_temp', 'data_dump']);
+
+/** blocked[] entries are "<path>:<reason>"; keep only incident-class ones. */
+export function classifyBlockedText(blocked: string[]): string[] {
+  return blocked.filter(e => !POLICY_BLOCK_REASONS.has(e.slice(e.lastIndexOf(':') + 1)));
 }
 
 export interface AgentGoalStatus {
@@ -390,7 +422,7 @@ export function autoCommit(projectDir: string, dryRun: boolean = false, agentPat
   try {
     execSync('git rev-parse --is-inside-work-tree', { cwd: projectDir, stdio: 'pipe' });
   } catch {
-    return { status: 'clean', staged: [], blocked: [] };
+    return { status: 'clean', blocked_text: [], staged: [], blocked: [] };
   }
 
   // Get changed files
@@ -398,11 +430,11 @@ export function autoCommit(projectDir: string, dryRun: boolean = false, agentPat
   try {
     porcelainOutput = execSync('git status --porcelain', { cwd: projectDir, encoding: 'utf-8' });
   } catch {
-    return { status: 'clean', staged: [], blocked: [] };
+    return { status: 'clean', blocked_text: [], staged: [], blocked: [] };
   }
 
   if (!porcelainOutput.trim()) {
-    return { status: 'clean', staged: [], blocked: [] };
+    return { status: 'clean', blocked_text: [], staged: [], blocked: [] };
   }
 
   const changedFiles = porcelainOutput
@@ -517,11 +549,11 @@ export function autoCommit(projectDir: string, dryRun: boolean = false, agentPat
   }
 
   if (staged.length === 0) {
-    return { status: 'nothing_to_stage', staged: [], blocked };
+    return { status: 'nothing_to_stage', blocked_text: classifyBlockedText(blocked), staged: [], blocked };
   }
 
   if (dryRun) {
-    return { status: 'dry_run', staged, blocked };
+    return { status: 'dry_run', blocked_text: classifyBlockedText(blocked), staged, blocked };
   }
 
   // Stage safe files
@@ -543,7 +575,7 @@ export function autoCommit(projectDir: string, dryRun: boolean = false, agentPat
     // Ignore
   }
 
-  return { status: 'staged', staged, blocked, diff_stat: diffStat };
+  return { status: 'staged', blocked_text: classifyBlockedText(blocked), staged, blocked, diff_stat: diffStat };
 }
 
 /**
@@ -585,8 +617,30 @@ export function screenFile(fullPath: string, relPath: string): string | null {
  * MEMORY.md is listed explicitly: long-term memory lives at the agent-dir root,
  * NOT under memory/ (which holds the daily files), so a memory/-only scope
  * silently omits the single most important file.
+ *
+ * THREE-ZONE UNION (2026-07-14, task_1783990536465). Before this, only zone 1
+ * existed and every agent's OPERATING DEFINITION — who it is, how it boots,
+ * what it must never do — had no history at all. Worse, the coverage gaps hid
+ * each other: a file exempt from versioning was thereby exempt from the
+ * credential screen (screening happens at staging), so GUARDRAILS.md carried a
+ * credential-shaped literal for days that a first commit would have caught.
+ * Fleet redaction pre-step ran BEFORE this list grew (660 files, imported
+ * hasCredential, controls both ways, 0 flagged) so the extension cannot land
+ * as a fleet-wide silent block.
+ *   zone 1: memory/ workspace/ MEMORY.md            (the original allowlist)
+ *   zone 2: the operating definition + its data     (*.md at root, config.json, goals.json)
+ *   zone 3: .claude/ (settings + skills) + experiments/
  */
-const AGENT_REPO_PATHS = ['memory', 'workspace', 'MEMORY.md'];
+const AGENT_REPO_PATHS = [
+  // zone 1
+  'memory', 'workspace', 'MEMORY.md',
+  // zone 2 — operating definition
+  'AGENTS.md', 'CLAUDE.md', 'GOALS.md', 'GUARDRAILS.md', 'HEARTBEAT.md',
+  'IDENTITY.md', 'ONBOARDING.md', 'SOUL.md', 'SYSTEM.md', 'TOOLS.md', 'USER.md',
+  'config.json', 'goals.json',
+  // zone 3 — skills, settings, experiment learnings
+  '.claude', 'experiments',
+];
 
 /** Never let these into the snapshot repo, even via an explicit add. */
 const AGENT_REPO_EXCLUDE = [
@@ -638,12 +692,13 @@ export function ensureAgentRepo(agentDir: string): boolean {
  */
 export function autoCommitAgentRepo(agentDir: string, dryRun: boolean = false): AutoCommitReport {
   if (!ensureAgentRepo(agentDir)) {
-    return { status: 'failed', staged: [], blocked: [], reason: `agent dir not found: ${agentDir}` };
+    return { status: 'failed', blocked_text: [], staged: [], blocked: [], reason: `agent dir not found: ${agentDir}` };
   }
 
   const present = AGENT_REPO_PATHS.filter(p => existsSync(join(agentDir, p)));
+  const absent = AGENT_REPO_PATHS.filter(p => !present.includes(p));
   if (present.length === 0) {
-    return { status: 'clean', staged: [], blocked: [], repo: agentDir };
+    return { status: 'clean', blocked_text: [], staged: [], blocked: [], repo: agentDir, covered_paths: present, absent_paths: absent };
   }
 
   // Force past the agent-dir .gitignore, then inspect what actually landed.
@@ -654,7 +709,7 @@ export function autoCommitAgentRepo(agentDir: string, dryRun: boolean = false): 
 
   if (candidates.length === 0) {
     execFileSync('git', ['reset', '-q'], { cwd: agentDir, stdio: 'pipe' });
-    return { status: 'clean', staged: [], blocked: [], repo: agentDir };
+    return { status: 'clean', blocked_text: [], staged: [], blocked: [], repo: agentDir, covered_paths: present, absent_paths: absent };
   }
 
   const staged: string[] = [];
@@ -680,16 +735,19 @@ export function autoCommitAgentRepo(agentDir: string, dryRun: boolean = false): 
     execFileSync('git', ['reset', '-q'], { cwd: agentDir, stdio: 'pipe' });
     return {
       status: 'failed',
+      blocked_text: classifyBlockedText(blocked),
       staged: [],
       blocked,
       repo: agentDir,
+      covered_paths: present,
+      absent_paths: absent,
       reason: `${candidates.length} changed file(s) but 0 stageable — all screened out`,
     };
   }
 
   if (dryRun) {
     execFileSync('git', ['reset', '-q'], { cwd: agentDir, stdio: 'pipe' });
-    return { status: 'dry_run', staged, blocked, repo: agentDir };
+    return { status: 'dry_run', blocked_text: classifyBlockedText(blocked), staged, blocked, repo: agentDir, covered_paths: present, absent_paths: absent };
   }
 
   let diffStat: string | undefined;
@@ -711,7 +769,13 @@ export function autoCommitAgentRepo(agentDir: string, dryRun: boolean = false): 
   // went missing on 2026-07-09 and nobody noticed for three weeks: the badge said
   // the job was done. Same inversion as a stale bundle re-shipped as fresh.
   const status = blocked.length > 0 ? 'committed_partial' : 'committed';
-  return { status, staged, blocked, diff_stat: diffStat, commit, repo: agentDir };
+  return {
+    status,
+    blocked_text: classifyBlockedText(blocked),
+    staged, blocked,
+    covered_paths: present, absent_paths: absent,
+    diff_stat: diffStat, commit, repo: agentDir,
+  };
 }
 
 /**
