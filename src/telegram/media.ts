@@ -41,12 +41,20 @@ export function sanitizeFilename(name: string | null | undefined): string {
 }
 
 /**
- * Format a Unix timestamp as YYYYMMDD_HHmmss.
+ * Format a Unix timestamp as YYYYMMDD_HHmmssZ, always in UTC.
+ *
+ * MUST stay UTC with the explicit Z marker. This runs inside the daemon,
+ * whose environment carries no TZ — local getters here render in the HOST
+ * zone (this box: Asia/Singapore, +08) while every agent session runs
+ * CTX_TIMEZONE (+04), so a local-rendered name disagrees with every clock
+ * an agent can see, including the date itself near midnight. Names without
+ * the Z suffix predate this fix and are rendered in an unknown zone: for
+ * those files trust the mtime, not the name.
  */
 function formatDate(unixTs: number): string {
   const d = new Date(unixTs * 1000);
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}_${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
 }
 
 /**

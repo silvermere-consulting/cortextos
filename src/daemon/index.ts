@@ -6,7 +6,7 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
-import { logEvent } from '../bus/event.js';
+import { logObserverEvent } from '../bus/event.js';
 import { sendMessage } from '../bus/message.js';
 import { resolvePaths } from '../utils/paths.js';
 import { stripBom } from '../utils/strip-bom.js';
@@ -296,7 +296,11 @@ class Daemon {
       restartAgent: (agent) => am.restartAgent(agent),
       recordEvent: ({ agent, org, category, event, severity, meta }) => {
         try {
-          logEvent(resolvePaths(agent, instanceId, org || undefined), agent, org, category, event, severity, meta);
+          // MUST be the observer variant: the watchdog speaks ABOUT the agent.
+          // Plain logEvent here bumped the frozen target's heartbeat and made
+          // the watchdog's own row its "pulse" — every recovery verify then
+          // passed against a still-frozen agent (fixed 2026-07-13).
+          logObserverEvent(resolvePaths(agent, instanceId, org || undefined), agent, org, category, event, severity, meta);
         } catch { /* observational only — never disrupt the watchdog */ }
       },
       escalate: (detail) => this.escalateFrozenTurn(frameworkRoot, instanceId, detail),

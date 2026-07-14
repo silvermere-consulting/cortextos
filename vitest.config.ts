@@ -21,6 +21,8 @@ export default defineConfig({
       'dashboard/src/**/__tests__/**/*.test.ts',
       'dashboard/src/**/__tests__/**/*.test.tsx',
     ],
-    setupFiles: ['./dashboard/vitest.setup.ts'],
+    // isolate-home MUST run first: it redirects HOME to a temp dir so no
+    // suite can write into the real ~/.cortextos (see that file's header).
+    setupFiles: ['./tests/isolate-home.setup.ts', './dashboard/vitest.setup.ts'],
   },
 });

@@ -117,6 +117,21 @@ describe('processMediaMessage', () => {
     expect(readFileSync(result!.image_path!).toString()).toBe('test-data');
   });
 
+  it('names photos from msg.date rendered in UTC with Z marker, never host-local', async () => {
+    // 1700000000 = 2023-11-14 22:13:20 UTC = 2023-11-15 06:13:20 in the
+    // daemon host zone (Asia/Singapore, +08). A local-rendered name is wrong
+    // by 8 hours AND lands on the wrong calendar day. The name must encode
+    // the UTC instant with an explicit Z, whatever TZ this process runs in.
+    const msg = makeMsg({
+      photo: [{ file_id: 'large', width: 800, height: 600 }],
+    });
+    const api = createMockApi('photos/file_ABCDEFGhijk.jpg');
+    const result = await processMediaMessage(msg, api, downloadDir);
+
+    const name = result!.image_path!.split('/').pop()!;
+    expect(name).toBe('20231114_221320Z_ABCDEFGhijk.jpg');
+  });
+
   it('processes document messages', async () => {
     const msg = makeMsg({
       document: { file_id: 'doc1', file_name: 'report.pdf' },

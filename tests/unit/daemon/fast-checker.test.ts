@@ -380,9 +380,9 @@ describe('FastChecker', () => {
       expect(result).toContain('[Your last message: "Last sent text"]');
     });
 
-    it('instruction uses single quotes to prevent shell variable expansion of $-numbers', () => {
+    it('instruction uses a quoted-delimiter heredoc so the shell never parses reply content (quotes, $, backticks all inert)', () => {
       const result = FastChecker.formatTelegramTextMessage('alice', '999', 'Hello', '/opt/cortextos');
-      expect(result).toContain("send-telegram 999 '<your reply>'");
+      expect(result).toContain("send-telegram 999 --stdin << 'EOF'");
     });
 
     it('emits msg_id in header and --reply-to in hint when messageId is provided', () => {
@@ -393,7 +393,7 @@ describe('FastChecker', () => {
         12345 /* messageId */,
       );
       expect(result).toContain('=== TELEGRAM from [USER: alice] (user_id:42) (msg_id:12345) (chat_id:999) ===');
-      expect(result).toContain("send-telegram 999 '<your reply>' --reply-to 12345");
+      expect(result).toContain("send-telegram 999 --stdin --reply-to 12345 << 'EOF'");
     });
 
     it('omits msg_id suffix and --reply-to when messageId is undefined', () => {
@@ -727,7 +727,7 @@ describe('FastChecker', () => {
       expect(result).toContain('caption:');
       expect(result).toContain('Check this out');
       expect(result).toContain('local_file: /tmp/telegram-images/20260403_abc12345678.jpg');
-      expect(result).toContain("cortextos bus send-telegram 123456789 '<your reply>'");
+      expect(result).toContain("cortextos bus send-telegram 123456789 --stdin << 'EOF'");
     });
 
     it('formats photo message with empty caption', () => {
@@ -740,7 +740,7 @@ describe('FastChecker', () => {
     it('includes msg_id and --reply-to when messageId is provided', () => {
       const result = FastChecker.formatTelegramPhotoMessage('Alice', '999', '', '/tmp/photo.jpg', 7777);
       expect(result).toContain('=== TELEGRAM PHOTO from Alice (msg_id:7777) (chat_id:999) ===');
-      expect(result).toContain("send-telegram 999 '<your reply>' --reply-to 7777");
+      expect(result).toContain("send-telegram 999 --stdin --reply-to 7777 << 'EOF'");
     });
   });
 
@@ -759,7 +759,7 @@ describe('FastChecker', () => {
       expect(result).toContain('Here is the file');
       expect(result).toContain('local_file: /tmp/telegram-images/report.pdf');
       expect(result).toContain('file_name: report.pdf');
-      expect(result).toContain("cortextos bus send-telegram 123456789 '<your reply>'");
+      expect(result).toContain("cortextos bus send-telegram 123456789 --stdin << 'EOF'");
     });
 
     it('includes msg_id and --reply-to when messageId is provided', () => {
@@ -767,7 +767,7 @@ describe('FastChecker', () => {
         'Alice', '999', 'cap', '/tmp/f.pdf', 'f.pdf', 4242,
       );
       expect(result).toContain('=== TELEGRAM DOCUMENT from Alice (msg_id:4242) (chat_id:999) ===');
-      expect(result).toContain("send-telegram 999 '<your reply>' --reply-to 4242");
+      expect(result).toContain("send-telegram 999 --stdin --reply-to 4242 << 'EOF'");
     });
   });
 
@@ -783,7 +783,7 @@ describe('FastChecker', () => {
       expect(result).toContain('=== TELEGRAM VOICE from Alice (chat_id:123456789) ===');
       expect(result).toContain('duration: 12s');
       expect(result).toContain('local_file: /tmp/telegram-images/voice_1743718313.ogg');
-      expect(result).toContain("cortextos bus send-telegram 123456789 '<your reply>'");
+      expect(result).toContain("cortextos bus send-telegram 123456789 --stdin << 'EOF'");
     });
 
     it('uses "unknown" when duration is undefined', () => {
@@ -820,7 +820,7 @@ describe('FastChecker', () => {
         'Alice', '999', '/tmp/voice.ogg', 5, undefined, 909090,
       );
       expect(result).toContain('=== TELEGRAM VOICE from Alice (msg_id:909090) (chat_id:999) ===');
-      expect(result).toContain("send-telegram 999 '<your reply>' --reply-to 909090");
+      expect(result).toContain("send-telegram 999 --stdin --reply-to 909090 << 'EOF'");
     });
   });
 
@@ -894,7 +894,7 @@ describe('FastChecker', () => {
       expect(result).toContain('duration: 45s');
       expect(result).toContain('local_file: /tmp/telegram-images/video_1743718313.mp4');
       expect(result).toContain('file_name: video_1743718313.mp4');
-      expect(result).toContain("cortextos bus send-telegram 123456789 '<your reply>'");
+      expect(result).toContain("cortextos bus send-telegram 123456789 --stdin << 'EOF'");
     });
   });
 });

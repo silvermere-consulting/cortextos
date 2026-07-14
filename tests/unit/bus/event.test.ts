@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { logEvent } from '../../../src/bus/event';
+import { logEvent, logObserverEvent } from '../../../src/bus/event';
 import type { BusPaths, Heartbeat } from '../../../src/types';
 
 /**
@@ -119,6 +119,55 @@ describe('Bus events', () => {
       const eventFile = join(paths.analyticsDir, 'events', 'spark', `${today}.jsonl`);
       const entries = readFileSync(eventFile, 'utf-8').trim().split('\n');
       expect(entries).toHaveLength(1);
+    });
+  });
+
+  describe('observer events (2026-07-13 watchdog self-proof fix)', () => {
+    // An observer event is written ABOUT an agent by another process. It must
+    // be visible in the feed but never count as the agent's own pulse: no
+    // heartbeat bump, and a machine-readable `observer: true` stamp so
+    // liveness readers (frozen-turn watchdog arm (b)) can exclude the row.
+
+    const FROZEN_HB: Heartbeat = {
+      agent: 'spark',
+      org: 'eros-os',
+      status: 'healthy — mid task',
+      current_task: 'x',
+      mode: 'day',
+      last_heartbeat: '2026-04-23T12:00:00Z',
+      loop_interval: '1h',
+    };
+
+    it('logObserverEvent writes the row with observer: true and does NOT bump last_heartbeat', () => {
+      writeFileSync(join(paths.stateDir, 'heartbeat.json'), JSON.stringify(FROZEN_HB));
+
+      logObserverEvent(paths, 'spark', 'eros-os', 'action', 'watchdog_auto_restart', 'warning', { attempt: 1 });
+
+      const today = new Date().toISOString().split('T')[0];
+      const eventFile = join(paths.analyticsDir, 'events', 'spark', `${today}.jsonl`);
+      const rows = readFileSync(eventFile, 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ event: 'watchdog_auto_restart', observer: true });
+
+      const hb = JSON.parse(readFileSync(join(paths.stateDir, 'heartbeat.json'), 'utf-8')) as Heartbeat;
+      expect(hb.last_heartbeat).toBe(FROZEN_HB.last_heartbeat); // untouched
+    });
+
+    it('plain logEvent stays unchanged: no observer stamp, heartbeat bumped', async () => {
+      writeFileSync(join(paths.stateDir, 'heartbeat.json'), JSON.stringify(FROZEN_HB));
+      await new Promise((resolve) => setTimeout(resolve, 2));
+
+      logEvent(paths, 'spark', 'eros-os', 'action', 'agent_heartbeat', 'info');
+
+      const today = new Date().toISOString().split('T')[0];
+      const eventFile = join(paths.analyticsDir, 'events', 'spark', `${today}.jsonl`);
+      const rows = readFileSync(eventFile, 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
+      expect(rows[0].observer).toBeUndefined();
+
+      const hb = JSON.parse(readFileSync(join(paths.stateDir, 'heartbeat.json'), 'utf-8')) as Heartbeat;
+      expect(new Date(hb.last_heartbeat).getTime()).toBeGreaterThan(
+        new Date(FROZEN_HB.last_heartbeat).getTime(),
+      );
     });
   });
 });

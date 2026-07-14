@@ -237,13 +237,32 @@ export class FastChecker {
    */
   private formatInboxMessage(msg: InboxMessage): string {
     const replyNote = msg.reply_to ? ` [reply_to: ${msg.reply_to}]` : '';
+    // stdin heredoc form: apostrophes/quotes/backticks in the reply cannot
+    // break the shell. The single-quoted form this replaces broke on any
+    // apostrophe — three agents hit it on 2026-07-13 alone.
     return `=== AGENT MESSAGE from ${msg.from}${replyNote} [msg_id: ${msg.id}] ===
 \`\`\`
 ${msg.text}
 \`\`\`
-Reply using: cortextos bus send-message ${msg.from} normal '<your reply>' ${msg.id}
+Reply using: cortextos bus send-message ${msg.from} normal ${msg.id} --stdin << 'EOF'
+<your reply>
+EOF
 
 `;
+  }
+
+  /**
+   * The reply hint injected under every Telegram message. Recommends the
+   * --stdin heredoc form: the single-quoted form it replaces broke on any
+   * apostrophe in the reply, and double quotes are no safer (backticks and
+   * $() command-substitute — guardrail 129). A quoted-delimiter heredoc has
+   * no quote parsing at all.
+   */
+  private static telegramReplyHint(chatId: string | number, messageId?: number): string {
+    const replyTo = messageId !== undefined ? ` --reply-to ${messageId}` : '';
+    return `Reply using: cortextos bus send-telegram ${chatId} --stdin${replyTo} << 'EOF'
+<your reply>
+EOF`;
   }
 
   /**
@@ -288,9 +307,7 @@ Reply using: cortextos bus send-message ${msg.from} normal '<your reply>' ${msg.
     // When we know the originating Telegram message_id, suggest the
     // --reply-to flag so the agent's response threads under the user's
     // message in the Telegram client UI.
-    const replyHint = messageId !== undefined
-      ? `Reply using: cortextos bus send-telegram ${chatId} '<your reply>' --reply-to ${messageId}`
-      : `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`;
+    const replyHint = FastChecker.telegramReplyHint(chatId, messageId);
     return `=== TELEGRAM from [USER: ${from}]${userIdSuffix}${msgIdSuffix} (chat_id:${chatId}) ===
 ${replyCx}${historyCx}${body}
 ${lastSentCtx}${replyHint}
@@ -341,9 +358,7 @@ ${lastSentCtx}${replyHint}
     messageId?: number,
   ): string {
     const msgIdSuffix = messageId !== undefined ? ` (msg_id:${messageId})` : '';
-    const replyHint = messageId !== undefined
-      ? `Reply using: cortextos bus send-telegram ${chatId} '<your reply>' --reply-to ${messageId}`
-      : `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`;
+    const replyHint = FastChecker.telegramReplyHint(chatId, messageId);
     return `=== TELEGRAM PHOTO from ${from}${msgIdSuffix} (chat_id:${chatId}) ===
 caption:
 \`\`\`
@@ -368,9 +383,7 @@ ${replyHint}
     messageId?: number,
   ): string {
     const msgIdSuffix = messageId !== undefined ? ` (msg_id:${messageId})` : '';
-    const replyHint = messageId !== undefined
-      ? `Reply using: cortextos bus send-telegram ${chatId} '<your reply>' --reply-to ${messageId}`
-      : `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`;
+    const replyHint = FastChecker.telegramReplyHint(chatId, messageId);
     return `=== TELEGRAM DOCUMENT from ${from}${msgIdSuffix} (chat_id:${chatId}) ===
 caption:
 \`\`\`
@@ -405,9 +418,7 @@ ${replyHint}
       ? `transcript:\n\`\`\`\n${transcript.trim()}\n\`\`\`\n`
       : '';
     const msgIdSuffix = messageId !== undefined ? ` (msg_id:${messageId})` : '';
-    const replyHint = messageId !== undefined
-      ? `Reply using: cortextos bus send-telegram ${chatId} '<your reply>' --reply-to ${messageId}`
-      : `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`;
+    const replyHint = FastChecker.telegramReplyHint(chatId, messageId);
     return `=== TELEGRAM VOICE from ${from}${msgIdSuffix} (chat_id:${chatId}) ===
 duration: ${dur}s
 local_file: ${filePath}
@@ -431,9 +442,7 @@ ${transcriptBlock}${replyHint}
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
     const msgIdSuffix = messageId !== undefined ? ` (msg_id:${messageId})` : '';
-    const replyHint = messageId !== undefined
-      ? `Reply using: cortextos bus send-telegram ${chatId} '<your reply>' --reply-to ${messageId}`
-      : `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`;
+    const replyHint = FastChecker.telegramReplyHint(chatId, messageId);
     return `=== TELEGRAM VIDEO from ${from}${msgIdSuffix} (chat_id:${chatId}) ===
 caption:
 \`\`\`

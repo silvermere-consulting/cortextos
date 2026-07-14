@@ -4,7 +4,7 @@ import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -18,6 +18,7 @@ import { createReminder, listReminders, ackReminder, pruneReminders } from '../b
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { formatTaskRow, taskTableHeader } from './task-table.js';
+import { resolveMessageText } from './message-text.js';
 import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, deleteKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
@@ -75,10 +76,25 @@ busCommand
   .command('send-message')
   .argument('<to>', 'Target agent')
   .argument('<priority>', 'Message priority (urgent, high, normal, low)')
-  .argument('<text>', 'Message text')
+  .argument('[text]', 'Message text (omit when using --stdin or --text-file)')
   .argument('[reply-to]', 'Reply to message ID (optional positional form)')
   .option('--reply-to <id>', 'Reply to message ID')
-  .action((to: string, priority: string, text: string, replyToArg: string | undefined, opts: { replyTo?: string }) => {
+  .option('--stdin', 'Read message text from stdin — apostrophes, quotes, backticks and newlines are all safe (use a heredoc with a quoted delimiter)')
+  .option('--text-file <path>', 'Read message text from a file (same quoting safety as --stdin)')
+  .action((to: string, priority: string, text: string | undefined, replyToArg: string | undefined, opts: { replyTo?: string; stdin?: boolean; textFile?: string }) => {
+    // When the text comes from --stdin/--text-file, a lone third positional
+    // is the reply-to id, not the text: `send-message chief normal <id> --stdin`.
+    if ((opts.stdin || opts.textFile) && text !== undefined && replyToArg === undefined) {
+      replyToArg = text;
+      text = undefined;
+    }
+    let messageText: string;
+    try {
+      messageText = resolveMessageText(text, opts);
+    } catch (err) {
+      console.error(String(err instanceof Error ? err.message : err));
+      process.exit(1);
+    }
     // Accept reply-to as either positional arg or --reply-to flag (P2 fix #9)
     const effectiveReplyTo = opts.replyTo ?? replyToArg;
     const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
@@ -118,7 +134,7 @@ busCommand
       console.error(`Warning: agent '${to}' not found in project. Message will be queued but may never be read.`);
     }
 
-    const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo);
+    const msgId = sendMessage(paths, env.agentName, to, priority as Priority, messageText, effectiveReplyTo);
     try {
       logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }));
     } catch { /* non-fatal */ }
@@ -713,12 +729,27 @@ busCommand
 
 busCommand
   .command('check-goal-staleness')
-  .description('Detect agents with stale GOALS.md')
-  .option('--threshold <days>', 'Staleness threshold in days', '7')
+  .description('Report goal currency per agent (age + dead-goal + unverified). Never certifies "fresh".')
+  .option('--threshold <days>', 'Age threshold in days', '7')
   .action((opts: { threshold: string }) => {
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
-    const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10));
+    // Inject the task-status resolver: the deadness axis declares a goal dead
+    // only on a POSITIVE 'completed'. A missing/unresolvable ticket stays
+    // UNVERIFIED — the store living under ctxRoot must never fail us into a
+    // false "current".
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    const resolveTaskStatus = (taskId: string): string | null => {
+      try {
+        const file = findTaskFile(paths, taskId);
+        if (!file) return 'missing';
+        const task = JSON.parse(readFileSync(file, 'utf-8')) as { status?: string };
+        return typeof task.status === 'string' ? task.status : null;
+      } catch {
+        return null;
+      }
+    };
+    const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10), { resolveTaskStatus });
     console.log(JSON.stringify(report, null, 2));
   });
 
@@ -1035,16 +1066,28 @@ busCommand
   .command('send-telegram')
   .description('Send a message to a Telegram chat')
   .argument('<chat-id>', 'Telegram chat ID')
-  .argument('<message>', 'Message text (supports Telegram Markdown unless --plain-text is set)')
+  .argument('[message]', 'Message text (supports Telegram Markdown unless --plain-text is set; omit when using --stdin or --text-file)')
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
+  .option('--stdin', 'Read message text from stdin — apostrophes, quotes, backticks and newlines are all safe (use a heredoc with a quoted delimiter)')
+  .option('--text-file <path>', 'Read message text from a file (same quoting safety as --stdin; distinct from --file, which ATTACHES a document)')
   .option('--reply-to <message_id>', 'Send as a reply to an existing Telegram message_id (threads the new message under it in the client UI)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; replyTo?: string; plainText?: boolean }) => {
+  .action(async (chatId: string, message: string | undefined, opts: { image?: string; file?: string; stdin?: boolean; textFile?: string; replyTo?: string; plainText?: boolean }) => {
+    try {
+      message = resolveMessageText(message, opts);
+    } catch (err) {
+      console.error(String(err instanceof Error ? err.message : err));
+      process.exit(1);
+    }
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
-    message = message.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    // Applied only to argv text: file/stdin bytes are exact — a literal \n
+    // there is deliberate content, not a shell-quoting artefact.
+    if (!opts.stdin && !opts.textFile) {
+      message = message.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    }
     // Resolve bot token: agent .env first, then process.env
     const env = resolveEnv();
     let botToken = '';

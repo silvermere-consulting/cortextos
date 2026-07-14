@@ -20,6 +20,22 @@ import { validateEventCategory, validateEventSeverity, isValidJson } from '../ut
  * If no heartbeat file exists yet we do nothing — the first
  * update-heartbeat call creates it with full field values.
  */
+export interface LogEventOptions {
+  /**
+   * Mark this row as OBSERVER-written: recorded ABOUT the agent by another
+   * process (daemon watchdog, inbound-message logger), not BY the agent's
+   * own process. Observer rows are stamped `observer: true` in the JSONL so
+   * liveness readers can exclude them, and they do NOT refresh
+   * heartbeat.json.last_heartbeat — an observer writing about an agent is no
+   * evidence the agent processed anything. Before this flag existed the
+   * frozen-turn watchdog's own `watchdog_auto_restart` row bumped the frozen
+   * target's heartbeat AND became the newest event line, so every recovery
+   * verify read the watchdog's breadcrumb as the agent's pulse and reported
+   * `watchdog_recovery_ok` for agents that were still bricks (2026-07-13).
+   */
+  observer?: boolean;
+}
+
 export function logEvent(
   paths: BusPaths,
   agentName: string,
@@ -28,6 +44,7 @@ export function logEvent(
   eventName: string,
   severity: EventSeverity,
   metadata?: Record<string, unknown> | string,
+  options?: LogEventOptions,
 ): void {
   validateEventCategory(category);
   validateEventSeverity(severity);
@@ -60,12 +77,35 @@ export function logEvent(
     event: eventName,
     severity,
     metadata: meta,
+    ...(options?.observer ? { observer: true } : {}),
   });
 
   appendFileSync(join(eventsDir, `${today}.jsonl`), eventLine + '\n', 'utf-8');
 
-  // Refresh heartbeat timestamp as a side-effect. See doc comment above.
-  refreshHeartbeatTimestamp(paths, timestamp);
+  // Refresh heartbeat timestamp as a side-effect — but ONLY for rows the
+  // agent's own process wrote. See LogEventOptions.observer.
+  if (!options?.observer) {
+    refreshHeartbeatTimestamp(paths, timestamp);
+  }
+}
+
+/**
+ * Log an event ABOUT an agent from outside its process (daemon watchdog,
+ * inbound-message logger, …). Identical to logEvent with observer semantics:
+ * the row is visible in the agent's feed for dashboards, but it neither
+ * bumps the agent's heartbeat nor counts as the agent's pulse for liveness
+ * readers. Call sites that speak about an agent MUST use this, not logEvent.
+ */
+export function logObserverEvent(
+  paths: BusPaths,
+  agentName: string,
+  org: string,
+  category: EventCategory,
+  eventName: string,
+  severity: EventSeverity,
+  metadata?: Record<string, unknown> | string,
+): void {
+  logEvent(paths, agentName, org, category, eventName, severity, metadata, { observer: true });
 }
 
 /**

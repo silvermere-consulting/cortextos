@@ -254,83 +254,151 @@ describe('Bus System', () => {
   });
 
   describe('checkGoalStaleness', () => {
-    it('identifies stale goals', () => {
-      // Create org/agent structure with old timestamp
-      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
-      mkdirSync(agentDir, { recursive: true });
+    const NOW = Date.parse('2026-07-13T00:00:00Z');
+    const writeGoals = (org: string, agent: string, updatedAt: string, goals: unknown[]) => {
+      const dir = join(testDir, 'orgs', org, 'agents', agent);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'goals.json'), JSON.stringify({ updated_at: updatedAt, goals }));
+      return dir;
+    };
 
-      const oldDate = new Date(Date.now() - 10 * 86400 * 1000).toISOString();
-      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${oldDate}\n\nSome goal`);
-
-      const report = checkGoalStaleness(testDir, 7);
+    it('reads goals.json and flags an over-threshold age as "aged" (not a "fresh" verdict anywhere)', () => {
+      writeGoals('myorg', 'worker', '2026-07-01T00:00:00Z', ['some goal']); // 12d old
+      const report = checkGoalStaleness(testDir, 7, { now: NOW });
       expect(report.summary.total).toBe(1);
-      expect(report.summary.stale).toBe(1);
-      expect(report.agents[0].status).toBe('stale');
-      expect(report.agents[0].agent).toBe('worker');
-      expect(report.agents[0].org).toBe('myorg');
-      expect(report.agents[0].stale).toBe(true);
+      expect(report.agents[0].age_status).toBe('aged');
+      expect(report.agents[0].needs_attention).toBe(true);
+      expect(report.summary.aged).toBe(1);
+      // The load-bearing invariant: no "fresh"/"current" verdict exists.
+      expect(JSON.stringify(report)).not.toMatch(/"(fresh|current)"/);
     });
 
-    it('identifies fresh goals', () => {
-      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
-      mkdirSync(agentDir, { recursive: true });
-
-      const recentDate = new Date().toISOString();
-      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${recentDate}\n\nSome goal`);
-
-      const report = checkGoalStaleness(testDir, 7);
-      expect(report.summary.fresh).toBe(1);
-      expect(report.agents[0].status).toBe('fresh');
-      expect(report.agents[0].stale).toBe(false);
+    it('does NOT certify a recent goal as current — a recent free-text goal is UNVERIFIED', () => {
+      writeGoals('myorg', 'worker', '2026-07-12T18:00:00Z', ['ship the thing']); // 6h old
+      const report = checkGoalStaleness(testDir, 7, { now: NOW });
+      const a = report.agents[0];
+      expect(a.age_status).toBe('ok');       // age is fine...
+      expect(a.currency).toBe('unverified'); // ...but currency is NOT certified
+      expect(a.reason).toContain('UNVERIFIED');
+      expect(a.reason).toContain('not an all-clear');
     });
 
-    it('handles missing GOALS.md', () => {
-      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
-      mkdirSync(agentDir, { recursive: true });
-      // No GOALS.md created
-
-      const report = checkGoalStaleness(testDir);
-      expect(report.agents[0].status).toBe('missing');
-      expect(report.agents[0].stale).toBe(true);
-      expect(report.agents[0].reason).toContain('no GOALS.md');
+    it('REGRESSION: parses goals.json even when GOALS.md carries a "(by X)" suffix', () => {
+      // The original bug: check read GOALS.md and did new Date("<iso>Z (by chief)")
+      // -> Invalid Date -> false "stale". Now we read goals.json and ignore GOALS.md.
+      const dir = writeGoals('myorg', 'chief', '2026-07-12T18:00:00Z', ['a goal']);
+      writeFileSync(join(dir, 'GOALS.md'), '# Goals\n\n## Updated\n2026-07-12T18:00:00Z (by chief)\n');
+      const report = checkGoalStaleness(testDir, 7, { now: NOW });
+      const a = report.agents[0];
+      expect(a.age_status).toBe('ok');           // age computed from goals.json
+      expect(a.age_days).toBe(0);
+      expect(a.reason).not.toContain('parse');   // no parse_error path anymore
     });
 
-    it('handles missing timestamp in GOALS.md', () => {
-      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
-      mkdirSync(agentDir, { recursive: true });
-      writeFileSync(join(agentDir, 'GOALS.md'), '# Goals\n\nJust some text without updated section');
-
-      const report = checkGoalStaleness(testDir);
-      expect(report.agents[0].status).toBe('no_timestamp');
-      expect(report.agents[0].stale).toBe(true);
+    it('treats an empty updated_at as "no_timestamp" (never cascaded), not a false old date', () => {
+      writeGoals('myorg', 'othe', '', []); // the un-cascaded control
+      const report = checkGoalStaleness(testDir, 7, { now: NOW });
+      const a = report.agents[0];
+      expect(a.age_status).toBe('no_timestamp');
+      expect(a.needs_attention).toBe(true);
+      expect(a.reason).toContain('never cascaded');
     });
 
-    it('handles unparseable timestamp', () => {
-      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
-      mkdirSync(agentDir, { recursive: true });
-      writeFileSync(join(agentDir, 'GOALS.md'), '# Goals\n\n## Updated\nnot-a-date\n');
+    it('handles a missing goals.json', () => {
+      mkdirSync(join(testDir, 'orgs', 'myorg', 'agents', 'worker'), { recursive: true });
+      const report = checkGoalStaleness(testDir, 7, { now: NOW });
+      expect(report.agents[0].age_status).toBe('missing');
+      expect(report.agents[0].needs_attention).toBe(true);
+      expect(report.agents[0].reason).toContain('no goals.json');
+    });
 
-      const report = checkGoalStaleness(testDir);
-      expect(report.agents[0].status).toBe('parse_error');
-      expect(report.agents[0].stale).toBe(true);
+    it('DEADNESS: a goal whose declared done_when is a COMPLETED ticket is dead at any age', () => {
+      writeGoals('myorg', 'chief', '2026-07-12T22:00:00Z', [ // 2h old = age ok
+        { text: 'PDCA loops — Steve ask', done_when: { type: 'task', id: 'task_1783894228901_73614877' } },
+      ]);
+      const resolveTaskStatus = (id: string) => (id === 'task_1783894228901_73614877' ? 'completed' : 'missing');
+      const report = checkGoalStaleness(testDir, 7, { now: NOW, resolveTaskStatus });
+      const a = report.agents[0];
+      expect(a.age_status).toBe('ok');       // recent...
+      expect(a.dead_goals).toHaveLength(1);  // ...but dead by its declared condition
+      expect(a.dead_goals[0].handle).toBe('task_1783894228901_73614877');
+      expect(a.currency).toBe('has_dead_goal');
+      expect(report.summary.dead).toBe(1);
+    });
+
+    it('PROSE IS NEVER SCRAPED: a goal that CITES a completed ticket, with no done_when, is NOT dead', () => {
+      // The false positive chief caught: prose citing a completed ticket is not a
+      // goal whose done-when IS that ticket. A live-blocked goal that cites it.
+      writeGoals('myorg', 'chief', '2026-07-12T22:00:00Z', [
+        'the design is delivered (task_1783894228901_73614877, completed); now blocked on the Steve gate',
+      ]);
+      // Even if EVERY id resolved completed, prose must not be mined:
+      const report = checkGoalStaleness(testDir, 7, { now: NOW, resolveTaskStatus: () => 'completed' });
+      const a = report.agents[0];
+      expect(a.goals_with_done_when).toBe(0); // no declared done_when -> nothing checked
+      expect(a.dead_goals).toHaveLength(0);   // NOT marked dead from the prose
+      expect(a.currency).toBe('unverified');
+    });
+
+    it('DEADNESS refuses to guess: a done_when ticket that is not completed is live, never dead', () => {
+      writeGoals('myorg', 'worker', '2026-07-12T22:00:00Z', [
+        { text: 'ship it', done_when: { type: 'task', id: 'task_999' } },
+      ]);
+      const report = checkGoalStaleness(testDir, 7, { now: NOW, resolveTaskStatus: () => 'in_progress' });
+      const a = report.agents[0];
+      expect(a.goals_with_done_when).toBe(1);        // it saw the declared handle
+      expect(a.dead_goals).toHaveLength(0);          // not-completed -> not dead
+      expect(a.unresolvable_handles).toHaveLength(0); // and it DID resolve
+      expect(a.currency).toBe('unverified');
+    });
+
+    it('surfaces an UNRESOLVABLE declared done_when handle instead of masking it', () => {
+      // A bad handle (e.g. truncated) must be made visible, not folded into unverified.
+      writeGoals('myorg', 'worker', '2026-07-12T22:00:00Z', [
+        { text: 'ship it', done_when: { type: 'task', id: 'task_truncated' } },
+      ]);
+      const report = checkGoalStaleness(testDir, 7, { now: NOW, resolveTaskStatus: () => 'missing' });
+      const a = report.agents[0];
+      expect(a.unresolvable_handles).toHaveLength(1);
+      expect(a.unresolvable_handles[0].handle).toBe('task_truncated');
+      expect(a.dead_goals).toHaveLength(0);  // never guessed dead
+      expect(a.needs_attention).toBe(true);  // bad handle demands a look
+      expect(report.summary.unresolvable_handles).toBe(1);
+    });
+
+    it('without a resolver, a done_when goal is UNVERIFIED (cannot check), never assumed current', () => {
+      writeGoals('myorg', 'worker', '2026-07-12T22:00:00Z', [
+        { text: 'ship it', done_when: { type: 'task', id: 'task_123' } },
+      ]);
+      const report = checkGoalStaleness(testDir, 7, { now: NOW });
+      expect(report.agents[0].goals_with_done_when).toBe(1);
+      expect(report.agents[0].currency).toBe('unverified');
+    });
+
+    it('summary carries coverage counts and the honest-denominator note', () => {
+      writeGoals('myorg', 'worker', '2026-07-12T22:00:00Z', [
+        { text: 'has a handle', done_when: { type: 'task', id: 'task_1' } },
+        'free text goal',
+      ]);
+      const report = checkGoalStaleness(testDir, 7, { now: NOW });
+      expect(report.summary.goals_total).toBe(2);
+      expect(report.summary.goals_with_done_when).toBe(1);
+      expect(report.summary.note).toContain('NEVER certifies');
+      expect(report.summary.note).toContain('done_when');
+      expect(report.summary.note).toContain('does NOT fix stale goals');
     });
 
     it('returns empty report when no orgs directory', () => {
-      const report = checkGoalStaleness(testDir);
+      const report = checkGoalStaleness(testDir, 7, { now: NOW });
       expect(report.summary.total).toBe(0);
       expect(report.agents).toEqual([]);
+      expect(report.summary.note).toContain('NEVER certifies');
     });
 
     it('scans multiple orgs and agents', () => {
-      // Create two orgs with agents
-      for (const org of ['org1', 'org2']) {
-        const agentDir = join(testDir, 'orgs', org, 'agents', 'bot');
-        mkdirSync(agentDir, { recursive: true });
-        const date = new Date().toISOString();
-        writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${date}\n`);
-      }
-
-      const report = checkGoalStaleness(testDir);
+      writeGoals('org1', 'bot', '2026-07-12T22:00:00Z', ['g']);
+      writeGoals('org2', 'bot', '2026-07-12T22:00:00Z', ['g']);
+      const report = checkGoalStaleness(testDir, 7, { now: NOW });
       expect(report.summary.total).toBe(2);
     });
   });
