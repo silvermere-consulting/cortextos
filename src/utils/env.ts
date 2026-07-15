@@ -6,6 +6,69 @@ import { ensureDir } from './atomic.js';
 import { validateAgentName, validateOrgName } from './validate.js';
 import { stripBom } from './strip-bom.js';
 
+/** Fields sourced from an org's context.json. All optional; absent → undefined. */
+export interface OrgContextFields {
+  timezone?: string;
+  orchestrator?: string;
+  userTimezone?: string;
+  userTimezoneUntil?: string;
+  dayModeStart?: string;
+  dayModeEnd?: string;
+}
+
+/**
+ * Read an org's context.json into normalized env fields. The SINGLE source of
+ * this read — both resolveEnv() (CLI/bus path) and the daemon's per-agent env
+ * build (agent-manager) call this, so they cannot drift. That drift is exactly
+ * what shipped the user-tz arm as a silent no-op on 2026-07-14: resolveEnv read
+ * user_timezone, the daemon hand-built its env and did NOT, so CTX_USER_TIMEZONE
+ * injected empty. One reader, one contract, unit-tested at the seam.
+ *
+ * Never throws: missing file, unreadable, or malformed JSON → {} (callers then
+ * fall back to their own defaults / agent tz). stripBom handles the Windows
+ * UTF-8 BOM that would otherwise break JSON.parse at position 0.
+ */
+export function readOrgContext(projectRoot: string, org: string): OrgContextFields {
+  if (!projectRoot || !org) return {};
+  try {
+    const contextPath = join(projectRoot, 'orgs', org, 'context.json');
+    if (!existsSync(contextPath)) return {};
+    const ctx = JSON.parse(stripBom(readFileSync(contextPath, 'utf-8')));
+    return {
+      timezone: ctx.timezone || undefined,
+      orchestrator: ctx.orchestrator || undefined,
+      userTimezone: ctx.user_timezone || undefined,
+      userTimezoneUntil: ctx.user_timezone_until || undefined,
+      dayModeStart: ctx.day_mode_start || undefined,
+      dayModeEnd: ctx.day_mode_end || undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Merge an org's context.json fields into a CtxEnv, filling only EMPTY fields
+ * (existing values win — env vars/overrides already set upstream take precedence).
+ * This is the daemon's seam: agent-manager hand-builds a base CtxEnv (instanceId,
+ * ctxRoot, agentDir, org, projectRoot…) and MUST call this so user-tz/day-window
+ * reach the spawned agent. Before 2026-07-15 it did not, and the user-tz arm was
+ * a silent no-op. Pure + total (readOrgContext never throws) — unit-testable at
+ * exactly the seam that broke.
+ */
+export function applyOrgContext(env: CtxEnv): CtxEnv {
+  const ctx = readOrgContext(env.projectRoot, env.org);
+  return {
+    ...env,
+    timezone: env.timezone || ctx.timezone,
+    orchestrator: env.orchestrator || ctx.orchestrator,
+    userTimezone: env.userTimezone || ctx.userTimezone,
+    userTimezoneUntil: env.userTimezoneUntil || ctx.userTimezoneUntil,
+    dayModeStart: env.dayModeStart || ctx.dayModeStart,
+    dayModeEnd: env.dayModeEnd || ctx.dayModeEnd,
+  };
+}
+
 /**
  * Resolve the cortextOS environment context.
  * Equivalent of bash _ctx-env.sh - reads from env vars, .cortextos-env, .env files.
@@ -81,22 +144,17 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
   let dayModeStart = overrides?.dayModeStart || process.env.CTX_DAY_MODE_START || '';
   let dayModeEnd = overrides?.dayModeEnd || process.env.CTX_DAY_MODE_END || '';
 
+  // Fill any gaps from org context.json via the SHARED reader (readOrgContext) —
+  // the same reader the daemon uses, so the two env-build paths cannot drift.
+  // Precedence: overrides/env vars already set above WIN; context.json fills gaps.
   if ((!timezone || !orchestrator || !userTimezone || !dayModeStart) && org && projectRoot) {
-    try {
-      const contextPath = join(projectRoot, 'orgs', org, 'context.json');
-      if (existsSync(contextPath)) {
-        // stripBom: PowerShell/Notepad-saved context.json files have a BOM
-        // that breaks JSON.parse at position 0 — silent fallback to wrong
-        // timezone/orchestrator. See src/utils/strip-bom.ts for incident.
-        const ctx = JSON.parse(stripBom(readFileSync(contextPath, 'utf-8')));
-        if (!timezone && ctx.timezone) timezone = ctx.timezone;
-        if (!orchestrator && ctx.orchestrator) orchestrator = ctx.orchestrator;
-        if (!userTimezone && ctx.user_timezone) userTimezone = ctx.user_timezone;
-        if (!userTimezoneUntil && ctx.user_timezone_until) userTimezoneUntil = ctx.user_timezone_until;
-        if (!dayModeStart && ctx.day_mode_start) dayModeStart = ctx.day_mode_start;
-        if (!dayModeEnd && ctx.day_mode_end) dayModeEnd = ctx.day_mode_end;
-      }
-    } catch { /* ignore */ }
+    const ctx = readOrgContext(projectRoot, org);
+    if (!timezone && ctx.timezone) timezone = ctx.timezone;
+    if (!orchestrator && ctx.orchestrator) orchestrator = ctx.orchestrator;
+    if (!userTimezone && ctx.userTimezone) userTimezone = ctx.userTimezone;
+    if (!userTimezoneUntil && ctx.userTimezoneUntil) userTimezoneUntil = ctx.userTimezoneUntil;
+    if (!dayModeStart && ctx.dayModeStart) dayModeStart = ctx.dayModeStart;
+    if (!dayModeEnd && ctx.dayModeEnd) dayModeEnd = ctx.dayModeEnd;
   }
 
   // Security (H9): Validate agent name and org before they flow into filesystem paths.
