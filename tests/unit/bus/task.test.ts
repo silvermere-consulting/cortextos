@@ -410,6 +410,39 @@ describe('claimTask — atomic claim (beads-inspired)', () => {
     expect(() => claimTask(paths, 'task_nonexistent_000', 'alice')).toThrow(/not found in any org/);
   });
 
+  it('rejects a third-party claim on a task explicitly assigned to another agent', () => {
+    // chief creates FOR research (assigned_to !== created_by = explicit)
+    const id = createTask(paths, 'chief', 'acme', 'For research', { assignee: 'research' });
+    expect(() => claimTask(paths, id, 'bob')).toThrow(/assigned to research; bob cannot claim/);
+    // Refusal left no partial state: still pending, no lock file
+    const onDisk = JSON.parse(readFileSync(join(paths.taskDir, `${id}.json`), 'utf-8'));
+    expect(onDisk.status).toBe('pending');
+    expect(existsSync(join(paths.taskDir, '.claims', `${id}.claim`))).toBe(false);
+  });
+
+  it('lets the explicitly-assigned agent claim (ACK-and-start)', () => {
+    const id = createTask(paths, 'chief', 'acme', 'For research', { assignee: 'research' });
+    const task = claimTask(paths, id, 'research');
+    expect(task.status).toBe('in_progress');
+    expect(task.assigned_to).toBe('research');
+  });
+
+  it('CONTROL: creator-defaulted tasks stay claimable by anyone (pool workflow)', () => {
+    // No assignee passed — assigned_to defaults to creator. This is the
+    // pool case the assigned_to check must NOT break.
+    const id = createTask(paths, 'chief', 'acme', 'Pool work');
+    const task = claimTask(paths, id, 'bob');
+    expect(task.status).toBe('in_progress');
+    expect(task.assigned_to).toBe('bob');
+  });
+
+  it('documents the known ambiguity: explicit assignee equal to creator reads as default', () => {
+    const id = createTask(paths, 'chief', 'acme', 'Self-assigned', { assignee: 'chief' });
+    // Indistinguishable from the default — remains claimable.
+    const task = claimTask(paths, id, 'bob');
+    expect(task.status).toBe('in_progress');
+  });
+
   it('rolls back the lock if the task-JSON write fails (so retry can still succeed)', () => {
     const id = createTask(paths, 'alice', 'acme', 'Rollback probe');
     const claimPath = join(paths.taskDir, '.claims', `${id}.claim`);
