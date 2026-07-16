@@ -364,6 +364,15 @@ export function readTaskAudit(
  * without mutation). Claiming a non-pending task is rejected with a
  * message that names the current status so operators can diagnose.
  *
+ * Explicit assignment is honored: a pending task whose assigned_to names
+ * a DIFFERENT agent cannot be claimed by a third party — ask the assignee
+ * or have the orchestrator reassign first. Because createTask defaults
+ * assigned_to to the creator, "explicitly assigned" is detected as
+ * assigned_to !== created_by; creator-defaulted tasks remain claimable by
+ * anyone (the claim-from-pool workflow). Known ambiguity: an assignee
+ * passed explicitly that EQUALS the creator is indistinguishable from the
+ * default and stays claimable.
+ *
  * Claim-lock files live at `<taskDir>/.claims/<taskId>.claim` and carry
  * `<agent>\t<iso8601>` for audit. A later compaction pass can prune
  * claim-locks for completed tasks; for now they are append-only.
@@ -411,6 +420,20 @@ export function claimTask(
   if (task.status !== 'pending') {
     throw new Error(
       `Task ${taskId} is not pending (status=${task.status}); cannot claim`,
+    );
+  }
+
+  // Honor explicit assignment (assigned_to defaults to the creator, so
+  // only a cross-assignment — assigned_to differing from BOTH the claimer
+  // and the creator — is a real "this belongs to someone else").
+  if (
+    task.assigned_to &&
+    task.assigned_to !== agent &&
+    task.assigned_to !== task.created_by
+  ) {
+    throw new Error(
+      `Task ${taskId} is assigned to ${task.assigned_to}; ${agent} cannot claim it. ` +
+      `Ask ${task.assigned_to} to release it or have the orchestrator reassign first.`,
     );
   }
 
