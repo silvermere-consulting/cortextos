@@ -23,9 +23,9 @@ cortextos bus post-activity "<message>"
 
 ---
 
-## Agent-to-Agent Messages Are Automatically Logged
+## Agent-to-Agent Messages Do NOT Reach This Channel
 
-When you send a message to another agent via `send-message`, it is automatically logged to the activity channel. You do not need to post-activity separately for those.
+`send-message` traffic lands in the DASHBOARD activity feed (via the event log), not in the Telegram activity channel. `post-activity` is the ONLY path to the channel. (Corrected 2026-07-17 — the previous text claimed auto-logging that no code performs; see task_1784278133907.)
 
 ---
 

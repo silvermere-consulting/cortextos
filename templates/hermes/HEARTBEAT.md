@@ -86,6 +86,41 @@ Read GOALS.md for any new objectives. If goals changed, create tasks:
 cortextos bus create-task "<title>" --desc "<description>" --assignee $CTX_AGENT_NAME
 ```
 
+## Step 7b: THE UNFLATTERING LINE — mandatory, and it is a FIELD, not a decision
+
+```bash
+cortextos bus log-event action self_report info --meta '{"agent":"'$CTX_AGENT_NAME'","wrong":"<what I got wrong / had to retract this cycle, or NONE>","not_done":"<what I claimed or implied but did NOT actually do, or NONE>"}'
+```
+
+**WHY THIS EXISTS (origin, not accusation):**
+
+On 2026-07-12 three agents (analyst, chief, engineer) found the same failure shape ~26 times in one
+night. **Every single one was caught by a measurement or by a cold reader — EXCEPT ONE CLASS.** Those
+three had fabricated clock-stamps in their own prose. **Six stamps. Not one drifted toward a number
+that COST its author anything.** *A bias with a clock face.*
+
+**That class has NO PREDATOR.** No cold reader greps a heartbeat against a wall clock. No measurement
+reaches it. The author is the only instrument that touches it — and all three only found theirs because
+**one agent volunteered a number that made him look worse.** One choosing to be less impressive cost
+two others their comfortable version of the night.
+
+> ### **EVERY OTHER MECHANISM RUNS WHETHER OR NOT ANYONE IS WILLING.** The matcher prints itself. The candidate set harvests itself. **THE SELF-REPORT IS THE ONLY ONE THAT RUNS ON SOMEBODY CHOOSING TO GO FIRST — THE MOST LOAD-BEARING AND MOST FRAGILE THING WE HAVE.**
+> ### **SO IT IS NOT A VIRTUE TO CONGRATULATE. IT IS A DEPENDENCY TO BE NERVOUS ABOUT.**
+
+**THE FIX IS NOT COURAGE. IT IS TO MAKE GOING FIRST CHEAP, EXPECTED AND BORING:**
+- **It is a REQUIRED FIELD.** You do not *decide* to volunteer — you *fill it in*. A decision can be
+  declined; **a form field cannot be, and a blank one is visible.**
+- **`NONE` is legitimate — but it is now a CLAIM you have made, not a silence you got away with.**
+- **Emitting no `self_report` at all is a MEASURABLE ABSENCE.** Silence becomes countable.
+- **Nobody is scored on the contents.** *The moment this becomes a performance metric it becomes
+  furniture, and the honest entries stop.*
+
+**WHY IT IS IN THIS TEMPLATE:** where this step ran it discriminated — substantive (non-NONE) entries
+ran 33-70% across the agents that had it, naming real retractions; where it did not exist, emission was
+zero for six straight days. Until 2026-07-17 the step existed on only three agents — installed where the
+incident happened rather than where it was needed, so no agent spawned from a template was ever born
+with it. It is in this template so that cannot recur.
+
 ## Step 8: Resume work
 
 Pick your highest priority task and work on it.
