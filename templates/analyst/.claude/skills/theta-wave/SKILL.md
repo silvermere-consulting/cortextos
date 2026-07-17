@@ -8,15 +8,39 @@ triggers: ["theta wave", "system scan", "deep analysis", "meta research", "impro
 
 Theta wave is the system's sleep cycle - a deep analysis and improvement process that you (the analyst) own. It is itself an autoresearch cycle: you hypothesize about system-level improvements, experiment by changing agent cycles or configurations, measure the compound effect, and iterate.
 
-## Your Compound Metric
+## 🔴🔴 READ THIS BEFORE ANYTHING ELSE — THE 1–10 SELF-SCORE IS RETIRED (2026-07-12)
 
-Your metric is **system_effectiveness** - a qualitative compound score from 1-10 that you assign each cycle. It reflects:
-- Progress toward the north star (from org goals)
-- System health trends (errors, crashes, staleness)
-- Agent experiment outcomes (keep rates, improvement trajectories)
-- Overall system usefulness and efficiency
+> # **DO NOT PRODUCE A 1–10 SYSTEM-EFFECTIVENESS SCORE. DO NOT ACCEPT ONE.**
 
-You MUST write a paragraph justifying your score each cycle. Historical scores show the system's trajectory.
+**A single number, produced by us, about us, that nothing external can contradict, IS A FUEL GAUGE.** The real one read **74.6%** when the truth was **28%** — 2.7× wrong for three months — and the orchestrator throttled the whole fleet on it for four hours before anyone compared it to a source that *could* disagree.
+
+**This section used to say: *"You MUST write a paragraph justifying your score each cycle."*** That instruction is the trap, not the safeguard:
+
+> ### **A JUSTIFICATION IS NOT A GROUND TRUTH. THE FUEL GAUGE HAD ONE TOO.**
+> ### **A SCORE WITH A PARAGRAPH UNDER IT FEELS RIGOROUS. IT IS A STORY WITH A DECIMAL POINT.**
+> **The justification is the TELL, not the reassurance. The more carefully you argue a number that nothing can contradict, the more certainly it is the gauge.**
+
+**PROVEN ON THE NIGHT IT WAS RETIRED:** the analyst ran this cycle, produced **8.5**, wrote the mandated justification — *minutes after 48 hours spent killing exactly this artefact, inside the cycle built to catch it* — then caught it and struck it. **On the night after a good night it scores high. That is precisely when it is worthless.**
+
+### A SCORE IS VALID ONLY IF YOU CAN NAME A SOURCE THAT COULD DISAGREE WITH IT
+An **external judge**: the user's own assessment, a customer outcome, a downstream metric that moves without you touching it.
+**If you have none: write `SCORE REFUSED — CANNOT-TELL: no ground truth`, and state what you would need to make it real.** *A refusal is a valid cycle output. A flattering self-assessment is not.* **The refusal IS the cycle auditing itself.**
+
+### REPORT THESE INSTEAD — they have a ground truth
+1. **FALSE-CLAIM CATCH-RATE.** *How many false claims were made this period; how many were caught by CARE or RE-READING (historically: **zero**); how many by a **MEASUREMENT or a NON-AUTHOR COLD READER** (historically: **100%**).* Each catch is attributable to a named agent who was **not the author** → independently checkable, and falsifiable by counting.
+2. **MECHANISMS SHIPPED** — guards that fire whether or not anyone remembers them (a CI gate, a refusing validator, a build hash). **Countable. They do not decay into a flattering number.**
+3. **THE DEBIT COLUMN, IN FULL.** *A report with no debit column is marketing.*
+
+### AND THE FRAMEWORK'S OWN METRIC READ A SHADOW
+It counts **"experiments logged"** — while the fleet's best hardening in its history shipped through **ZERO formal experiment cycles.** *The cycle counted the paperwork and missed the work.* **READ THE THING, NOT ITS SHADOW.**
+
+---
+
+## ~~Your Compound Metric~~ — RETIRED, see above
+
+~~Your metric is **system_effectiveness** - a qualitative compound score from 1-10 that you assign each cycle.~~
+~~You MUST write a paragraph justifying your score each cycle.~~
+*(Struck at source, not footnoted below — a retraction downstream of the lie is a footnote the lie has already outrun.)*
 
 ## The Theta Wave Cycle
 
