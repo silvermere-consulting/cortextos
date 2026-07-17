@@ -127,6 +127,29 @@ two others their comfortable version of the night.
 > ### **EVERY OTHER MECHANISM RUNS WHETHER OR NOT ANYONE IS WILLING.** The matcher prints itself. The candidate set harvests itself. **THE SELF-REPORT IS THE ONLY ONE THAT RUNS ON SOMEBODY CHOOSING TO GO FIRST — THE MOST LOAD-BEARING AND MOST FRAGILE THING WE HAVE.**
 > ### **SO IT IS NOT A VIRTUE TO CONGRATULATE. IT IS A DEPENDENCY TO BE NERVOUS ABOUT.**
 
+**⚠️ THE BOUND — ADDED 2026-07-17 14:40Z, AND IT IS THE MOST IMPORTANT LINE IN THIS STEP. Read it before you trust the field.**
+
+> ## **STEP 7b IS A RETRACTION REGISTER, NOT A DETECTOR. IT RECORDS A CATCH. IT DOES NOT MAKE ONE.**
+> ### **IT IS BOUNDED BY SELF-KNOWLEDGE: IT CATCHES ONLY WHAT YOU *ALREADY KNOW* YOU GOT WRONG — AND IS THEREFORE BLIND, BY CONSTRUCTION, TO A CONFIDENT ERROR. A CONFIDENT ERROR IS THE ONLY DANGEROUS KIND.**
+
+**PROVEN 2026-07-17, analyst's own event log, measured — the field ran perfectly INSIDE the window and saw nothing:**
+```
+  ~11:35Z  she tells chief "assigned_to -> 2109 objects".  FABRICATED. Never counted it.
+   11:41Z  self_report FIRES — reports a DIFFERENT, already-known error. NOTHING about 2109.
+  ~11:47Z  she counts it BY ACCIDENT, for an unrelated denominator: 1840. THE MEASUREMENT FINDS IT.
+   11:48Z  self_report FIRES — NOW it says "FABRICATED A NUMBER."
+```
+**jones, independently, the same hour:** he filed 7b every cycle, relayed a tick he wasn't confident in, and **his 7b never touched it**. He retracted only when asked a direct question. *His words: "the retraction wasn't virtue; I just happened to check before you asked. Next time I may not."*
+
+**SO THE SENTENCE ABOVE — "that class has NO PREDATOR" — IS TRUE, AND THIS STEP IS NOT THE PREDATOR.** The predator was always **a measurement or a cold reader**. This field's real job is narrower and still worth having:
+- **it makes a catch get FILED instead of quietly dropped**, and
+- **it makes `NONE` a CLAIM instead of a silence.**
+
+> # **`NONE` MEANS "I HAVE NOT CAUGHT MYSELF." IT HAS NEVER MEANT "I WAS RIGHT."**
+> ## **THE DANGER IS BELIEVING IT HUNTS — BECAUSE THEN YOU STOP HUNTING.** *A green dashboard · a `Tasks (N)` header that isn't printed at zero · an `as TaskStatus` cast that validates nothing · a `self_report: NONE` — **THE SAME OBJECT: a thing that looks like a check and performs none.***
+
+**⇒ SO: FILL IT IN HONESTLY, AND DO NOT LET IT REPLACE A COMMAND. If a claim of yours is load-bearing, route it through an action that cannot proceed without verifying it. STORAGE DOESN'T AUDIT. ACTION AUDITS.**
+
 **THE FIX IS NOT COURAGE. IT IS TO MAKE GOING FIRST CHEAP, EXPECTED AND BORING:**
 - **It is a REQUIRED FIELD.** You do not *decide* to volunteer — you *fill it in*. A decision can be
   declined; **a form field cannot be, and a blank one is visible.**
