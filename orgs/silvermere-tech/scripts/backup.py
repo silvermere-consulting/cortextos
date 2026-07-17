@@ -339,6 +339,13 @@ def send_backup(smtp_host, smtp_port, sender, password, recipient, subject, body
     msg["To"] = recipient
     msg["Subject"] = subject
 
+    # BACKUP_SMTP_PLAIN=1: test-surface override (harness body arms) — plain
+    # SMTP to a local sink, no TLS, no AUTH. The arms assert BODY CONTENT;
+    # transport is not the object under test. Default (unset) unchanged.
+    if os.environ.get("BACKUP_SMTP_PLAIN") == "1":
+        with smtplib.SMTP(smtp_host, smtp_port) as smtp:
+            smtp.send_message(msg)
+        return
     with smtplib.SMTP_SSL(smtp_host, smtp_port) as smtp:
         smtp.login(sender, password)
         smtp.sendmail(sender, [recipient], msg.as_string())
@@ -987,7 +994,8 @@ def main():
                 f"Attachment omitted. Retained copies:\n"
                 f"  {local_status}\n"
                 f"  {ftp_status}\n"
-                f"  {gw_status}\n\n"
+                f"  {gw_status}\n"
+                f"  {sec_status}\n\n"
                 f"Excluded {len(skipped)} credential/binary file(s).\n"
             )
             attach = None
@@ -1001,7 +1009,10 @@ def main():
                 f"doc-to-pdf.js on restore); orphan/external PDFs are kept.\n"
                 f"Excluded credentials: secrets.env, gsc-service-account.json, .env files.\n\n"
                 f"Excluded {len(skipped)} additional credential/binary/derived file(s).\n\n"
+                f"This attachment is the CORE zip (email-size-bound). The FULL zip "
+                f"(CORE + the projects sweep, {full_size:.2f} MB) rides the scp tiers only.\n"
                 f"Retained copies:\n  {local_status}\n  {ftp_status}\n  {gw_status}\n"
+                f"  {sec_status}\n"
                 f"  {bundle_status}\n\n"
                 f"Restore: use scripts/restore.py to fetch + unzip from IMAP.\n"
             )
@@ -1060,6 +1071,7 @@ def main():
                 f"Retained copies (the real safety net):\n"
                 f"  {local_status}\n"
                 f"  {gw_status}\n"
+                f"  {sec_status}\n"
                 f"  {ftp_status}\n\n"
                 f"True off-site (OVH Backup Storage via FTPS) is being wired; until then the "
                 f"gateway copy on a separate box is the off-host safety. Ask engineer/chief "
