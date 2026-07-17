@@ -533,7 +533,17 @@ def make_git_bundles() -> tuple:
             if r.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
                 failed.append(f"{name}(create)")
                 continue
-            v = subprocess.run(["git", "bundle", "verify", str(dest)],
+            # --git-dir anchors verify to the SOURCE repo (task_1783642231441):
+            # `git bundle verify` needs a repository to resolve prerequisites
+            # against, and with none it fails "need a repository to verify a
+            # bundle" — so today's verify passes only by accident of the
+            # process CWD being inside some git repo. Run backup.py from /tmp
+            # and every repo would land in `failed`, each fresh bundle unlink'd,
+            # the whole tier down, with the status line naming six innocent
+            # repos and pointing away from the cwd cause. Anchoring to the
+            # bundle's own source repo is also strictly more correct than
+            # verifying against an arbitrary bystander repo.
+            v = subprocess.run(["git", f"--git-dir={git_dir}", "bundle", "verify", str(dest)],
                                capture_output=True, text=True, timeout=120)
             if v.returncode != 0:
                 failed.append(f"{name}(verify)")
