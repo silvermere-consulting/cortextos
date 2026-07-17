@@ -55,8 +55,14 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 ORG_ROOT = Path("/home/cortext/cortextos/orgs/silvermere-tech")
-SECRETS_FILE = Path("/home/cortext/cortextos/orgs/silvermere-tech/secrets.env")
-SIZE_LIMIT_MB = 20
+# BACKUP_SECRETS_FILE / BACKUP_SIZE_LIMIT_MB: test-surface overrides so the
+# loud-tier harness (workspace/backup-hardening/) can point a REAL run at
+# sandboxed creds / a synthetic size limit without touching prod secrets or
+# mailing bertha@. Defaults unchanged; production never sets them.
+SECRETS_FILE = Path(os.environ.get(
+    "BACKUP_SECRETS_FILE",
+    "/home/cortext/cortextos/orgs/silvermere-tech/secrets.env"))
+SIZE_LIMIT_MB = float(os.environ.get("BACKUP_SIZE_LIMIT_MB", "20"))
 DAILY_DEST = "bertha@silvermere.tech"
 WEEKLY_DEST = "steven.barker@silvermereconsulting.com"
 KEEP_DAILY = 7
@@ -189,6 +195,22 @@ def should_exclude(path: Path) -> bool:
         return True
     if path.suffix.lower() in EXCLUDE_SUFFIXES:
         return True
+    # A secrets file with a suffix APPENDED defeats the exact-suffix check above.
+    # 2026-07-11: `.env.bak-pre-yoodli-test-20260710T211446Z` and
+    # `secrets.env.bak-*` shipped off-box in the daily zip — each holding a live,
+    # 108-char `sk-ant-api03-…` key — because their suffix is `.bak-pre-…`, not
+    # `.env`, so `path.suffix == ".env"` never matched. A `.env` backup with a
+    # timestamp appended is STILL A .ENV, and it still holds the secrets.
+    #
+    # So match `.env` as a NAME SEGMENT, not just as the final suffix. This catches
+    # `.env.bak-*`, `.env.waitlist`, `secrets.env.20260602T…`, and every future
+    # variant nobody has named yet — the class, not the instance. `.env.template`
+    # and `.env.example` are placeholders (no real values) and are allowed through.
+    name = path.name.lower()
+    if (".env." in name or name.endswith(".env")) and not (
+        name.endswith(".env.template") or name.endswith(".env.example")
+    ):
+        return True
     for part in path.parts:
         if part in EXCLUDE_DIRS:
             return True
@@ -214,8 +236,36 @@ def add_to_zip(zf: zipfile.ZipFile, src: Path, arc_base: Path) -> list[str]:
     return skipped
 
 
-def build_zip(dest_path: str) -> tuple[float, list[str]]:
-    """Build the backup zip. Returns (size_mb, skipped_list)."""
+def swept_projects(org_root: Path = None) -> tuple[list[Path], int, int]:
+    """The FULL-zip projects sweep (task_1784285554485): EVERY dir under
+    projects/ except those carrying their OWN git repo — the bundle tier
+    auto-discovers those and ships their history, so sweeping their working
+    tree would double coverage git already provides off-box.
+
+    The criterion is DERIVED (has .git), never a hand list: a project that
+    grows its own repo leaves the sweep automatically, and a new project is
+    protected the day it exists — the INCLUDE_PATTERNS hand-list is how 25
+    projects were born unprotected (nobody decided; a list decided).
+
+    Returns (dirs_to_sweep, swept_count, census_count). BOTH counts are
+    printed by the caller: an empty glob and a complete sweep print the same
+    success unless the census denominator rides beside the swept number.
+
+    org_root is a parameter (default silvermere) so a future org (family —
+    task_1784286097725, conditional) is a config entry, not new code.
+    """
+    root = (org_root or ORG_ROOT) / "projects"
+    if not root.exists():
+        return [], 0, 0
+    census = sorted(p for p in root.iterdir() if p.is_dir())
+    swept = [p for p in census if not (p / ".git").exists()]
+    return swept, len(swept), len(census)
+
+
+def build_zip(dest_path: str, extra_dirs: list = None) -> tuple[float, list[str]]:
+    """Build the backup zip. Returns (size_mb, skipped_list).
+    extra_dirs: additional directories (the FULL-zip projects sweep) added
+    after INCLUDE_PATTERNS; dedup via the same seen-set."""
     skipped: list[str] = []
     arc_base = ORG_ROOT.parent  # zip paths start from cortextos/orgs/
 
@@ -240,6 +290,9 @@ def build_zip(dest_path: str) -> tuple[float, list[str]]:
                 target = ORG_ROOT / pattern
                 if target.exists():
                     skipped.extend(add_once(zf, target, arc_base))
+        for extra in (extra_dirs or []):
+            if extra.exists():
+                skipped.extend(add_once(zf, extra, arc_base))
 
     size_mb = os.path.getsize(dest_path) / (1024 * 1024)
     return size_mb, skipped
@@ -635,6 +688,49 @@ def upload_to_gateway(secrets, zip_path: str) -> str:
                 pass
 
 
+# BACKUP_SECONDARY_TARGET: test-surface override (harness sandboxes this at a
+# black-hole host so its real-run arms never touch .10). Default is production.
+SECONDARY_TARGET = os.environ.get("BACKUP_SECONDARY_TARGET", "deploy@10.10.10.10")  # key-based ssh, proven path (umami tier)
+SECONDARY_REMOTE_DIR = "/home/deploy/backups/silvermere-org-full"
+KEEP_SECONDARY = 7
+
+
+def upload_to_secondary(zip_path: str) -> str:
+    """Step 2c — the FULL zip to docker01 (.10, 167G free). Second off-host
+    copy on a distinct machine; the scp tiers have no 20MB ceiling, so this is
+    where the projects sweep lives (task_1784285554485). Key-based auth — no
+    askpass. Same contract as the gateway tier: byte-size verified before
+    success is reported, prune to KEEP_SECONDARY, and a FAILED string here is
+    turned into a nonzero exit by the tier-failure collection in main()."""
+    ssh_opts = ["-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=30", "-o", "BatchMode=yes"]
+    env = os.environ.copy()
+    fname = os.path.basename(zip_path)
+    remote_file = f"{SECONDARY_REMOTE_DIR}/{fname}"
+    try:
+        rc, _out, err = _run_ssh(["ssh"] + ssh_opts + [SECONDARY_TARGET, f"mkdir -p {SECONDARY_REMOTE_DIR}"], env)
+        if rc != 0:
+            return f"Secondary: FAILED (mkdir) — {err.strip() or rc}"
+        rc, _out, err = _run_ssh(
+            ["scp"] + ssh_opts + [zip_path, f"{SECONDARY_TARGET}:{remote_file}"], env, timeout=600)
+        if rc != 0:
+            return f"Secondary: FAILED (scp) — {err.strip() or rc}"
+        local_size = os.path.getsize(zip_path)
+        rc, out, _err = _run_ssh(["ssh"] + ssh_opts + [SECONDARY_TARGET, f"stat -c %s {remote_file}"], env)
+        remote_size = out.strip()
+        if rc != 0 or not remote_size.isdigit() or int(remote_size) != local_size:
+            return (f"Secondary: FAILED (size mismatch: local={local_size} "
+                    f"remote={remote_size or '?'})")
+        prune_cmd = (f"ls -1t {SECONDARY_REMOTE_DIR}/silvermere-tech-backup-full-*.zip 2>/dev/null "
+                     f"| tail -n +{KEEP_SECONDARY + 1} | xargs -r rm -f")
+        _run_ssh(["ssh"] + ssh_opts + [SECONDARY_TARGET, prune_cmd], env)
+        size_mb = local_size / (1024 * 1024)
+        return (f"Secondary: uploaded {fname} ({size_mb:.2f} MB) to {SECONDARY_TARGET}:{SECONDARY_REMOTE_DIR} "
+                f"(size-verified, keep last {KEEP_SECONDARY})")
+    except Exception as e:
+        return f"Secondary: FAILED — {e}"
+
+
 def relocate_from_junk(host, port, user, password, subject, attempts=6, delay=5):
     """Move a self-sent daily backup from INBOX.Junk back to INBOX.
 
@@ -788,6 +884,29 @@ def main():
         size_mb, skipped = build_zip(zip_path)
         print(f"Zip size: {size_mb:.2f} MB")
 
+        # CORE/FULL split (task_1784285554485): the 20MB email limit was
+        # silently deciding what the org protects (25 projects born outside a
+        # hand-list). CORE = INCLUDE_PATTERNS, rides EVERY tier including the
+        # size-bound email. FULL = CORE + the projects sweep, rides the scp
+        # tiers only (no size ceiling there). The two tiers protect different
+        # sets ON PURPOSE — a deliberate, documented divergence, not a decoy.
+        print(f"CORE zip {size_mb:.2f} MB (email + all tiers; set = INCLUDE_PATTERNS above)")
+        # WARN band derived from the limit (0.8x), never a second constant:
+        # agents/*/memory is 13.1 of CORE's 20.6MB uncompressed and grows
+        # daily, so the cliff returns on a schedule — this line makes it
+        # announce itself months out, in the report the 22:0xZ cron shows.
+        if size_mb > SIZE_LIMIT_MB * 0.8:
+            print(f"WARN: CORE zip {size_mb:.2f} MB approaching the {SIZE_LIMIT_MB:.0f} MB email limit "
+                  f"(band {SIZE_LIMIT_MB * 0.8:.1f} MB) — largest growth component is agents memory; "
+                  f"see pruning task_1784153366580")
+
+        swept, n_swept, n_census = swept_projects()
+        print(f"projects swept: {n_swept} of {n_census} (census); "
+              f"own-repo projects ride the bundle tier")
+        full_path = os.path.join(tmp, f"silvermere-tech-backup-full-{date_str}.zip")
+        full_size, full_skipped = build_zip(full_path, extra_dirs=swept)
+        print(f"FULL zip {full_size:.2f} MB — projects sweep rides scp tiers only (email carries CORE)")
+
         if skipped:
             print(f"Excluded {len(skipped)} file(s) (credentials/binaries)")
 
@@ -828,6 +947,17 @@ def main():
         else:
             gw_status = upload_to_gateway(secrets, zip_path)
             print(gw_status)
+
+        # Step 2c' — FULL zip to the secondary host (.10). Gated behind the
+        # same --no-gateway flag (both are the "scp tiers"); dry-run never
+        # connects. The FULL zip is the one carrying the projects sweep.
+        if args.no_gateway:
+            sec_status = "Secondary: skipped (--no-gateway)"
+        elif args.dry_run:
+            sec_status = f"Secondary: dry-run — would copy FULL zip to {SECONDARY_TARGET}:{SECONDARY_REMOTE_DIR}"
+        else:
+            sec_status = upload_to_secondary(full_path)
+            print(sec_status)
 
         # Step 2c — git history off-host. Rebuilt + verified EVERY run: a stale
         # bundle re-shipped nightly is a backup that reports success while
@@ -886,16 +1016,32 @@ def main():
             return
 
         # Daily send → bertha (self-archive)
+        # Email tier is HANDLED, not trusted (harness arm email-loud): an
+        # unhandled SMTP failure used to kill the run mid-flight — after the
+        # gateway upload, before IMAP prune and the weekly — with a raw
+        # traceback nobody reads. Now: the tier records FAILED, its dependents
+        # (relocate/prune, which need the mail to exist) are skipped with a
+        # printed reason, later tiers still run, and the tier-failure exit at
+        # the bottom attributes it loudly.
+        email_status = "Email: not attempted"
         print(f"Sending daily backup to {DAILY_DEST}...")
-        send_backup(smtp_host, smtp_port, sender, password, DAILY_DEST, subject, body, attach)
-        print(f"OK  daily backup sent ({size_mb:.2f} MB {'+ attachment' if attach else 'no attachment'})")
+        try:
+            send_backup(smtp_host, smtp_port, sender, password, DAILY_DEST, subject, body, attach)
+            email_status = f"Email: sent ({size_mb:.2f} MB {'+ attachment' if attach else 'no attachment'})"
+            print(f"OK  daily backup sent ({size_mb:.2f} MB {'+ attachment' if attach else 'no attachment'})")
+        except Exception as e:
+            email_status = f"Email: FAILED — {e}"
+            print(email_status)
 
-        # Relocate self-sent backup out of Junk (Hostinger spam-files it) so it
-        # lands in INBOX where retention + restore expect it. Best-effort.
-        relocate_from_junk(imap_host, imap_port, sender, password, subject)
+        if email_status.startswith("Email: sent"):
+            # Relocate self-sent backup out of Junk (Hostinger spam-files it) so it
+            # lands in INBOX where retention + restore expect it. Best-effort.
+            relocate_from_junk(imap_host, imap_port, sender, password, subject)
 
-        # IMAP prune — keep last KEEP_DAILY daily backups (INBOX + Junk)
-        prune_imap(imap_host, imap_port, sender, password, keep_n=KEEP_DAILY)
+            # IMAP prune — keep last KEEP_DAILY daily backups (INBOX + Junk)
+            prune_imap(imap_host, imap_port, sender, password, keep_n=KEEP_DAILY)
+        else:
+            print("Skipping Junk-relocate + IMAP prune (no mail was sent this run)")
 
         # Weekly send → Steven: NOTIFICATION ONLY (no attachment).
         # The recipient's mail provider (mailchannels) HARD-BOUNCES .zip attachments
@@ -919,9 +1065,29 @@ def main():
                 f"gateway copy on a separate box is the off-host safety. Ask engineer/chief "
                 f"for the full zip if you ever need to restore.\n"
             )
-            send_backup(smtp_host, smtp_port, sender, password, WEEKLY_DEST,
-                        weekly_subject, weekly_body, None)
-            print(f"OK  weekly status notice sent to {WEEKLY_DEST} (no attachment)")
+            try:
+                send_backup(smtp_host, smtp_port, sender, password, WEEKLY_DEST,
+                            weekly_subject, weekly_body, None)
+                print(f"OK  weekly status notice sent to {WEEKLY_DEST} (no attachment)")
+            except Exception as e:
+                # Weekly is a notice, not a data tier — record inside the email
+                # tier's status so it still exits loud, but never crash here.
+                email_status += f" | weekly notice FAILED — {e}"
+                print(f"Weekly notice: FAILED — {e}")
+
+        # Fail loudly, PER TIER, at the very end (harness arms gateway-loud /
+        # email-loud). Every tier ran; now every failure is attributed by name
+        # so the 22:0xZ cron read shows WHICH leg died, and the exit code
+        # makes the run un-ignorable. A status string containing FAILED that
+        # only ever landed in an email body is how the gateway tier could die
+        # best-effort-silently onto a full disk (task_1784280833929).
+        tier_failures = []
+        for tier, status in (("local-retain", local_status), ("ftp", ftp_status),
+                             ("gateway", gw_status), ("secondary", sec_status),
+                             ("email", email_status)):
+            if "FAILED" in status:
+                tier_failures.append(tier)
+                print(f"ERROR: {tier} tier FAILED — {status}", file=sys.stderr)
 
     # Fail loudly. A backup that reports success while shipping no history is
     # worse than no backup: it buys false confidence and nobody looks again.
@@ -929,6 +1095,8 @@ def main():
     # precisely "the git-history tier failed", and the cron surfaces it.
     if bundles_failed:
         print("ERROR: git-bundle tier FAILED — history did NOT reach the gateway", file=sys.stderr)
+        sys.exit(1)
+    if tier_failures:
         sys.exit(1)
 
 
