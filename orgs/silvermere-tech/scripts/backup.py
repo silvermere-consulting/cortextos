@@ -474,6 +474,11 @@ def _discover_repos() -> dict:
     prod = Path("/home/cortext/.silvermere-prod.git")
     if prod.is_dir():
         repos["silvermere-prod"] = prod
+    # org-projects snapshot repo (task_1784286990142): history for the 33
+    # swept projects — same external-git-dir pattern as the prod repo above.
+    snap = Path("/home/cortext/.silvermere-projects-snapshot.git")
+    if snap.is_dir():
+        repos["silvermere-projects-snapshot"] = snap
     for agent_git in sorted(Path("/home/cortext/cortextos/orgs").glob("*/agents/*/.git")):
         if agent_git.is_dir():
             repos[f"agent-{agent_git.parent.name}"] = agent_git
