@@ -206,7 +206,8 @@ busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
+  .option('--note <text>', 'Reason for the transition — lands in the task audit log (visible via task-history)')
+  .action((id: string, status: string, opts: { note?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -226,8 +227,8 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus);
-    console.log(`Updated ${id} -> ${status}`);
+    updateTask(paths, id, status as TaskStatus, opts.note);
+    console.log(`Updated ${id} -> ${status}${opts.note ? ' (note recorded)' : ''}`);
   });
 
 busCommand

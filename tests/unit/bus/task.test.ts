@@ -520,6 +520,19 @@ describe('Task audit log (append-only JSONL)', () => {
     expect(log[2].to).toBe('pending');
   });
 
+  it('updateTask plumbs an optional note into the audit entry (the field create/complete already use)', () => {
+    const id = createTask(paths, 'alice', 'acme', 'Noted', { assignee: 'alice' });
+    updateTask(paths, id, 'blocked', 'waiting on appr_123 — retracted off-box claim');
+    updateTask(paths, id, 'pending');
+
+    const log = readTaskAudit(paths, id);
+    expect(log[1].event).toBe('update');
+    expect(log[1].note).toBe('waiting on appr_123 — retracted off-box claim');
+    // A note-less update must stay note-ABSENT, not become an empty string —
+    // task-history renders ` | ${note}` only when the field exists.
+    expect(log[2].note).toBeUndefined();
+  });
+
   it('audit log is append-only — existing entries are never overwritten', () => {
     const id = createTask(paths, 'alice', 'acme', 'Append proof');
     const path = join(paths.taskDir, 'audit', `${id}.jsonl`);
