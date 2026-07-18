@@ -55,11 +55,18 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
-ORG_ROOT = Path("/home/cortext/cortextos/orgs/silvermere-tech")
+DEFAULT_ORG = "silvermere-tech"
 # BACKUP_SECRETS_FILE / BACKUP_SIZE_LIMIT_MB: test-surface overrides so the
 # loud-tier harness (workspace/backup-hardening/) can point a REAL run at
 # sandboxed creds / a synthetic size limit without touching prod secrets or
 # mailing bertha@. Defaults unchanged; production never sets them.
+#
+# TRANSPORT IS INFRA-SCOPED, CONTENT IS ORG-SCOPED (task_1784295189575):
+# the mailbox, gateway ssh and .10 ssh credentials belong to the machine
+# room, not to the org being backed up — every org's zip rides the same
+# transport, so SECRETS_FILE / DAILY_DEST / WEEKLY_DEST do NOT vary with
+# --org. What varies is the CONTENT (root, include set) and the NAMESPACE
+# (zip prefix, retain/remote dirs), all derived in configure_org().
 SECRETS_FILE = Path(os.environ.get(
     "BACKUP_SECRETS_FILE",
     "/home/cortext/cortextos/orgs/silvermere-tech/secrets.env"))
@@ -67,32 +74,15 @@ SIZE_LIMIT_MB = float(os.environ.get("BACKUP_SIZE_LIMIT_MB", "20"))
 DAILY_DEST = "bertha@silvermere.tech"
 WEEKLY_DEST = "steven.barker@silvermereconsulting.com"
 KEEP_DAILY = 7
-# Durable on-box retained copy. The zip is otherwise built in a TemporaryDirectory
-# and discarded on exit — so on oversized days (no email attachment) with FTPS
-# unconfigured there was NO retained copy anywhere. This guarantees at least one.
-LOCAL_RETAIN_DIR = Path("/home/cortext/backups/org-daily")
 KEEP_LOCAL = 14
 BACKUP_SUBJECT_PREFIX = "[BACKUP]"
-
-# Step 2b — off-host copy to the OVH gateway (internal infra, our own box).
-# True off-host copy that survives total loss of the app VM. The gateway is a
-# small 2.0G LXC, so retention is kept lean (zip ~55MB → 7 copies ~385MB).
-GATEWAY_REMOTE_DIR = "/home/cortext/backups/silvermere-org"
 KEEP_GATEWAY = 7
-
-# Step 2c — git history off-host. EXCLUDE_DIRS strips every .git dir and the
-# framework tree lives outside ORG_ROOT, so without this NO repo history ever
-# leaves the box. Bundles go straight to the gateway and NEVER into the zip:
-# adding them measured 30.67 MB against a 20 MB email limit, which silently
-# drops the attachment — and the email tier is the documented restore path.
-GIT_BUNDLE_DIR = ORG_ROOT / "backups" / "git"
-GATEWAY_BUNDLE_DIR = "/home/cortext/backups/silvermere-git"
 KEEP_BUNDLES = 7
 
-# Paths to include in the zip (relative to ORG_ROOT).
+# Generic core: what EVERY org's zip carries (relative to its org root).
 # Explicit inclusion list keeps the zip predictable and avoids accidental
 # credential leaks (secrets.env, gsc-service-account.json are excluded).
-INCLUDE_PATTERNS = [
+GENERIC_INCLUDE = [
     "knowledge.md",
     "context.json",
     "goals.json",
@@ -105,27 +95,87 @@ INCLUDE_PATTERNS = [
     "agents/*/config.json",
     "agents/*/*.md",
     "agents/*/memory",
-    # Project docs (exclude clearspeak-studio/app — node_modules/build, ~641MB)
-    "projects/gamesonthemove",
-    "projects/business-in-a-box",
-    "projects/dog-supplements",
-    "projects/hiba-ventures",
-    "projects/dashboard-tooling",
-    "projects/server-reselling",
-    "projects/smb-discovery",
-    "projects/silvermere-tech-email",
-    "projects/foundry",
-    "projects/clearspeak-studio",  # node_modules/build/dist/.next stripped by EXCLUDE_DIRS
-    "backups/umami",               # self-host Umami DB dump (written fresh by dump_umami_db() each run)
-    # NOTE (2026-07-09): git bundles are deliberately NOT included here.
-    # EXCLUDE_DIRS strips every .git dir, so no repo history leaves this box —
-    # a real DR gap. The obvious fix (add "backups/git") was measured and
-    # REJECTED: it takes the zip from 13.3 MB to 30.67 MB, past SIZE_LIMIT_MB,
-    # so the email tier silently drops its attachment. That tier is also the
-    # documented restore path (restore.py fetches from IMAP), so we would have
-    # traded a history gap for a restore gap and been told nothing.
-    # Bundles go off-host via the gateway instead. See task_1783575583… .
 ]
+
+# Per-org extras beyond the generic core. Projects named here ride the CORE
+# (email-bound) zip; every OTHER project rides the FULL zip via the
+# swept_projects() sweep — so an org with no entry here (family) still gets
+# all its projects backed up, just on the scp tiers where no 20MB email
+# ceiling applies. That split is MEASURED at run time (zip sizes + the WARN
+# band), never a typed per-org number.
+ORG_EXTRA_INCLUDE = {
+    "silvermere-tech": [
+        # Project docs (exclude clearspeak-studio/app — node_modules/build, ~641MB)
+        "projects/gamesonthemove",
+        "projects/business-in-a-box",
+        "projects/dog-supplements",
+        "projects/hiba-ventures",
+        "projects/dashboard-tooling",
+        "projects/server-reselling",
+        "projects/smb-discovery",
+        "projects/silvermere-tech-email",
+        "projects/foundry",
+        "projects/clearspeak-studio",  # node_modules/build/dist/.next stripped by EXCLUDE_DIRS
+        "backups/umami",               # self-host Umami DB dump (written fresh by dump_umami_db() each run)
+        # NOTE (2026-07-09): git bundles are deliberately NOT included here.
+        # EXCLUDE_DIRS strips every .git dir, so no repo history leaves this box —
+        # a real DR gap. The obvious fix (add "backups/git") was measured and
+        # REJECTED: it takes the zip from 13.3 MB to 30.67 MB, past SIZE_LIMIT_MB,
+        # so the email tier silently drops its attachment. That tier is also the
+        # documented restore path (restore.py fetches from IMAP), so we would have
+        # traded a history gap for a restore gap and been told nothing.
+        # Bundles go off-host via the gateway instead. See task_1783575583… .
+    ],
+}
+
+# Existing on-disk/remote names predate --org. Renaming them would orphan the
+# retention lineage (prune globs would stop seeing old copies), so the default
+# org keeps its exact historical paths; new orgs get cleanly derived ones.
+_LEGACY_NAMES = {
+    "silvermere-tech": dict(retain="org-daily", gw="silvermere-org",
+                            gwgit="silvermere-git", sec="silvermere-org-full",
+                            secgit="silvermere-org-git-bundles"),
+}
+
+
+def configure_org(org: str) -> None:
+    """Derive every org-scoped global from the org name. Called once at
+    startup (module bottom for the default, main() for --org). Everything
+    here is DERIVED — adding an org means having a directory under orgs/,
+    not adding constants."""
+    global BACKUP_ORG, ORG_ROOT, GIT_BUNDLE_DIR, LOCAL_RETAIN_DIR, ZIP_PREFIX
+    global GATEWAY_REMOTE_DIR, GATEWAY_BUNDLE_DIR, SECONDARY_REMOTE_DIR
+    global SECONDARY_BUNDLE_DIR, INCLUDE_PATTERNS, INFRA_TIERS, _BACKUP_NAME_RE
+    root = Path(f"/home/cortext/cortextos/orgs/{org}")
+    if not root.is_dir():
+        raise SystemExit(f"unknown org '{org}': {root} does not exist")
+    names = _LEGACY_NAMES.get(org, dict(
+        retain=f"{org}-daily", gw=f"{org}-org", gwgit=f"{org}-git",
+        sec=f"{org}-org-full", secgit=f"{org}-org-git-bundles"))
+    BACKUP_ORG = org
+    ORG_ROOT = root
+    # Step 2c — git history off-host. Bundles are INFRA-tier: _discover_repos()
+    # already enumerates every org's agent + project repos, so the default
+    # org's nightly run ships ALL orgs' history. A second org's run skips the
+    # tier (loudly) instead of re-shipping ~670MB of the same bundles.
+    GIT_BUNDLE_DIR = root / "backups" / "git"
+    # Durable on-box retained copy. The zip is otherwise built in a
+    # TemporaryDirectory and discarded on exit — this guarantees at least one.
+    LOCAL_RETAIN_DIR = Path(f"/home/cortext/backups/{names['retain']}")
+    ZIP_PREFIX = f"{org}-backup-"
+    _BACKUP_NAME_RE = re.compile(rf"^{re.escape(org)}-backup-(\d{{4}}-\d{{2}}-\d{{2}})\.zip$")
+    # Step 2b — off-host copy to the OVH gateway (internal infra, our own box).
+    # The gateway is a small 2.0G LXC, so retention is kept lean.
+    GATEWAY_REMOTE_DIR = f"/home/cortext/backups/{names['gw']}"
+    GATEWAY_BUNDLE_DIR = f"/home/cortext/backups/{names['gwgit']}"
+    SECONDARY_REMOTE_DIR = f"/home/deploy/backups/{names['sec']}"
+    SECONDARY_BUNDLE_DIR = f"/home/deploy/backups/{names['secgit']}"
+    INCLUDE_PATTERNS = GENERIC_INCLUDE + ORG_EXTRA_INCLUDE.get(org, [])
+    # Umami dump + git bundles run in the infra org's invocation only.
+    INFRA_TIERS = (org == DEFAULT_ORG)
+
+
+configure_org(DEFAULT_ORG)
 
 # Always exclude these patterns even if matched above
 EXCLUDE_SUFFIXES = {".env", ".key", ".pem", ".p12", ".pfx", ".tsbuildinfo"}
@@ -305,9 +355,9 @@ def retain_local(zip_path: str, date_str: str) -> str:
     the zip is oversized (no email attachment) AND FTPS is unconfigured."""
     try:
         LOCAL_RETAIN_DIR.mkdir(parents=True, exist_ok=True)
-        dest = LOCAL_RETAIN_DIR / f"silvermere-tech-backup-{date_str}.zip"
+        dest = LOCAL_RETAIN_DIR / f"{ZIP_PREFIX}{date_str}.zip"
         shutil.copy2(zip_path, dest)
-        zips = sorted(LOCAL_RETAIN_DIR.glob("silvermere-tech-backup-*.zip"))
+        zips = sorted(LOCAL_RETAIN_DIR.glob(f"{ZIP_PREFIX}*.zip"))
         pruned = 0
         for old in (zips[:-KEEP_LOCAL] if len(zips) > KEEP_LOCAL else []):
             try:
@@ -406,7 +456,8 @@ def upload_to_ftp(secrets, zip_path: str) -> str:
         return f"FTP: upload FAILED — {e}"
 
 
-_BACKUP_NAME_RE = re.compile(r"^silvermere-tech-backup-(\d{4}-\d{2}-\d{2})\.zip$")
+# _BACKUP_NAME_RE is org-derived in configure_org() — a static regex here
+# would let one org's IMAP prune parse (and age out) another org's copies.
 
 
 def prune_ftp(secrets) -> str:
@@ -770,7 +821,7 @@ def upload_to_gateway(secrets, zip_path: str) -> str:
                     f"remote={remote_size or '?'})")
 
         # Prune to last KEEP_GATEWAY by mtime (newest kept).
-        prune_cmd = (f"ls -1t {GATEWAY_REMOTE_DIR}/silvermere-tech-backup-*.zip 2>/dev/null "
+        prune_cmd = (f"ls -1t {GATEWAY_REMOTE_DIR}/{ZIP_PREFIX}*.zip 2>/dev/null "
                      f"| tail -n +{KEEP_GATEWAY + 1} | xargs -r rm -f")
         _run_ssh(["ssh"] + ssh_opts + [target, prune_cmd], env)
 
@@ -790,9 +841,8 @@ def upload_to_gateway(secrets, zip_path: str) -> str:
 # BACKUP_SECONDARY_TARGET: test-surface override (harness sandboxes this at a
 # black-hole host so its real-run arms never touch .10). Default is production.
 SECONDARY_TARGET = os.environ.get("BACKUP_SECONDARY_TARGET", "deploy@10.10.10.10")  # key-based ssh, proven path (umami tier)
-SECONDARY_REMOTE_DIR = "/home/deploy/backups/silvermere-org-full"
+# SECONDARY_REMOTE_DIR / SECONDARY_BUNDLE_DIR are org-derived in configure_org().
 KEEP_SECONDARY = 7
-SECONDARY_BUNDLE_DIR = "/home/deploy/backups/silvermere-org-git-bundles"
 
 
 def upload_to_secondary(zip_path: str) -> str:
@@ -821,7 +871,7 @@ def upload_to_secondary(zip_path: str) -> str:
         if rc != 0 or not remote_size.isdigit() or int(remote_size) != local_size:
             return (f"Secondary: FAILED (size mismatch: local={local_size} "
                     f"remote={remote_size or '?'})")
-        prune_cmd = (f"ls -1t {SECONDARY_REMOTE_DIR}/silvermere-tech-backup-full-*.zip 2>/dev/null "
+        prune_cmd = (f"ls -1t {SECONDARY_REMOTE_DIR}/{ZIP_PREFIX}full-*.zip 2>/dev/null "
                      f"| tail -n +{KEEP_SECONDARY + 1} | xargs -r rm -f")
         _run_ssh(["ssh"] + ssh_opts + [SECONDARY_TARGET, prune_cmd], env)
         size_mb = local_size / (1024 * 1024)
@@ -935,11 +985,19 @@ def relocate_from_junk(host, port, user, password, subject, attempts=6, delay=5)
 
 
 def prune_imap(host, port, user, password, keep_n=KEEP_DAILY):
-    """Delete oldest [BACKUP] emails, keeping the last keep_n in each folder.
+    """Delete oldest [BACKUP] emails FOR THIS ORG, keeping the last keep_n in
+    each folder.
 
     Self-sent daily backups (bertha -> bertha) are spam-filtered into INBOX.Junk
     by Hostinger, so retention must be enforced there too — pruning INBOX alone
-    leaves Junk to grow unbounded. restore.py reads both folders."""
+    leaves Junk to grow unbounded. restore.py reads both folders.
+
+    ORG-SCOPED (caught live 2026-07-18, first family run): all orgs share one
+    mailbox, and a bare `[BACKUP]` search counts every org's copies in one
+    keep_n window — the family run's very first mail displaced and DELETED the
+    oldest silvermere backup email. Subjects have always carried the org name
+    ("[BACKUP] <org> <date>"), so scoping the search string is sufficient for
+    the whole retention history, both orgs."""
     try:
         with imaplib.IMAP4_SSL(host, port) as imap:
             imap.login(user, password)
@@ -947,8 +1005,8 @@ def prune_imap(host, port, user, password, keep_n=KEEP_DAILY):
                 status, _ = imap.select(f'"{folder}"')
                 if status != "OK":
                     continue  # folder may not exist on this mailbox
-                # Search for messages with BACKUP prefix (seq nums, oldest first)
-                status, data = imap.search(None, f'SUBJECT "{BACKUP_SUBJECT_PREFIX}"')
+                # Search for THIS org's backups (seq nums, oldest first)
+                status, data = imap.search(None, f'SUBJECT "{BACKUP_SUBJECT_PREFIX} {BACKUP_ORG} "')
                 if status != "OK" or not data or not data[0]:
                     continue
                 uids = data[0].split()
@@ -999,7 +1057,11 @@ def dump_umami_db() -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Backup silvermere-tech org to email")
+    parser = argparse.ArgumentParser(description="Backup a cortextos org (content org-scoped, transport infra-scoped)")
+    parser.add_argument("--org", default=DEFAULT_ORG,
+                        help=f"Org to back up (a directory under cortextos/orgs/). Default: {DEFAULT_ORG}. "
+                             "Git bundles + umami dump run only in the default (infra) org's invocation — "
+                             "_discover_repos() already spans every org.")
     parser.add_argument("--weekly", action="store_true",
                         help="Force weekly send (also send to Steven). Default: auto on Sundays.")
     parser.add_argument("--dry-run", action="store_true",
@@ -1009,6 +1071,7 @@ def main():
     parser.add_argument("--no-gateway", action="store_true",
                         help="Skip Step 2b off-host gateway copy.")
     args = parser.parse_args()
+    configure_org(args.org)
 
     try:
         secrets = load_secrets()
@@ -1026,14 +1089,17 @@ def main():
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M UTC")
-    subject = f"{BACKUP_SUBJECT_PREFIX} silvermere-tech {date_str} {time_str}"
+    subject = f"{BACKUP_SUBJECT_PREFIX} {BACKUP_ORG} {date_str} {time_str}"
 
     is_weekly = args.weekly or (now.weekday() == 6)  # 6 = Sunday
 
-    print(f"Umami DB dump: {dump_umami_db()}")
+    if INFRA_TIERS:
+        print(f"Umami DB dump: {dump_umami_db()}")
+    else:
+        print(f"Umami DB dump: skipped — infra tier, runs in the {DEFAULT_ORG} invocation")
 
     with tempfile.TemporaryDirectory() as tmp:
-        zip_path = os.path.join(tmp, f"silvermere-tech-backup-{date_str}.zip")
+        zip_path = os.path.join(tmp, f"{ZIP_PREFIX}{date_str}.zip")
         print(f"Building backup zip...")
         size_mb, skipped = build_zip(zip_path)
         print(f"Zip size: {size_mb:.2f} MB")
@@ -1057,7 +1123,7 @@ def main():
         swept, n_swept, n_census = swept_projects()
         print(f"projects swept: {n_swept} of {n_census} (census); "
               f"own-repo projects ride the bundle tier")
-        full_path = os.path.join(tmp, f"silvermere-tech-backup-full-{date_str}.zip")
+        full_path = os.path.join(tmp, f"{ZIP_PREFIX}full-{date_str}.zip")
         full_size, full_skipped = build_zip(full_path, extra_dirs=swept)
         print(f"FULL zip {full_size:.2f} MB — projects sweep rides scp tiers only (email carries CORE)")
 
@@ -1117,7 +1183,13 @@ def main():
         # bundle re-shipped nightly is a backup that reports success while
         # archiving frozen history. Failure here fails the run.
         bundles_failed = False
-        if args.no_gateway:
+        if not INFRA_TIERS:
+            # Not silent: the email body + stdout both say WHERE this org's
+            # history rides, so a reader auditing the family backup doesn't
+            # conclude git history is unprotected.
+            bundle_status = (f"Bundles: not run here — _discover_repos() spans all orgs, so "
+                             f"{BACKUP_ORG}'s repo history ships in the {DEFAULT_ORG} nightly run")
+        elif args.no_gateway:
             bundle_status = "Bundles: skipped (--no-gateway)"
         elif args.dry_run:
             bundle_status = (f"Bundles: dry-run — would rebuild + copy to {GATEWAY_BUNDLE_DIR} "
