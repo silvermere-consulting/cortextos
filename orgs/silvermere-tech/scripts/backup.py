@@ -40,6 +40,7 @@ import ftplib
 import hashlib
 import hmac
 import imaplib
+import json
 import os
 import re
 import shutil
@@ -1028,6 +1029,155 @@ def _s3_list_keys(cfg, prefix):
             return keys
 
 
+def _s3_list_sizes(cfg, prefix):
+    """Sum the Size of every object under prefix (list-type=2, paged). Parses
+    per-<Contents> so Key and Size stay paired. Returns total bytes."""
+    total, token = 0, None
+    while True:
+        q = [("list-type", "2"), ("prefix", prefix)]
+        if token:
+            q.append(("continuation-token", token))
+        status, body = _s3_request(cfg, "GET", "", q)
+        if status != 200:
+            raise RuntimeError(f"LIST-sizes {prefix!r} -> HTTP {status}: {body[:200]!r}")
+        text = body.decode(errors="replace")
+        for block in re.findall(r"<Contents>(.*?)</Contents>", text, re.DOTALL):
+            m = re.search(r"<Size>(\d+)</Size>", block)
+            if m:
+                total += int(m.group(1))
+        m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", text)
+        token = m.group(1) if m else None
+        if not token:
+            return total
+
+
+# ── R2 SIZE GUARDRAIL (task_1784412736637, Steve cost-tight: MUST stay under
+# the 10GB R2 free-tier step) ────────────────────────────────────────────────
+# Two HONEST modes, never conflated (the units-on-a-record lesson):
+#   LIVE  (S3 configured): sum the real object Sizes in the bucket = a MEASUREMENT.
+#   DARK  (not configured): project from the local retained set = a PROJECTION.
+# Each emitted line states which it is, so a projected number never reads as measured.
+_GB = 1024 ** 3
+R2_FREE_TIER_GB = float(os.environ.get("BACKUP_R2_LIMIT_GB", "10"))   # hard ceiling
+R2_SOFT_LIMIT_GB = float(os.environ.get("BACKUP_R2_SOFT_GB", "8"))    # warn band, well under
+
+
+def _r2_verdict(used_bytes, soft_bytes, hard_bytes):
+    """Pure verdict — the two-sided-testable core. RED at/over the ceiling,
+    WARN at/over the soft band, else OK."""
+    if used_bytes >= hard_bytes:
+        return "RED"
+    if used_bytes >= soft_bytes:
+        return "WARN"
+    return "OK"
+
+
+def _r2_selftest():
+    """Watched-fire both directions on the verdict logic before it gates.
+    Returns (ok, detail)."""
+    soft, hard = 8 * _GB, 10 * _GB
+    cases = [
+        (1 * _GB, "OK"), (7 * _GB, "OK"),              # known-under: must stay quiet
+        (8 * _GB, "WARN"), (9 * _GB, "WARN"),          # known-over-band: must warn
+        (10 * _GB, "RED"), (12 * _GB, "RED"),          # known-over-ceiling: must go red
+    ]
+    for used, expect in cases:
+        got = _r2_verdict(used, soft, hard)
+        if got != expect:
+            return False, f"verdict({used/_GB:.0f}GB)={got}, expected {expect}"
+    return True, "OK"
+
+
+def _r2_local_projection(this_full_zip, local_bundle_set_bytes):
+    """DARK-mode estimate of THIS org's steady-state R2 footprint.
+
+    Two parts, each matched to R2's retention so the projection equals what
+    actually accumulates there:
+    - FULL zips: R2 keeps KEEP_S3 of them; one cycle produces one; so
+      KEEP_S3 × this_cycle's full zip.
+    - BUNDLES: R2 keeps KEEP_BUNDLES per repo — and the LOCAL bundle dir is
+      pruned to the SAME KEEP_BUNDLES per repo (make_git_bundles), so the
+      current local bundle SET already equals R2's steady-state bundle
+      footprint. Use it directly — do NOT multiply again (that was a
+      double-count: the retained set × retention).
+    Encryption overhead (~51 bytes/object: magic+salt+nonce+tag) is negligible
+    vs MB artifacts, so ciphertext ≈ plaintext bytes."""
+    return KEEP_S3 * this_full_zip + local_bundle_set_bytes
+
+
+def _r2_delta_phrase(used_bytes, mode_tag):
+    """Run-over-run trend off a tiny per-org state file. Honest on two edges:
+    INSUFFICIENT-IS-NOT-FLAT (no prior sample → say so, never '+0%'), and
+    MODE-MATCH (a PROJECTED value vs a prior MEASURED one is not comparable).
+    `mode_tag` is a short mode key ('live' | 'dark'). Always writes the current
+    sample. Returns a phrase to append to the footprint line."""
+    state = Path(os.path.expanduser(f"~/.backup-r2-footprint-{BACKUP_ORG}.json"))
+    prior = None
+    if state.exists():
+        try:
+            prior = json.loads(state.read_text())
+        except Exception:  # noqa: BLE001 — a corrupt state file must not fail the backup
+            prior = None
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        state.write_text(json.dumps({"used_bytes": used_bytes, "mode": mode_tag, "ts": now_iso}))
+    except Exception:  # noqa: BLE001
+        pass  # trend is a heads-up, not the gate — never fail the run on it
+
+    if not prior or "used_bytes" not in prior:
+        return " (no prior sample — first footprint record)"
+    if prior.get("mode") != mode_tag:
+        return f" (prior sample was {prior.get('mode','?')}-mode, not comparable to this {mode_tag}-mode value)"
+    p = prior["used_bytes"]
+    try:
+        days = (datetime.now(timezone.utc)
+                - datetime.strptime(prior["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).days
+    except Exception:  # noqa: BLE001
+        days = "?"
+    when = "today" if days == 0 else (f"{days}d ago" if isinstance(days, int) else "last run")
+    if p == 0:
+        return f" (prior was 0 — {when})"
+    pct = (used_bytes - p) / p * 100.0
+    sign = "+" if pct >= 0 else ""
+    return f" ({sign}{pct:.1f}% vs last run {when})"
+
+
+def r2_footprint_guard(secrets, this_full_zip_bytes, this_bundle_bytes):
+    """Emit the R2 footprint line + verdict. Returns (ok, line): ok=False only
+    on a RED (measured/projected breach of the hard ceiling) so main() can exit
+    nonzero and the cron surfaces it. A failed self-test degrades to
+    CANNOT-TELL (ok=True, non-blocking) rather than a false green or false red."""
+    st_ok, st_why = _r2_selftest()
+    if not st_ok:
+        return True, f"R2 footprint: CANNOT-TELL — guard self-test failed ({st_why}); not certifying size this run"
+
+    soft_b, hard_b = R2_SOFT_LIMIT_GB * _GB, R2_FREE_TIER_GB * _GB
+    cfg = _s3_cfg(secrets)
+    if cfg is not None:
+        # LIVE — the authoritative bucket-wide MEASUREMENT (all orgs share the bucket)
+        try:
+            used = _s3_list_sizes(cfg, "backups/")
+            mode = "MEASURED (live bucket LIST, all orgs)"
+        except Exception as e:  # noqa: BLE001
+            return True, f"R2 footprint: CANNOT-TELL — live LIST failed ({e.__class__.__name__}); size unknown this run"
+    else:
+        # DARK — this org's PROJECTION only (can't see other orgs' share)
+        used = _r2_local_projection(this_full_zip_bytes, this_bundle_bytes)
+        mode = f"PROJECTED ({BACKUP_ORG} only, retention×cycle; bucket-wide total needs live LIST)"
+
+    verdict = _r2_verdict(used, soft_b, hard_b)
+    delta = _r2_delta_phrase(used, "live" if cfg is not None else "dark")
+    line = (f"R2 footprint: {used/_GB:.2f} GB of {R2_FREE_TIER_GB:.0f} GB free tier "
+            f"(band {R2_SOFT_LIMIT_GB:.0f} GB) — {mode}{delta}")
+    if verdict == "RED":
+        return False, (f"  🔴 {line} — OVER the {R2_FREE_TIER_GB:.0f} GB free-tier ceiling. "
+                       f"Prune retention or move to a paid tier BEFORE next run.")
+    if verdict == "WARN":
+        return True, (f"  ⚠️ {line} — past the {R2_SOFT_LIMIT_GB:.0f} GB band, approaching the "
+                      f"{R2_FREE_TIER_GB:.0f} GB free-tier cliff. Plan retention/paid-tier now.")
+    return True, f"  ℹ️  {line} — healthy headroom."
+
+
 def upload_to_s3(secrets, artifacts):
     """Step 2e — encrypt + ship artifacts to the S3-compatible off-host bucket.
 
@@ -1403,6 +1553,18 @@ def main():
             _ok_s3, s3_status = upload_to_s3(secrets, s3_artifacts)
             print(s3_status)
 
+        # R2 size guardrail (task_1784412736637) — measure/project the R2
+        # footprint every run and flag before the 10GB free-tier cliff. Runs in
+        # both dry-run and real (it reads sizes, ships nothing). A RED (ceiling
+        # breach) sets its own tier-failure so the run exits nonzero.
+        this_bundle_bytes = 0
+        if INFRA_TIERS and not args.no_gateway:
+            this_bundle_bytes = sum(b.stat().st_size for b in GIT_BUNDLE_DIR.glob("*.bundle"))
+        r2_ok, r2_line = r2_footprint_guard(
+            secrets, int(full_size * 1024 * 1024), this_bundle_bytes)
+        print(r2_line)
+        r2_footprint_over = not r2_ok
+
         over_limit = size_mb > SIZE_LIMIT_MB
         if over_limit:
             print(f"WARN: zip ({size_mb:.1f} MB) exceeds {SIZE_LIMIT_MB} MB limit — sending without attachment")
@@ -1522,6 +1684,11 @@ def main():
             if "FAILED" in status:
                 tier_failures.append(tier)
                 print(f"ERROR: {tier} tier FAILED — {status}", file=sys.stderr)
+        # R2 footprint RED (over the free-tier ceiling) is a run failure too —
+        # a silent breach becomes a surprise bill or a rejected upload.
+        if r2_footprint_over:
+            tier_failures.append("r2-footprint")
+            print(f"ERROR: r2-footprint OVER free-tier ceiling — {r2_line.strip()}", file=sys.stderr)
 
     # Fail loudly. A backup that reports success while shipping no history is
     # worse than no backup: it buys false confidence and nobody looks again.
