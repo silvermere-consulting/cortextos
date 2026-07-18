@@ -4,7 +4,7 @@ import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile, parseTaskStatus } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -208,9 +208,10 @@ busCommand
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
   .option('--note <text>', 'Reason for the transition — lands in the task audit log (visible via task-history)')
   .action((id: string, status: string, opts: { note?: string }) => {
-    const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
-    if (!validStatuses.includes(status as TaskStatus)) {
-      console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
+    try {
+      parseTaskStatus(status);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
     const env = resolveEnv();
@@ -381,11 +382,22 @@ busCommand
   .option('--format <fmt>', 'Output format: json or text', 'text')
   .option('--respect-deps', 'Sort DAG-aware: unblocked tasks first, blocked tasks last')
   .action((opts: { agent?: string; status?: string; project?: string; titlePrefix?: string; format?: string; respectDeps?: boolean }) => {
+    // Validate the filter instead of casting: a typo'd --status would match
+    // nothing and render as "No tasks found" — a bad filter must be loud.
+    let statusFilter: TaskStatus | undefined;
+    if (opts.status !== undefined) {
+      try {
+        statusFilter = parseTaskStatus(opts.status);
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+    }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const tasks = listTasks(paths, {
       agent: opts.agent,
-      status: opts.status as TaskStatus,
+      status: statusFilter,
       project: opts.project,
       titlePrefix: opts.titlePrefix,
       respectDeps: opts.respectDeps ?? false,

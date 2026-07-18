@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile, parseTaskStatus, TASK_STATUSES } from '../../../src/bus/task';
 import type { BusPaths } from '../../../src/types';
 
 describe('Task Management', () => {
@@ -557,6 +557,23 @@ describe('Task audit log (append-only JSONL)', () => {
 
   it('readTaskAudit returns [] for a task with no history', () => {
     expect(readTaskAudit(paths, 'task_nonexistent_000')).toEqual([]);
+  });
+});
+
+describe('parseTaskStatus — loud validation instead of a silent cast', () => {
+  it('accepts every status in the vocabulary (known-positives)', () => {
+    for (const s of TASK_STATUSES) {
+      expect(parseTaskStatus(s)).toBe(s);
+    }
+  });
+
+  it('throws on a near-miss typo, naming the vocabulary (known-negative)', () => {
+    // 'inprogress' is the real-world typo that motivated this: as an
+    // unvalidated list-tasks filter it matched nothing and read as an
+    // empty queue instead of a bad filter.
+    expect(() => parseTaskStatus('inprogress')).toThrow(/Invalid status 'inprogress'.*in_progress/);
+    expect(() => parseTaskStatus('done')).toThrow(/Invalid status/);
+    expect(() => parseTaskStatus('')).toThrow(/Invalid status/);
   });
 });
 

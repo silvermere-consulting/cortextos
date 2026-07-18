@@ -256,6 +256,21 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
 }
 
 /**
+ * The full status vocabulary, in one place. CLI surfaces that accept a
+ * status string must validate through parseTaskStatus rather than casting:
+ * an unvalidated `as TaskStatus` on a filter turns a typo into a silent
+ * empty result, which reads as "no tasks" instead of "bad filter".
+ */
+export const TASK_STATUSES: readonly TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
+
+export function parseTaskStatus(s: string): TaskStatus {
+  if (!(TASK_STATUSES as readonly string[]).includes(s)) {
+    throw new Error(`Invalid status '${s}'. Must be one of: ${TASK_STATUSES.join(', ')}`);
+  }
+  return s as TaskStatus;
+}
+
+/**
  * Update a task's status. Matches bash update-task.sh behavior, with the
  * cross-org fallback from findTaskFile so an assignee in one org can drive
  * the lifecycle of a task filed by an orchestrator in a sibling org.
