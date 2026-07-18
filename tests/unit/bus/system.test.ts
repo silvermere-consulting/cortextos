@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
-import { selfRestart, hardRestart, autoCommit, autoCommitAgentRepo, checkGoalStaleness, postActivity, classifyBlockedText, hasCredential } from '../../../src/bus/system';
+import { selfRestart, hardRestart, autoCommit, autoCommitAgentRepo, checkGoalStaleness, postActivity, classifyBlockedText, hasCredential, hasCredentialHash } from '../../../src/bus/system';
 import type { BusPaths } from '../../../src/types';
 
 function makePaths(testDir: string, agent: string = 'test-agent'): BusPaths {
@@ -541,6 +541,16 @@ describe('Bus System', () => {
       const report = autoCommitAgentRepo(agentDir, true);
       expect(report.blocked.some(b => b.includes('sec-notes.md'))).toBe(false);
       expect(report.staged).toContain('memory/sec-notes.md');
+    });
+
+    it('hasCredentialHash is the htpasswd arm ALONE — hash fires, assignment prose does not', () => {
+      // The whole point of the narrow export: a prose-scanner must be able to
+      // detect hashes WITHOUT re-flagging `token=…` assignment prose that the
+      // full hasCredential correctly blocks at the commit gate.
+      expect(hasCredentialHash('x:$apr1$s$' + 'A1'.repeat(11))).toBe(true);
+      expect(hasCredentialHash('token=abc123')).toBe(false);   // full hasCredential fires on this
+      expect(hasCredential('token=abc123')).toBe(true);        // …proving the two differ where intended
+      expect(hasCredentialHash('prose mentioning $apr1$REPLACEME')).toBe(false);
     });
 
     it('htpasswd structural arms discriminate on exact digest length, both directions', () => {

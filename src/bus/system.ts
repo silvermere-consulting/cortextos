@@ -316,6 +316,19 @@ function hasCredentialAssignment(content: string): boolean {
 const CREDENTIAL_HTPASSWD =
   /\$apr1\$[A-Za-z0-9./]{1,8}\$[A-Za-z0-9./]{22}(?![A-Za-z0-9./])|\$2[aby]\$\d{2}\$[A-Za-z0-9./]{53}(?![A-Za-z0-9./])/;
 
+/**
+ * The htpasswd arm ALONE, for callers that scan PROSE-heavy corpora
+ * (analyst's nightly credential-at-rest pass, Step 2b): full hasCredential
+ * also carries the key-shape + assignment arms, which correctly fire on
+ * `token=…` prose that a hash detector must not re-flag. Exported as a
+ * FUNCTION, not the RegExp — a shared RegExp object invites lastIndex and
+ * mutation coupling; the predicate is the contract. Import this instead of
+ * copying the pattern: a copy agrees with the gate only until either edits.
+ */
+export function hasCredentialHash(content: string): boolean {
+  return CREDENTIAL_HTPASSWD.test(content);
+}
+
 export function hasCredential(content: string): boolean {
   return (
     CREDENTIAL_KEY_SHAPES.test(content) ||
