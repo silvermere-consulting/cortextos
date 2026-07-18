@@ -37,6 +37,7 @@ TODO Step 3: restore script in restore.py (companion to this script).
 """
 import argparse
 import ftplib
+import hashlib
 import imaplib
 import os
 import re
@@ -488,6 +489,18 @@ def _discover_repos() -> dict:
     return repos
 
 
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _bundle_sidecar(bundle: Path) -> Path:
+    return bundle.with_name(bundle.name + ".sha256")
+
+
 def make_git_bundles() -> tuple:
     """Regenerate a fresh bundle per repo, then VERIFY each one.
 
@@ -495,6 +508,14 @@ def make_git_bundles() -> tuple:
     cleanly is a silent-null wearing a success badge, and a stale bundle that
     is merely re-shipped is the same bug slowed down. Both are why this
     rebuilds every run and verifies before anything leaves the box.
+
+    AT-REST INTEGRITY (task_1784294569313): `git bundle verify` checks
+    prerequisites + signature but NOT the packfile tail — a bundle truncated
+    to HALF passes rc=0 (reproduced independently by chief). So verify alone
+    cannot detect on-disk rot. Each bundle gets a sha256 SIDECAR written at
+    creation; the upload legs assert the REMOTE bytes hash back to this
+    creation-time value, which closes both gaps (local rot between creation
+    and upload, and remote rot/truncation) with one artifact.
     """
     repos = _discover_repos()
     if not repos:
@@ -549,9 +570,23 @@ def make_git_bundles() -> tuple:
                 failed.append(f"{name}(verify)")
                 dest.unlink(missing_ok=True)
                 continue
+            # Creation-time hash. Written AFTER verify so a bundle that dies
+            # in verify never leaves a sidecar behind to vouch for it.
+            _bundle_sidecar(dest).write_text(f"{_sha256(dest)}  {dest.name}\n")
             made.append(dest)
         except Exception as e:  # noqa: BLE001 - report, never mask
             failed.append(f"{name}({type(e).__name__})")
+
+    # One-time backfill: retained bundles from before the sidecar existed get
+    # hashed NOW. That anchors integrity from today, not from their creation —
+    # stated honestly: rot BEFORE this backfill is invisible to it. They did
+    # pass `git bundle verify` + a size-assert on their original upload.
+    backfilled = 0
+    for b in GIT_BUNDLE_DIR.glob("*.bundle"):
+        sc = _bundle_sidecar(b)
+        if not sc.exists():
+            sc.write_text(f"{_sha256(b)}  {b.name}\n")
+            backfilled += 1
 
     # Prune old local bundles per repo by LEXICAL name sort. Names carry an
     # ISO-basic UTC stamp so lexical == chronological, which is immune to the
@@ -560,6 +595,7 @@ def make_git_bundles() -> tuple:
         old = sorted(GIT_BUNDLE_DIR.glob(f"{name}-*.bundle"))
         for stale in old[:-KEEP_BUNDLES]:
             stale.unlink(missing_ok=True)
+            _bundle_sidecar(stale).unlink(missing_ok=True)
 
     skip_note = f", skipped {len(skipped)} empty ({', '.join(sorted(skipped))})" if skipped else ""
 
@@ -571,16 +607,47 @@ def make_git_bundles() -> tuple:
         # a stale bundle wearing a success badge, which this tier exists to prevent.
         return False, f"Bundles: FAILED — no repo produced a bundle{skip_note}"
 
+    hash_note = f" + sha256 sidecars ({backfilled} backfilled)" if backfilled else " + sha256 sidecars"
     total_mb = sum(p.stat().st_size for p in made) / (1024 * 1024)
-    return True, (f"Bundles: {len(made)} repo(s) bundled + verified ({total_mb:.2f} MB), "
+    return True, (f"Bundles: {len(made)} repo(s) bundled + verified{hash_note} ({total_mb:.2f} MB), "
                   f"keep last {KEEP_BUNDLES}{skip_note}")
+
+
+def _load_creation_hashes(bundles) -> tuple:
+    """Read each bundle's creation-time sidecar into {name: hex}.
+    Returns (dict, "") or (None, reason). A missing/malformed sidecar is a
+    REFUSAL, not a recompute — hashing the current bytes at upload time would
+    vouch for exactly the rot the sidecar exists to catch."""
+    hashes = {}
+    for b in bundles:
+        sc = _bundle_sidecar(b)
+        if not sc.exists():
+            return None, f"no sha256 sidecar for {b.name}"
+        hx = sc.read_text().split()[0].strip().lower() if sc.read_text().split() else ""
+        if not re.fullmatch(r"[0-9a-f]{64}", hx):
+            return None, f"malformed sha256 sidecar for {b.name}"
+        hashes[b.name] = hx
+    return hashes, ""
+
+
+def _parse_sha256sum(out: str) -> dict:
+    """`sha256sum` output -> {basename: hex}, tolerating the `*name` binary marker."""
+    remote = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+            remote[os.path.basename(parts[-1].lstrip("*"))] = parts[0]
+    return remote
 
 
 def upload_git_bundles(secrets) -> tuple:
     """Ship this run's bundles to the gateway. Returns (ok, status).
 
-    Never touches the zip or the email attachment. Verifies remote byte-size
-    per file before reporting success, then prunes to KEEP_BUNDLES per repo.
+    Never touches the zip or the email attachment. Verifies the remote bytes
+    hash back to each bundle's CREATION-time sha256 before reporting success
+    (task_1784294569313 — `git bundle verify` passes a half-truncated file,
+    and a size-assert passes rot that keeps the length), then prunes to
+    KEEP_BUNDLES per repo.
     """
     host = secrets.get("TRAEFIK_GATEWAY_HOST", "").strip()
     user = secrets.get("TRAEFIK_GATEWAY_SSH_USER", "").strip()
@@ -591,6 +658,9 @@ def upload_git_bundles(secrets) -> tuple:
     bundles = sorted(GIT_BUNDLE_DIR.glob("*.bundle"))
     if not bundles:
         return False, "Bundles->gateway: FAILED (nothing to upload)"
+    hashes, why = _load_creation_hashes(bundles)
+    if hashes is None:
+        return False, f"Bundles->gateway: FAILED ({why})"
 
     askpass_path = None
     try:
@@ -612,30 +682,37 @@ def upload_git_bundles(secrets) -> tuple:
         if rc != 0:
             return False, f"Bundles->gateway: FAILED (mkdir) — {err.strip() or rc}"
 
+        sidecars = [str(_bundle_sidecar(b)) for b in bundles]
         rc, _o, err = _run_ssh(
-            ["scp"] + ssh_opts + [str(b) for b in bundles] + [f"{target}:{GATEWAY_BUNDLE_DIR}/"],
+            ["scp"] + ssh_opts + [str(b) for b in bundles] + sidecars + [f"{target}:{GATEWAY_BUNDLE_DIR}/"],
             env, timeout=600)
         if rc != 0:
             return False, f"Bundles->gateway: FAILED (scp) — {err.strip() or rc}"
 
+        # Hash-assert against the CREATION-time sidecar, one ssh for the set.
+        rc, out, err = _run_ssh(
+            ["ssh"] + ssh_opts + [target, f"cd {GATEWAY_BUNDLE_DIR} && sha256sum *.bundle"],
+            env, timeout=300)
+        if rc != 0:
+            return False, f"Bundles->gateway: FAILED (remote sha256sum) — {err.strip() or rc}"
+        remote = _parse_sha256sum(out)
         for b in bundles:
-            rc, out, _e = _run_ssh(
-                ["ssh"] + ssh_opts + [target, f"stat -c %s {GATEWAY_BUNDLE_DIR}/{b.name}"], env)
-            remote = out.strip()
-            if rc != 0 or not remote.isdigit() or int(remote) != b.stat().st_size:
-                return False, (f"Bundles->gateway: FAILED (size mismatch on {b.name}: "
-                               f"local={b.stat().st_size} remote={remote or '?'})")
+            if remote.get(b.name) != hashes[b.name]:
+                return False, (f"Bundles->gateway: FAILED (hash mismatch on {b.name}: "
+                               f"creation={hashes[b.name][:12]}… remote={(remote.get(b.name) or '?')[:12]}…)")
 
         # Lexical prune per repo prefix — same reasoning as the local prune.
+        # Each pruned bundle takes its .sha256 sidecar with it.
         prefixes = sorted({b.name.rsplit("-", 1)[0] for b in bundles})
         for pref in prefixes:
             prune = (f"ls -1 {GATEWAY_BUNDLE_DIR}/{pref}-*.bundle 2>/dev/null "
-                     f"| sort | head -n -{KEEP_BUNDLES} | xargs -r rm -f")
+                     f"| sort | head -n -{KEEP_BUNDLES} "
+                     f"| while IFS= read -r f; do rm -f \"$f\" \"$f.sha256\"; done")
             _run_ssh(["ssh"] + ssh_opts + [target, prune], env)
 
         total_mb = sum(b.stat().st_size for b in bundles) / (1024 * 1024)
         return True, (f"Bundles->gateway: {len(bundles)} file(s) ({total_mb:.2f} MB) -> "
-                      f"{host}:{GATEWAY_BUNDLE_DIR} (size-verified, keep last {KEEP_BUNDLES})")
+                      f"{host}:{GATEWAY_BUNDLE_DIR} (sha256-verified vs creation, keep last {KEEP_BUNDLES})")
     except Exception as e:  # noqa: BLE001
         return False, f"Bundles->gateway: FAILED — {e}"
     finally:
@@ -766,6 +843,9 @@ def upload_git_bundles_secondary() -> tuple:
     bundles = sorted(GIT_BUNDLE_DIR.glob("*.bundle"))
     if not bundles:
         return False, "Bundles->secondary: FAILED (nothing to upload)"
+    hashes, why = _load_creation_hashes(bundles)
+    if hashes is None:
+        return False, f"Bundles->secondary: FAILED ({why})"
     ssh_opts = ["-o", "StrictHostKeyChecking=accept-new",
                 "-o", "ConnectTimeout=30", "-o", "BatchMode=yes"]
     env = os.environ.copy()
@@ -773,27 +853,34 @@ def upload_git_bundles_secondary() -> tuple:
         rc, _o, err = _run_ssh(["ssh"] + ssh_opts + [SECONDARY_TARGET, f"mkdir -p {SECONDARY_BUNDLE_DIR}"], env)
         if rc != 0:
             return False, f"Bundles->secondary: FAILED (mkdir) — {err.strip() or rc}"
+        sidecars = [str(_bundle_sidecar(b)) for b in bundles]
         rc, _o, err = _run_ssh(
-            ["scp"] + ssh_opts + [str(b) for b in bundles] + [f"{SECONDARY_TARGET}:{SECONDARY_BUNDLE_DIR}/"],
+            ["scp"] + ssh_opts + [str(b) for b in bundles] + sidecars + [f"{SECONDARY_TARGET}:{SECONDARY_BUNDLE_DIR}/"],
             env, timeout=600)
         if rc != 0:
             return False, f"Bundles->secondary: FAILED (scp) — {err.strip() or rc}"
+        # Hash-assert against the CREATION-time sidecar, one ssh for the set.
+        rc, out, err = _run_ssh(
+            ["ssh"] + ssh_opts + [SECONDARY_TARGET, f"cd {SECONDARY_BUNDLE_DIR} && sha256sum *.bundle"],
+            env, timeout=300)
+        if rc != 0:
+            return False, f"Bundles->secondary: FAILED (remote sha256sum) — {err.strip() or rc}"
+        remote = _parse_sha256sum(out)
         for b in bundles:
-            rc, out, _e = _run_ssh(
-                ["ssh"] + ssh_opts + [SECONDARY_TARGET, f"stat -c %s {SECONDARY_BUNDLE_DIR}/{b.name}"], env)
-            remote = out.strip()
-            if rc != 0 or not remote.isdigit() or int(remote) != b.stat().st_size:
-                return False, (f"Bundles->secondary: FAILED (size mismatch on {b.name}: "
-                               f"local={b.stat().st_size} remote={remote or '?'})")
+            if remote.get(b.name) != hashes[b.name]:
+                return False, (f"Bundles->secondary: FAILED (hash mismatch on {b.name}: "
+                               f"creation={hashes[b.name][:12]}… remote={(remote.get(b.name) or '?')[:12]}…)")
         # Lexical prune per repo prefix — same reasoning as the gateway leg.
+        # Each pruned bundle takes its .sha256 sidecar with it.
         prefixes = sorted({b.name.rsplit("-", 1)[0] for b in bundles})
         for pref in prefixes:
             prune = (f"ls -1 {SECONDARY_BUNDLE_DIR}/{pref}-*.bundle 2>/dev/null "
-                     f"| sort | head -n -{KEEP_BUNDLES} | xargs -r rm -f")
+                     f"| sort | head -n -{KEEP_BUNDLES} "
+                     f"| while IFS= read -r f; do rm -f \"$f\" \"$f.sha256\"; done")
             _run_ssh(["ssh"] + ssh_opts + [SECONDARY_TARGET, prune], env)
         total_mb = sum(b.stat().st_size for b in bundles) / (1024 * 1024)
         return True, (f"Bundles->secondary: {len(bundles)} file(s) ({total_mb:.2f} MB) -> "
-                      f"{SECONDARY_TARGET}:{SECONDARY_BUNDLE_DIR} (size-verified, keep last {KEEP_BUNDLES})")
+                      f"{SECONDARY_TARGET}:{SECONDARY_BUNDLE_DIR} (sha256-verified vs creation, keep last {KEEP_BUNDLES})")
     except Exception as e:  # noqa: BLE001
         return False, f"Bundles->secondary: FAILED — {e}"
 
