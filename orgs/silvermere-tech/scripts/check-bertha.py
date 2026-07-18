@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""check-bertha.py — poll bertha@silvermere.tech IMAP inbox and surface
+NEW unread messages to chief via the cortextos bus.
+
+Design choices:
+- Local seen-set in state/chief/bertha-seen.json keyed by Message-ID. We do
+  NOT mark messages as read on the server — Steve still sees normal unread
+  badges in his mail client.
+- Surfaces only messages not previously surfaced. First run after deploy
+  back-fills the seen-set with currently-unread IDs so we don't spam chief
+  with the existing backlog.
+- One bus send-message per new message, normal priority. Body is sender +
+  subject + a short body excerpt (text/plain preferred, HTML stripped to
+  text as a fallback).
+- Idempotent: safe to re-run by cron without dedup issues.
+
+Reads (from orgs/silvermere-tech/secrets.env or env):
+  HOSTINGER_EMAIL              — bertha@silvermere.tech
+  HOSTINGER_EMAIL_APP_PASSWORD — app password
+"""
+
+from __future__ import annotations
+
+import email
+import imaplib
+import json
+import os
+import re
+import subprocess
+import sys
+from email.header import decode_header, make_header
+from pathlib import Path
+from typing import Iterable
+
+IMAP_HOST = "imap.hostinger.com"
+IMAP_PORT = 993
+SECRETS_ENV = Path("/home/cortext/cortextos/orgs/silvermere-tech/secrets.env")
+STATE_FILE = Path(
+    os.environ.get("CTX_ROOT", os.path.expanduser("~/.cortextos/dev"))
+) / "state" / "chief" / "bertha-seen.json"
+BODY_EXCERPT_CHARS = 800  # cap surfaced body to keep Telegram-friendly
+
+
+def _load_secrets() -> None:
+    """Source HOSTINGER_EMAIL + HOSTINGER_EMAIL_APP_PASSWORD from secrets.env
+    if not already in env. Lets the script run from cron without a shell."""
+    if os.environ.get("HOSTINGER_EMAIL") and os.environ.get(
+        "HOSTINGER_EMAIL_APP_PASSWORD"
+    ):
+        return
+    if not SECRETS_ENV.exists():
+        return
+    with SECRETS_ENV.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.startswith("export "):
+                key = key[len("export "):]
+            if key in ("HOSTINGER_EMAIL", "HOSTINGER_EMAIL_APP_PASSWORD"):
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+
+
+def _decode_header(raw: str | None) -> str:
+    if not raw:
+        return ""
+    try:
+        return str(make_header(decode_header(raw)))
+    except Exception:
+        return raw or ""
+
+
+def _extract_body(msg: email.message.Message) -> str:
+    """Best-effort plain-text excerpt. Prefers text/plain part; falls back to
+    text/html with tags stripped."""
+    text_plain: str | None = None
+    text_html: str | None = None
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = (part.get_content_type() or "").lower()
+            if part.get("Content-Disposition", "").lower().startswith("attachment"):
+                continue
+            if ct == "text/plain" and text_plain is None:
+                text_plain = _decode_payload(part)
+            elif ct == "text/html" and text_html is None:
+                text_html = _decode_payload(part)
+    else:
+        ct = (msg.get_content_type() or "").lower()
+        body = _decode_payload(msg)
+        if ct == "text/html":
+            text_html = body
+        else:
+            text_plain = body
+
+    if text_plain:
+        return _clean_text(text_plain)
+    if text_html:
+        return _clean_text(_strip_html(text_html))
+    return ""
+
+
+def _decode_payload(part: email.message.Message) -> str:
+    try:
+        payload = part.get_payload(decode=True) or b""
+        charset = part.get_content_charset() or "utf-8"
+        return payload.decode(charset, errors="replace")
+    except Exception:
+        try:
+            return str(part.get_payload() or "")
+        except Exception:
+            return ""
+
+
+_HTML_TAG = re.compile(r"<[^>]+>")
+_WS = re.compile(r"\s+")
+
+
+def _strip_html(html: str) -> str:
+    return _HTML_TAG.sub(" ", html)
+
+
+def _clean_text(s: str) -> str:
+    return _WS.sub(" ", s).strip()
+
+
+def _load_seen() -> set[str]:
+    if not STATE_FILE.exists():
+        return set()
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return set(data.get("seen", []))
+    except Exception:
+        return set()
+
+
+def _save_seen(seen: set[str]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Cap the seen-set so it can't grow unbounded over years of polling.
+    capped = sorted(seen)[-5000:]
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump({"seen": capped}, fh, indent=2)
+    tmp.replace(STATE_FILE)
+
+
+def _surface_to_chief(message_id: str, sender: str, subject: str, body: str) -> None:
+    excerpt = body[:BODY_EXCERPT_CHARS]
+    if len(body) > BODY_EXCERPT_CHARS:
+        excerpt += "…"
+    text = (
+        f"BERTHA INBOX — new unread\n"
+        f"From: {sender}\n"
+        f"Subject: {subject}\n"
+        f"Message-ID: {message_id}\n\n"
+        f"{excerpt}"
+    )
+    subprocess.run(
+        ["cortextos", "bus", "send-message", "chief", "normal", text],
+        check=False,
+    )
+
+
+def _iter_unread_ids(imap: imaplib.IMAP4_SSL) -> Iterable[bytes]:
+    typ, data = imap.search(None, "UNSEEN")
+    if typ != "OK" or not data or not data[0]:
+        return []
+    return data[0].split()
+
+
+# Above this size, a new message's FULL body is not fetched — only its first
+# MIME part (where the text lives in ordinary and in our own backup mails),
+# capped. The excerpt is 800 chars; a 22MB zip attachment adds nothing to it.
+FULL_FETCH_MAX_BYTES = 2 * 1024 * 1024
+_SIZE_RE = re.compile(rb"RFC822\.SIZE (\d+)")
+
+
+def _fetch_headers(imap: imaplib.IMAP4_SSL, ids: list[bytes]) -> list[tuple[bytes, int, str]]:
+    """ONE batched fetch of (size, Message-ID/From/Subject/Date headers) for
+    all unread ids. Returns [(seq_id, rfc822_size, message_id_key), ...].
+
+    This pass exists so the seen-check happens BEFORE any body fetch. The
+    previous shape fetched full RFC822 of every UNSEEN message and THEN
+    checked the seen-set — measured 2026-07-18: 169.2 MB per poll (7 keep-7
+    backup-zip mails at ~22 MB dominate), which is chief's 90-120s polls.
+    Headers for the same 58 messages are a few KB in one round trip."""
+    typ, data = imap.fetch(
+        b",".join(ids),
+        "(RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE)])")
+    if typ != "OK" or not data:
+        return []
+    out = []
+    for item in data:
+        if not isinstance(item, tuple):
+            continue
+        meta, header_bytes = item
+        seq_m = re.match(rb"(\d+) ", meta)
+        if not seq_m:  # response we can't attribute to a message — skip it
+            continue
+        seq = seq_m.group(1)
+        m = _SIZE_RE.search(meta)
+        size = int(m.group(1)) if m else 0
+        hdr = email.message_from_bytes(header_bytes)
+        mid = (hdr.get("Message-ID") or "").strip()
+        if not mid:
+            mid = f"no-msgid:{seq.decode(errors='replace')}:{_decode_header(hdr.get('Date'))}"
+        out.append((seq, size, mid))
+    return out
+
+
+def _fetch_message(imap: imaplib.IMAP4_SSL, seq: bytes, size: int) -> email.message.Message | None:
+    """Body fetch for a message the seen-diff proved NEW. Size-gated: ordinary
+    mail comes whole; anything over FULL_FETCH_MAX_BYTES (backup zips) gets
+    headers + first MIME part only — enough for the surfaced excerpt, without
+    re-downloading an attachment nobody reads."""
+    if size <= FULL_FETCH_MAX_BYTES:
+        typ, data = imap.fetch(seq, "(RFC822)")
+        if typ != "OK" or not data or not isinstance(data[0], tuple):
+            return None
+        return email.message_from_bytes(data[0][1])
+    typ, data = imap.fetch(seq, "(BODY.PEEK[HEADER] BODY.PEEK[1]<0.65536>)")
+    if typ != "OK" or not data:
+        return None
+    header_bytes = body_bytes = b""
+    for item in data:
+        if not isinstance(item, tuple):
+            continue
+        if b"BODY[HEADER]" in item[0].upper():
+            header_bytes = item[1]
+        else:
+            body_bytes = item[1]
+    if not header_bytes:
+        return None
+    msg = email.message_from_bytes(header_bytes)
+    # Present the first part's text as a simple body for _extract_body.
+    plain = body_bytes.decode("utf-8", errors="replace")
+    stub = email.message.Message()
+    for k, v in msg.items():
+        stub[k] = v
+    if stub.get_content_maintype() == "multipart":
+        del stub["Content-Type"]
+        stub["Content-Type"] = "text/plain"
+    stub.set_payload(plain)
+    return stub
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    bootstrap = "--bootstrap" in argv  # first deploy: backfill seen-set, no surface
+    quiet = "--quiet" in argv
+
+    _load_secrets()
+    user = os.environ.get("HOSTINGER_EMAIL")
+    pwd = os.environ.get("HOSTINGER_EMAIL_APP_PASSWORD")
+    if not user or not pwd:
+        print("HOSTINGER_EMAIL or HOSTINGER_EMAIL_APP_PASSWORD missing", file=sys.stderr)
+        return 2
+
+    try:
+        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        imap.login(user, pwd)
+    except Exception as exc:
+        print(f"IMAP login failed: {exc}", file=sys.stderr)
+        return 3
+
+    surfaced = 0
+    try:
+        imap.select("INBOX", readonly=True)  # readonly = won't flip \\Seen
+        seen = _load_seen()
+        new_seen = set(seen)
+
+        unread = list(_iter_unread_ids(imap))
+        # Header pass first (one batched round trip, a few KB), THEN the
+        # seen-diff, THEN bodies only for what the diff proved new. Bodies of
+        # already-seen unread mail are never re-downloaded.
+        for seq, size, mid in (_fetch_headers(imap, unread) if unread else []):
+            if mid in seen:
+                continue
+            new_seen.add(mid)
+
+            if bootstrap:
+                continue  # backfill only — do not surface
+
+            msg = _fetch_message(imap, seq, size)
+            if msg is None:
+                # Header said new but the body fetch failed: do NOT record it
+                # as seen, so the next poll retries instead of silently
+                # swallowing the message forever.
+                new_seen.discard(mid)
+                continue
+            sender = _decode_header(msg.get("From")) or "unknown"
+            subject = _decode_header(msg.get("Subject")) or "(no subject)"
+            body = _extract_body(msg)
+            _surface_to_chief(mid, sender, subject, body)
+            surfaced += 1
+
+        if new_seen != seen:
+            _save_seen(new_seen)
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+    if not quiet:
+        mode = "bootstrap" if bootstrap else "poll"
+        print(f"[check-bertha] {mode}: surfaced={surfaced} seen_total={len(_load_seen())}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
