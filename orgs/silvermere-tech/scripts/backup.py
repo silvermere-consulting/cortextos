@@ -715,6 +715,7 @@ def upload_to_gateway(secrets, zip_path: str) -> str:
 SECONDARY_TARGET = os.environ.get("BACKUP_SECONDARY_TARGET", "deploy@10.10.10.10")  # key-based ssh, proven path (umami tier)
 SECONDARY_REMOTE_DIR = "/home/deploy/backups/silvermere-org-full"
 KEEP_SECONDARY = 7
+SECONDARY_BUNDLE_DIR = "/home/deploy/backups/silvermere-org-git-bundles"
 
 
 def upload_to_secondary(zip_path: str) -> str:
@@ -751,6 +752,50 @@ def upload_to_secondary(zip_path: str) -> str:
                 f"(size-verified, keep last {KEEP_SECONDARY})")
     except Exception as e:
         return f"Secondary: FAILED — {e}"
+
+
+def upload_git_bundles_secondary() -> tuple:
+    """Second home for this run's bundles: docker01 (.10, 167G), over the
+    key-based ssh path the FULL zip already uses. Same contract as the
+    gateway leg — byte-size verified per file before success, lexical prune
+    to KEEP_BUNDLES per repo prefix. Added 2026-07-18 (task_1784325977603):
+    the bundle tier was single-homed on the gateway disk that filled to
+    100% while the ZIP had already been dual-homed — when you add a
+    fallback, ask which OTHER tier still shares the same single point of
+    failure. Returns (ok, status)."""
+    bundles = sorted(GIT_BUNDLE_DIR.glob("*.bundle"))
+    if not bundles:
+        return False, "Bundles->secondary: FAILED (nothing to upload)"
+    ssh_opts = ["-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=30", "-o", "BatchMode=yes"]
+    env = os.environ.copy()
+    try:
+        rc, _o, err = _run_ssh(["ssh"] + ssh_opts + [SECONDARY_TARGET, f"mkdir -p {SECONDARY_BUNDLE_DIR}"], env)
+        if rc != 0:
+            return False, f"Bundles->secondary: FAILED (mkdir) — {err.strip() or rc}"
+        rc, _o, err = _run_ssh(
+            ["scp"] + ssh_opts + [str(b) for b in bundles] + [f"{SECONDARY_TARGET}:{SECONDARY_BUNDLE_DIR}/"],
+            env, timeout=600)
+        if rc != 0:
+            return False, f"Bundles->secondary: FAILED (scp) — {err.strip() or rc}"
+        for b in bundles:
+            rc, out, _e = _run_ssh(
+                ["ssh"] + ssh_opts + [SECONDARY_TARGET, f"stat -c %s {SECONDARY_BUNDLE_DIR}/{b.name}"], env)
+            remote = out.strip()
+            if rc != 0 or not remote.isdigit() or int(remote) != b.stat().st_size:
+                return False, (f"Bundles->secondary: FAILED (size mismatch on {b.name}: "
+                               f"local={b.stat().st_size} remote={remote or '?'})")
+        # Lexical prune per repo prefix — same reasoning as the gateway leg.
+        prefixes = sorted({b.name.rsplit("-", 1)[0] for b in bundles})
+        for pref in prefixes:
+            prune = (f"ls -1 {SECONDARY_BUNDLE_DIR}/{pref}-*.bundle 2>/dev/null "
+                     f"| sort | head -n -{KEEP_BUNDLES} | xargs -r rm -f")
+            _run_ssh(["ssh"] + ssh_opts + [SECONDARY_TARGET, prune], env)
+        total_mb = sum(b.stat().st_size for b in bundles) / (1024 * 1024)
+        return True, (f"Bundles->secondary: {len(bundles)} file(s) ({total_mb:.2f} MB) -> "
+                      f"{SECONDARY_TARGET}:{SECONDARY_BUNDLE_DIR} (size-verified, keep last {KEEP_BUNDLES})")
+    except Exception as e:  # noqa: BLE001
+        return False, f"Bundles->secondary: FAILED — {e}"
 
 
 def relocate_from_junk(host, port, user, password, subject, attempts=6, delay=5):
@@ -988,15 +1033,23 @@ def main():
         if args.no_gateway:
             bundle_status = "Bundles: skipped (--no-gateway)"
         elif args.dry_run:
-            bundle_status = f"Bundles: dry-run — would rebuild + copy to {GATEWAY_BUNDLE_DIR}"
+            bundle_status = (f"Bundles: dry-run — would rebuild + copy to {GATEWAY_BUNDLE_DIR} "
+                             f"AND {SECONDARY_TARGET}:{SECONDARY_BUNDLE_DIR}")
         else:
             ok_make, bundle_status = make_git_bundles()
             print(bundle_status)
             if ok_make:
-                ok_up, up_status = upload_git_bundles(secrets)
-                print(up_status)
-                bundle_status = f"{bundle_status}\n  {up_status}"
-                bundles_failed = not ok_up
+                # Dual-homed (task_1784325977603): both legs always run — a
+                # failed gateway leg must never short-circuit the .10 leg,
+                # that ordering dependency is how one full disk took git
+                # history off-box down entirely on 2026-07-17. Either leg
+                # failing still fails the run: degraded redundancy is loud.
+                ok_gw, gw_up_status = upload_git_bundles(secrets)
+                print(gw_up_status)
+                ok_sec, sec_up_status = upload_git_bundles_secondary()
+                print(sec_up_status)
+                bundle_status = f"{bundle_status}\n  {gw_up_status}\n  {sec_up_status}"
+                bundles_failed = not (ok_gw and ok_sec)
             else:
                 bundles_failed = True
 
@@ -1121,7 +1174,8 @@ def main():
     # The zip/email path has already succeeded by here, so this exit code says
     # precisely "the git-history tier failed", and the cron surfaces it.
     if bundles_failed:
-        print("ERROR: git-bundle tier FAILED — history did NOT reach the gateway", file=sys.stderr)
+        print("ERROR: git-bundle tier FAILED — see per-leg status above "
+              "(history must land on BOTH gateway and secondary)", file=sys.stderr)
         sys.exit(1)
     if tier_failures:
         sys.exit(1)
