@@ -38,6 +38,7 @@ TODO Step 3: restore script in restore.py (companion to this script).
 import argparse
 import ftplib
 import hashlib
+import hmac
 import imaplib
 import os
 import re
@@ -861,6 +862,250 @@ def upload_git_bundles_secondary() -> tuple:
         return False, f"Bundles->secondary: FAILED — {e}"
 
 
+# --- Step 2e: S3-compatible off-host tier (STAGED DARK 2026-07-18, task_1784359893159) ---
+#
+# Steve's catch (task_1784359500586): .10 and the gateway are VMs on the SAME
+# physical host — every scp tier above is single-VM redundancy, not DR. This
+# leg is the true off-host home. Staged DARK: fully built + harness-armed, but
+# DORMANT until BACKUP_S3_ENDPOINT lands in secrets.env (Steve picks R2 or B2;
+# both are S3-compatible, so the pick is an endpoint+creds swap, zero rework).
+#
+# Design rules, each bought by a measured failure this week:
+#   - Skip-when-unconfigured is LOUD (a printed line), never silence.
+#   - Client-side AES-256-GCM BEFORE upload; key missing = FAIL CLOSED
+#     (plaintext never ships as a fallback). Provider SSE is not our threat
+#     model — the provider holds those keys.
+#   - sha256 READ-BACK assert on remote bytes vs ciphertext-at-creation
+#     (remote bytes are the truth; a 200 on PUT is not).
+#   - Prune is ORG-SCOPED by key prefix and REFUSES to delete outside it
+#     (the family-backup first-run lesson: a second tenant's first action
+#     audits every shared-namespace selector).
+#
+# Config (secrets.env): BACKUP_S3_ENDPOINT (enabling switch, e.g.
+#   https://<acct>.r2.cloudflarestorage.com or https://s3.<region>.backblazeb2.com),
+#   BACKUP_S3_BUCKET, BACKUP_S3_ACCESS_KEY_ID, BACKUP_S3_SECRET_ACCESS_KEY,
+#   BACKUP_S3_REGION (default "auto" — R2's value; B2 uses its region string),
+#   BACKUP_ENCRYPT_PASSPHRASE (client-side key material; ESCROW A COPY with
+#   Steve — a key that dies with this host protects nothing).
+#
+# Restore (DR runbook): download backups/{org}/<name>.zip.enc, then
+#   python3 -c "import sys; sys.path.insert(0,'scripts'); import backup;
+#               backup._decrypt_file('<in>.enc','<out>.zip','<passphrase>')"
+# Needs python3 + `pip install cryptography` on the restore box.
+
+KEEP_S3 = 7
+_S3_ENC_MAGIC = b"CTXS3E1"  # header: MAGIC + salt(16) + nonce(12) + AESGCM ciphertext
+
+
+def _s3_cfg(secrets):
+    """Tier config, or None when dormant (endpoint unset)."""
+    endpoint = (os.environ.get("BACKUP_S3_ENDPOINT") or secrets.get("BACKUP_S3_ENDPOINT", "")).strip()
+    if not endpoint:
+        return None
+    get = lambda k, d="": (os.environ.get(k) or secrets.get(k, d)).strip()
+    return {
+        "endpoint": endpoint.rstrip("/"),
+        "bucket": get("BACKUP_S3_BUCKET"),
+        "key_id": get("BACKUP_S3_ACCESS_KEY_ID"),
+        "secret": get("BACKUP_S3_SECRET_ACCESS_KEY"),
+        "region": get("BACKUP_S3_REGION", "auto") or "auto",
+        "passphrase": get("BACKUP_ENCRYPT_PASSPHRASE"),
+    }
+
+
+def _s3_request(cfg, method, key="", query_pairs=(), data=b"", timeout=120):
+    """Minimal AWS SigV4 request, stdlib-only (no boto3 on this host, and the
+    tier must stay DR-portable). Path-style addressing: {endpoint}/{bucket}/{key}
+    — works on both R2 and B2. Returns (http_status, body_bytes).
+
+    NOTE the honest scope: the signer is spec-implemented and the harness stub
+    asserts a well-formed AWS4-HMAC-SHA256 Authorization header on every call,
+    but signature ACCEPTANCE can only be proven against the live provider —
+    that is the first-real-run check when the tier is enabled."""
+    import urllib.parse as _up
+    import urllib.request as _ur
+
+    host = _up.urlparse(cfg["endpoint"]).netloc
+    amz_date = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_date[:8]
+    payload_hash = hashlib.sha256(data or b"").hexdigest()
+
+    # canonical URI: our keys are generated from a safe charset; refuse others
+    # rather than encode surprises into a signature mismatch.
+    path = f"/{cfg['bucket']}" + (f"/{key}" if key else "")
+    if not re.fullmatch(r"[A-Za-z0-9./_\-]*", key):
+        raise ValueError(f"S3 key outside safe charset: {key!r}")
+
+    canonical_query = "&".join(
+        f"{_up.quote(str(k), safe='')}={_up.quote(str(v), safe='')}"
+        for k, v in sorted(query_pairs)
+    )
+    headers = {
+        "host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+    }
+    signed_headers = ";".join(sorted(headers))
+    canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
+    canonical_request = "\n".join(
+        [method, path, canonical_query, canonical_headers, signed_headers, payload_hash])
+    scope = f"{date_stamp}/{cfg['region']}/s3/aws4_request"
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256", amz_date, scope,
+        hashlib.sha256(canonical_request.encode()).hexdigest()])
+
+    def _hmac(k, msg):
+        return hmac.new(k, msg.encode(), hashlib.sha256).digest()
+
+    k_date = _hmac(("AWS4" + cfg["secret"]).encode(), date_stamp)
+    k_region = _hmac(k_date, cfg["region"])
+    k_service = _hmac(k_region, "s3")
+    k_signing = _hmac(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode(), hashlib.sha256).hexdigest()
+
+    url = cfg["endpoint"] + path + (f"?{canonical_query}" if canonical_query else "")
+    req = _ur.Request(url, data=data if method in ("PUT", "POST") else None, method=method)
+    req.add_header("x-amz-content-sha256", payload_hash)
+    req.add_header("x-amz-date", amz_date)
+    req.add_header(
+        "Authorization",
+        f"AWS4-HMAC-SHA256 Credential={cfg['key_id']}/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}")
+    try:
+        with _ur.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except _ur.HTTPError as e:
+        return e.code, e.read()
+
+
+def _encrypt_file(src, dest, passphrase):
+    """Client-side AES-256-GCM (authenticated). Key = scrypt(passphrase, salt).
+    Import is LAZY on purpose: without `cryptography` installed the rest of
+    backup.py must keep working while this tier is dormant."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # lazy, see above
+    salt, nonce = os.urandom(16), os.urandom(12)
+    key = hashlib.scrypt(passphrase.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32,
+                         maxmem=64 * 1024 * 1024)
+    with open(src, "rb") as f:
+        plaintext = f.read()
+    ct = AESGCM(key).encrypt(nonce, plaintext, None)
+    with open(dest, "wb") as f:
+        f.write(_S3_ENC_MAGIC + salt + nonce + ct)
+
+
+def _decrypt_file(src, dest, passphrase):
+    """Restore path — proven by the harness round-trip arm, documented in the
+    tier header. A backup that has never been decrypted is theatre."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # lazy
+    with open(src, "rb") as f:
+        blob = f.read()
+    if not blob.startswith(_S3_ENC_MAGIC):
+        raise ValueError("not a CTXS3E1 envelope (wrong file or pre-encryption artifact)")
+    off = len(_S3_ENC_MAGIC)
+    salt, nonce = blob[off:off + 16], blob[off + 16:off + 28]
+    key = hashlib.scrypt(passphrase.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32,
+                         maxmem=64 * 1024 * 1024)
+    plaintext = AESGCM(key).decrypt(nonce, blob[off + 28:], None)
+    with open(dest, "wb") as f:
+        f.write(plaintext)
+
+
+def _s3_list_keys(cfg, prefix):
+    """List object keys under prefix (list-type=2, paged)."""
+    keys, token = [], None
+    while True:
+        q = [("list-type", "2"), ("prefix", prefix)]
+        if token:
+            q.append(("continuation-token", token))
+        status, body = _s3_request(cfg, "GET", "", q)
+        if status != 200:
+            raise RuntimeError(f"LIST {prefix!r} -> HTTP {status}: {body[:200]!r}")
+        text = body.decode(errors="replace")
+        keys += re.findall(r"<Key>([^<]+)</Key>", text)
+        m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", text)
+        token = m.group(1) if m else None
+        if not token:
+            return keys
+
+
+def upload_to_s3(secrets, artifacts):
+    """Step 2e — encrypt + ship artifacts to the S3-compatible off-host bucket.
+
+    artifacts: list of Path. Each lands as backups/{org}/{name}.enc after
+    client-side encryption; remote bytes are read back and sha256-asserted
+    against the ciphertext-at-creation hash. Prune keeps KEEP_S3 zips and
+    KEEP_BUNDLES bundles per repo prefix, ONLY under this org's prefix.
+    Returns (ok, status)."""
+    cfg = _s3_cfg(secrets)
+    if cfg is None:
+        return True, ("S3 off-host: not configured (BACKUP_S3_ENDPOINT unset) — "
+                      "leg staged dark 2026-07-18, awaiting Steve's R2-vs-B2 pick; skipped")
+    missing = [k for k in ("bucket", "key_id", "secret") if not cfg[k]]
+    if missing:
+        return False, f"S3 off-host: FAILED (endpoint set but incomplete config: {', '.join(missing)})"
+    if not cfg["passphrase"]:
+        return False, ("S3 off-host: FAILED (BACKUP_ENCRYPT_PASSPHRASE unset — "
+                       "refusing to ship plaintext off-host; tier fails CLOSED)")
+
+    org_prefix = f"backups/{BACKUP_ORG}/"
+    shipped, total_mb = [], 0.0
+    try:
+        for art in artifacts:
+            art = Path(art)
+            enc = Path(tempfile.gettempdir()) / f"{art.name}.enc"
+            try:
+                _encrypt_file(art, enc, cfg["passphrase"])
+                cipher_hash = _sha256(enc)
+                data = enc.read_bytes()
+                key = f"{org_prefix}{art.name}.enc"
+                status, body = _s3_request(cfg, "PUT", key, data=data, timeout=600)
+                if status not in (200, 201):
+                    return False, f"S3 off-host: FAILED (PUT {art.name} -> HTTP {status}: {body[:200]!r})"
+                # Read-back: remote bytes are the truth, a 200 is not.
+                status, remote = _s3_request(cfg, "GET", key, timeout=600)
+                if status != 200:
+                    return False, f"S3 off-host: FAILED (read-back GET {art.name} -> HTTP {status})"
+                remote_hash = hashlib.sha256(remote).hexdigest()
+                if remote_hash != cipher_hash:
+                    return False, (f"S3 off-host: FAILED (read-back hash mismatch on {art.name}: "
+                                   f"creation={cipher_hash[:12]}… remote={remote_hash[:12]}…)")
+                shipped.append(art.name)
+                total_mb += len(data) / (1024 * 1024)
+            finally:
+                enc.unlink(missing_ok=True)
+
+        # Org-scoped prune. Structural refusal: every candidate key must carry
+        # our org prefix — if the LIST ever returns a foreign key, we stop
+        # rather than delete it (the shared-namespace-selector lesson).
+        listed = _s3_list_keys(cfg, org_prefix)
+        foreign = [k for k in listed if not k.startswith(org_prefix)]
+        if foreign:
+            return False, (f"S3 off-host: FAILED (prune refused: LIST under {org_prefix!r} "
+                           f"returned foreign key {foreign[0]!r} — selector scope broken)")
+        pruned = 0
+        zips = sorted(k for k in listed if k.endswith(".zip.enc"))
+        for k in zips[:-KEEP_S3] if len(zips) > KEEP_S3 else []:
+            st, _ = _s3_request(cfg, "DELETE", k)
+            if st not in (200, 204):
+                return False, f"S3 off-host: FAILED (prune DELETE {k} -> HTTP {st})"
+            pruned += 1
+        bundles = [k for k in listed if k.endswith(".bundle.enc")]
+        for pref in sorted({k.rsplit("-", 1)[0] for k in bundles}):
+            series = sorted(k for k in bundles if k.rsplit("-", 1)[0] == pref)
+            for k in series[:-KEEP_BUNDLES] if len(series) > KEEP_BUNDLES else []:
+                st, _ = _s3_request(cfg, "DELETE", k)
+                if st not in (200, 204):
+                    return False, f"S3 off-host: FAILED (prune DELETE {k} -> HTTP {st})"
+                pruned += 1
+
+        return True, (f"S3 off-host: {len(shipped)} artifact(s) ({total_mb:.2f} MB encrypted) -> "
+                      f"{cfg['endpoint']}/{cfg['bucket']}/{org_prefix} "
+                      f"(AES-256-GCM client-side, sha256 read-back verified, "
+                      f"org-scoped prune removed {pruned})")
+    except Exception as e:  # noqa: BLE001 — tier reports, main() attributes + exits
+        return False, f"S3 off-host: FAILED — {e}"
+
+
 def relocate_from_junk(host, port, user, password, subject, attempts=6, delay=5):
     """Move a self-sent daily backup from INBOX.Junk back to INBOX.
 
@@ -996,6 +1241,8 @@ def main():
                         help="Skip Step 2 FTPS upload even if configured.")
     parser.add_argument("--no-gateway", action="store_true",
                         help="Skip Step 2b off-host gateway copy.")
+    parser.add_argument("--no-s3", action="store_true",
+                        help="Skip Step 2e S3 off-host tier even if configured.")
     args = parser.parse_args()
     configure_org(args.org)
 
@@ -1137,6 +1384,25 @@ def main():
             else:
                 bundles_failed = True
 
+        # Step 2e — S3-compatible off-host tier (the only leg that leaves this
+        # PHYSICAL host; scp tiers are same-host VMs — Steve's 2026-07-18
+        # catch). Runs after the bundle block so this run's bundles ride too.
+        # Dormant-but-LOUD until Steve's R2-vs-B2 pick lands in secrets.env.
+        if args.no_s3:
+            s3_status = "S3 off-host: skipped (--no-s3)"
+        elif args.dry_run:
+            s3_cfg_probe = _s3_cfg(secrets)
+            s3_status = (f"S3 off-host: dry-run — would encrypt + ship to "
+                         f"{s3_cfg_probe['endpoint']}/{s3_cfg_probe['bucket']}/backups/{BACKUP_ORG}/"
+                         if s3_cfg_probe
+                         else "S3 off-host: dry-run — not configured (BACKUP_S3_ENDPOINT unset), leg staged dark")
+        else:
+            s3_artifacts = [Path(full_path)]
+            if INFRA_TIERS and not args.no_gateway and not bundles_failed:
+                s3_artifacts += sorted(GIT_BUNDLE_DIR.glob("*.bundle"))
+            _ok_s3, s3_status = upload_to_s3(secrets, s3_artifacts)
+            print(s3_status)
+
         over_limit = size_mb > SIZE_LIMIT_MB
         if over_limit:
             print(f"WARN: zip ({size_mb:.1f} MB) exceeds {SIZE_LIMIT_MB} MB limit — sending without attachment")
@@ -1147,7 +1413,8 @@ def main():
                 f"  {local_status}\n"
                 f"  {ftp_status}\n"
                 f"  {gw_status}\n"
-                f"  {sec_status}\n\n"
+                f"  {sec_status}\n"
+                f"  {s3_status}\n\n"
                 f"Excluded {len(skipped)} credential/binary file(s).\n"
             )
             attach = None
@@ -1165,6 +1432,7 @@ def main():
                 f"(CORE + the projects sweep, {full_size:.2f} MB) rides the scp tiers only.\n"
                 f"Retained copies:\n  {local_status}\n  {ftp_status}\n  {gw_status}\n"
                 f"  {sec_status}\n"
+                f"  {s3_status}\n"
                 f"  {bundle_status}\n\n"
                 f"Restore: use scripts/restore.py to fetch + unzip from IMAP.\n"
             )
@@ -1174,6 +1442,7 @@ def main():
             print(f"DRY RUN — would send to {DAILY_DEST}" + (f" + {WEEKLY_DEST}" if is_weekly else ""))
             print(f"DRY RUN — {ftp_status}")
             print(f"DRY RUN — {gw_status}")
+            print(f"DRY RUN — {s3_status}")
             if over_limit:
                 print("DRY RUN — zip over limit, would send without attachment")
             return
@@ -1224,6 +1493,7 @@ def main():
                 f"  {local_status}\n"
                 f"  {gw_status}\n"
                 f"  {sec_status}\n"
+                f"  {s3_status}\n"
                 f"  {ftp_status}\n\n"
                 f"True off-site (OVH Backup Storage via FTPS) is being wired; until then the "
                 f"gateway copy on a separate box is the off-host safety. Ask engineer/chief "
@@ -1248,7 +1518,7 @@ def main():
         tier_failures = []
         for tier, status in (("local-retain", local_status), ("ftp", ftp_status),
                              ("gateway", gw_status), ("secondary", sec_status),
-                             ("email", email_status)):
+                             ("s3", s3_status), ("email", email_status)):
             if "FAILED" in status:
                 tier_failures.append(tier)
                 print(f"ERROR: {tier} tier FAILED — {status}", file=sys.stderr)
