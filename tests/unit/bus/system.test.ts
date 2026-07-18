@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
-import { selfRestart, hardRestart, autoCommit, autoCommitAgentRepo, checkGoalStaleness, postActivity, classifyBlockedText } from '../../../src/bus/system';
+import { selfRestart, hardRestart, autoCommit, autoCommitAgentRepo, checkGoalStaleness, postActivity, classifyBlockedText, hasCredential } from '../../../src/bus/system';
 import type { BusPaths } from '../../../src/types';
 
 function makePaths(testDir: string, agent: string = 'test-agent'): BusPaths {
@@ -512,12 +512,47 @@ describe('Bus System', () => {
     });
 
     it('blocks apr1/bcrypt htpasswd hashes — the shape the value-bearing scan misses', () => {
+      // Both fixtures are STRUCTURALLY real, semantically worthless.
+      // apr1: 8-char salt + exactly-22-char digest (matches the live traefik
+      // corpus layout, 7/7 measured 2026-07-18). bcrypt: cost + 53 chars of
+      // MCF base64 (22 salt + 31 digest), COMPOSED AT RUN TIME so no
+      // screen-matching literal is ever committed to this file — a committed
+      // real-structure hash would re-trip the very screen it tests.
+      const bcryptStructural = '$2y$10$' + 'Ab1.'.repeat(13) + 'C'; // 53 chars
       writeFileSync(join(agentDir, 'memory', 'leak.md'), 'users: liwa:$apr1$SYNTH000$0000000000000000000000');
-      writeFileSync(join(agentDir, 'memory', 'leak2.md'), 'hash: $2y$10$abcdefghijklmnopqrstuv');
+      writeFileSync(join(agentDir, 'memory', 'leak2.md'), `hash: ${bcryptStructural}`);
 
       const report = autoCommitAgentRepo(agentDir, true);
       expect(report.blocked.some(b => b.includes('leak.md') && b.includes('credential'))).toBe(true);
       expect(report.blocked.some(b => b.includes('leak2.md') && b.includes('credential'))).toBe(true);
+    });
+
+    it('htpasswd arm is STRUCTURAL: prose mentions, truncated prefixes, and placeholders stage', () => {
+      // The loose prefix predicate fired on the WORD `$apr1$`/`$2y$` followed
+      // by any 6+/20+ base64ish chars — so every memory file DOCUMENTING
+      // credential work tripped the screen nightly and had to be hand-masked
+      // to snapshot (the treadmill this swap ends). None of these is a hash:
+      writeFileSync(join(agentDir, 'memory', 'sec-notes.md'), [
+        'the old predicate `$apr1$|$2[aby]$` fired on prose like this line',
+        'masked a hash starting $2y$10$abcdefghijklmnopqrstuv in the snapshot',
+        'template row: user:$apr1$REPLACEME (documented placeholder)',
+      ].join('\n'));
+
+      const report = autoCommitAgentRepo(agentDir, true);
+      expect(report.blocked.some(b => b.includes('sec-notes.md'))).toBe(false);
+      expect(report.staged).toContain('memory/sec-notes.md');
+    });
+
+    it('htpasswd structural arms discriminate on exact digest length, both directions', () => {
+      // Real structure fires…
+      expect(hasCredential('x:$apr1$s$' + 'A1'.repeat(11))).toBe(true);           // 1-char salt + 22 (old predicate MISSED short salts)
+      expect(hasCredential('x:$apr1$SYNTH000$' + 'A1'.repeat(11))).toBe(true);    // 8-char salt + 22
+      expect(hasCredential('x:$2b$12$' + 'Ab1.'.repeat(13) + 'C')).toBe(true);    // cost + 53
+      // …and near-misses do not: a digest one char short or long is not a hash.
+      expect(hasCredential('x:$apr1$SYNTH000$' + 'A'.repeat(21))).toBe(false);
+      expect(hasCredential('x:$apr1$SYNTH000$' + 'A'.repeat(23))).toBe(false);
+      expect(hasCredential('x:$2y$10$' + 'A'.repeat(52))).toBe(false);
+      expect(hasCredential('x:$2y$10$' + 'A'.repeat(54))).toBe(false);
     });
 
     it('still stages MEMORY.md once its hashes are redacted', () => {

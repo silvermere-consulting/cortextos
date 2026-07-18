@@ -301,12 +301,20 @@ function hasCredentialAssignment(content: string): boolean {
 // it held six of these, and the same blind spot let apr1 hashes reach agent
 // memory files — which ship off-box in the nightly backup email.
 // Two distinct layouts, and a single character class cannot express both:
-//   apr1:   $apr1$<salt>$<hash>
-//   bcrypt: $2y$<cost>$<salt+hash>   <- the `10$` cost field breaks a naive class
+//   apr1:   $apr1$<salt 1-8>$<22-char digest>        (fixed-length MD5 output)
+//   bcrypt: $2[aby]$<cost 2>$<53 chars: 22 salt + 31 digest>   (MCF layout;
+//           the `10$` cost field breaks a naive class)
+// STRUCTURAL, not prefix-loose (2026-07-18, task_1784312753310): the old
+// `{6,}` / `{20,}` tails fired on the WORD `$apr1$…` in prose, so every
+// memory file DOCUMENTING credential work tripped the screen nightly and had
+// to be hand-masked to snapshot. A real hash has a fixed structure; prose and
+// placeholders (`$apr1$REPLACEME`) don't. Exact digest lengths with a
+// boundary lookahead: strictly stronger in BOTH directions — the old apr1 arm
+// also MISSED hashes with salts shorter than 6 chars, which now block.
 // A redacted marker like `$apr1$<REDACTED>` matches neither, by design, so
 // memory files stay committable once their hash bodies are stripped.
 const CREDENTIAL_HTPASSWD =
-  /\$apr1\$[A-Za-z0-9./]{6,}|\$2[aby]\$\d{2}\$[A-Za-z0-9./]{20,}/;
+  /\$apr1\$[A-Za-z0-9./]{1,8}\$[A-Za-z0-9./]{22}(?![A-Za-z0-9./])|\$2[aby]\$\d{2}\$[A-Za-z0-9./]{53}(?![A-Za-z0-9./])/;
 
 export function hasCredential(content: string): boolean {
   return (
