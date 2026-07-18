@@ -133,7 +133,7 @@ ORG_EXTRA_INCLUDE = {
 # org keeps its exact historical paths; new orgs get cleanly derived ones.
 _LEGACY_NAMES = {
     "silvermere-tech": dict(retain="org-daily", gw="silvermere-org",
-                            gwgit="silvermere-git", sec="silvermere-org-full",
+                            sec="silvermere-org-full",
                             secgit="silvermere-org-git-bundles"),
 }
 
@@ -144,13 +144,13 @@ def configure_org(org: str) -> None:
     here is DERIVED — adding an org means having a directory under orgs/,
     not adding constants."""
     global BACKUP_ORG, ORG_ROOT, GIT_BUNDLE_DIR, LOCAL_RETAIN_DIR, ZIP_PREFIX
-    global GATEWAY_REMOTE_DIR, GATEWAY_BUNDLE_DIR, SECONDARY_REMOTE_DIR
+    global GATEWAY_REMOTE_DIR, SECONDARY_REMOTE_DIR
     global SECONDARY_BUNDLE_DIR, INCLUDE_PATTERNS, INFRA_TIERS, _BACKUP_NAME_RE
     root = Path(f"/home/cortext/cortextos/orgs/{org}")
     if not root.is_dir():
         raise SystemExit(f"unknown org '{org}': {root} does not exist")
     names = _LEGACY_NAMES.get(org, dict(
-        retain=f"{org}-daily", gw=f"{org}-org", gwgit=f"{org}-git",
+        retain=f"{org}-daily", gw=f"{org}-org",
         sec=f"{org}-org-full", secgit=f"{org}-org-git-bundles"))
     BACKUP_ORG = org
     ORG_ROOT = root
@@ -167,7 +167,6 @@ def configure_org(org: str) -> None:
     # Step 2b — off-host copy to the OVH gateway (internal infra, our own box).
     # The gateway is a small 2.0G LXC, so retention is kept lean.
     GATEWAY_REMOTE_DIR = f"/home/cortext/backups/{names['gw']}"
-    GATEWAY_BUNDLE_DIR = f"/home/cortext/backups/{names['gwgit']}"
     SECONDARY_REMOTE_DIR = f"/home/deploy/backups/{names['sec']}"
     SECONDARY_BUNDLE_DIR = f"/home/deploy/backups/{names['secgit']}"
     INCLUDE_PATTERNS = GENERIC_INCLUDE + ORG_EXTRA_INCLUDE.get(org, [])
@@ -654,7 +653,7 @@ def make_git_bundles() -> tuple:
         return False, f"Bundles: FAILED — {', '.join(failed)} (made {len(made)}{skip_note})"
     if not made:
         # Every repo skipped => nothing fresh to ship. Returning True here would let
-        # upload_git_bundles() re-scp the RETAINED bundles and call it a success —
+        # upload_git_bundles_secondary() re-scp the RETAINED bundles and call it a success —
         # a stale bundle wearing a success badge, which this tier exists to prevent.
         return False, f"Bundles: FAILED — no repo produced a bundle{skip_note}"
 
@@ -691,87 +690,14 @@ def _parse_sha256sum(out: str) -> dict:
     return remote
 
 
-def upload_git_bundles(secrets) -> tuple:
-    """Ship this run's bundles to the gateway. Returns (ok, status).
-
-    Never touches the zip or the email attachment. Verifies the remote bytes
-    hash back to each bundle's CREATION-time sha256 before reporting success
-    (task_1784294569313 — `git bundle verify` passes a half-truncated file,
-    and a size-assert passes rot that keeps the length), then prunes to
-    KEEP_BUNDLES per repo.
-    """
-    host = secrets.get("TRAEFIK_GATEWAY_HOST", "").strip()
-    user = secrets.get("TRAEFIK_GATEWAY_SSH_USER", "").strip()
-    password = secrets.get("TRAEFIK_GATEWAY_SSH_PASSWORD", "").strip()
-    if not (host and user and password):
-        return False, "Bundles->gateway: FAILED (TRAEFIK_GATEWAY_* not configured)"
-
-    bundles = sorted(GIT_BUNDLE_DIR.glob("*.bundle"))
-    if not bundles:
-        return False, "Bundles->gateway: FAILED (nothing to upload)"
-    hashes, why = _load_creation_hashes(bundles)
-    if hashes is None:
-        return False, f"Bundles->gateway: FAILED ({why})"
-
-    askpass_path = None
-    try:
-        fd, askpass_path = tempfile.mkstemp(prefix="bk_askpass_", suffix=".sh")
-        with os.fdopen(fd, "w") as f:
-            f.write('#!/bin/sh\necho "$GW_SSH_PW"\n')
-        os.chmod(askpass_path, 0o700)
-        env = os.environ.copy()
-        env["GW_SSH_PW"] = password
-        env["SSH_ASKPASS"] = askpass_path
-        env["SSH_ASKPASS_REQUIRE"] = "force"
-        env["DISPLAY"] = env.get("DISPLAY", ":0")
-
-        ssh_opts = ["-o", "StrictHostKeyChecking=accept-new",
-                    "-o", "ConnectTimeout=30", "-o", "BatchMode=no"]
-        target = f"{user}@{host}"
-
-        rc, _o, err = _run_ssh(["ssh"] + ssh_opts + [target, f"mkdir -p {GATEWAY_BUNDLE_DIR}"], env)
-        if rc != 0:
-            return False, f"Bundles->gateway: FAILED (mkdir) — {err.strip() or rc}"
-
-        sidecars = [str(_bundle_sidecar(b)) for b in bundles]
-        rc, _o, err = _run_ssh(
-            ["scp"] + ssh_opts + [str(b) for b in bundles] + sidecars + [f"{target}:{GATEWAY_BUNDLE_DIR}/"],
-            env, timeout=600)
-        if rc != 0:
-            return False, f"Bundles->gateway: FAILED (scp) — {err.strip() or rc}"
-
-        # Hash-assert against the CREATION-time sidecar, one ssh for the set.
-        rc, out, err = _run_ssh(
-            ["ssh"] + ssh_opts + [target, f"cd {GATEWAY_BUNDLE_DIR} && sha256sum *.bundle"],
-            env, timeout=300)
-        if rc != 0:
-            return False, f"Bundles->gateway: FAILED (remote sha256sum) — {err.strip() or rc}"
-        remote = _parse_sha256sum(out)
-        for b in bundles:
-            if remote.get(b.name) != hashes[b.name]:
-                return False, (f"Bundles->gateway: FAILED (hash mismatch on {b.name}: "
-                               f"creation={hashes[b.name][:12]}… remote={(remote.get(b.name) or '?')[:12]}…)")
-
-        # Lexical prune per repo prefix — same reasoning as the local prune.
-        # Each pruned bundle takes its .sha256 sidecar with it.
-        prefixes = sorted({b.name.rsplit("-", 1)[0] for b in bundles})
-        for pref in prefixes:
-            prune = (f"ls -1 {GATEWAY_BUNDLE_DIR}/{pref}-*.bundle 2>/dev/null "
-                     f"| sort | head -n -{KEEP_BUNDLES} "
-                     f"| while IFS= read -r f; do rm -f \"$f\" \"$f.sha256\"; done")
-            _run_ssh(["ssh"] + ssh_opts + [target, prune], env)
-
-        total_mb = sum(b.stat().st_size for b in bundles) / (1024 * 1024)
-        return True, (f"Bundles->gateway: {len(bundles)} file(s) ({total_mb:.2f} MB) -> "
-                      f"{host}:{GATEWAY_BUNDLE_DIR} (sha256-verified vs creation, keep last {KEEP_BUNDLES})")
-    except Exception as e:  # noqa: BLE001
-        return False, f"Bundles->gateway: FAILED — {e}"
-    finally:
-        if askpass_path:
-            try:
-                os.unlink(askpass_path)
-            except OSError:
-                pass
+# The gateway BUNDLE leg was RETIRED 2026-07-18 (chief decision, Option 1,
+# msg 1784348468181; Steve AM brief FYI+veto): the nightly upload ships the
+# whole retained set (~673M) and a 2.1G routing LXC cannot hold set + incoming
+# headroom at ANY keep depth — it was always an ill-fitting bundle home.
+# Bundles now ride upload_git_bundles_secondary() to .10 (165G, sha256-assert
+# vs creation). The gateway carries the ZIP tier only, which fits with ~5x
+# headroom. Upgrade path if 3-home bundle redundancy is wanted back: resize
+# the LXC (Proxmox host side, [HUMAN]).
 
 
 def upload_to_gateway(secrets, zip_path: str) -> str:
@@ -1192,23 +1118,22 @@ def main():
         elif args.no_gateway:
             bundle_status = "Bundles: skipped (--no-gateway)"
         elif args.dry_run:
-            bundle_status = (f"Bundles: dry-run — would rebuild + copy to {GATEWAY_BUNDLE_DIR} "
-                             f"AND {SECONDARY_TARGET}:{SECONDARY_BUNDLE_DIR}")
+            bundle_status = (f"Bundles: dry-run — would rebuild + copy to "
+                             f"{SECONDARY_TARGET}:{SECONDARY_BUNDLE_DIR} (gateway leg retired 2026-07-18)")
         else:
             ok_make, bundle_status = make_git_bundles()
             print(bundle_status)
             if ok_make:
-                # Dual-homed (task_1784325977603): both legs always run — a
-                # failed gateway leg must never short-circuit the .10 leg,
-                # that ordering dependency is how one full disk took git
-                # history off-box down entirely on 2026-07-17. Either leg
-                # failing still fails the run: degraded redundancy is loud.
-                ok_gw, gw_up_status = upload_git_bundles(secrets)
-                print(gw_up_status)
                 ok_sec, sec_up_status = upload_git_bundles_secondary()
                 print(sec_up_status)
-                bundle_status = f"{bundle_status}\n  {gw_up_status}\n  {sec_up_status}"
-                bundles_failed = not (ok_gw and ok_sec)
+                # State the retirement wherever the tier reports, so a reader
+                # auditing the email body doesn't conclude history lost a home
+                # silently — it moved by decision, with an upgrade path.
+                retired_note = ("Bundles->gateway: leg retired 2026-07-18 (Option 1) — "
+                                ".10 is the off-box bundle home; gateway carries zips only")
+                print(retired_note)
+                bundle_status = f"{bundle_status}\n  {sec_up_status}\n  {retired_note}"
+                bundles_failed = not ok_sec
             else:
                 bundles_failed = True
 
