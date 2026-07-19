@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
-"""cortextOS org backup — Step 1 (zip + email) + Step 2 (FTPS off-site).
+"""cortextOS org backup — zip + off-host tiers.
 
-Zips the silvermere-tech org's durable knowledge and config, then:
-  - DAILY: emails the zip to bertha@silvermere.tech (self-managed retention,
-    last 7 daily backups kept via IMAP prune).
-  - WEEKLY (Sundays, or pass --weekly): also emails the zip to
-    steven.barker@silvermereconsulting.com as an offsite copy.
-  - STEP 2 (if BACKUP_FTP_HOST configured in secrets.env): uploads the zip
-    to an FTPS target for true off-site backup. Runs regardless of zip size
-    — provides off-site backup for ALL daily zips, not just the oversized
-    ones that fail the email path. Includes retention pruning.
+Zips the org's durable knowledge and config, then lands it on:
+  - LOCAL retain (/home/cortext/backups/<org>-daily, keep KEEP_LOCAL)
+  - GATEWAY (10.10.10.6, CORE zip only — the LXC is small, keep KEEP_GATEWAY)
+  - SECONDARY .10 (FULL zip + git bundles, sha256-verified)
+  - R2 (S3 tier, AES-256-GCM client-side encrypted, sha256 read-back
+    verified; the off-vendor DR copy — restore-proven 2026-07-18)
+  - FTPS (only if BACKUP_FTP_HOST configured; currently unconfigured)
 
-Both email sends use the system path (no auto-CC). The weekly send is TO
-Steven by design, not a CC — it's his explicit offsite copy.
-
-SIZE GUARD on email: zips exceeding SIZE_LIMIT_MB are sent as a no-attachment
-notification only — the FTP step (Step 2) is the recovery path for those.
-If FTP is not configured AND the zip is oversized, the email body says so
-explicitly so a human can manually intervene.
+EMAIL TIER REMOVED 2026-07-19 (Steve directive): R2 made the mailbox copy
+redundant, and the mailbox's 35MB wire ceiling was a standing cliff against
+CORE growth. Restore no longer involves IMAP — see restore.py (fetches from
+.10) and the R2 restore runbook it points at.
 
 Usage:
-  backup.py                   # daily mode (auto-weekly on Sundays)
-  backup.py --weekly          # force weekly send today
-  backup.py --dry-run         # build + size-check the zip, don't send
-  backup.py --no-ftp          # skip Step 2 even if configured (one-off testing)
+  backup.py                   # daily run, all configured tiers
+  backup.py --dry-run         # build + size-check the zip, don't upload
+  backup.py --no-ftp          # skip FTPS even if configured (one-off testing)
 
 CONFIG (secrets.env keys for Step 2 — all optional; absence = Step 2 disabled):
   BACKUP_FTP_HOST              FTPS hostname (REQUIRED to enable Step 2)
@@ -39,45 +33,33 @@ import argparse
 import ftplib
 import hashlib
 import hmac
-import imaplib
 import json
 import os
 import re
 import shutil
-import smtplib
 import ssl
 import subprocess
 import sys
 import tempfile
 import zipfile
 from datetime import datetime, timezone
-from email import encoders
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 
 DEFAULT_ORG = "silvermere-tech"
-# BACKUP_SECRETS_FILE / BACKUP_SIZE_LIMIT_MB: test-surface overrides so the
-# loud-tier harness (workspace/backup-hardening/) can point a REAL run at
-# sandboxed creds / a synthetic size limit without touching prod secrets or
-# mailing bertha@. Defaults unchanged; production never sets them.
+# BACKUP_SECRETS_FILE: test-surface override so the loud-tier harness
+# (workspace/backup-hardening/) can point a REAL run at sandboxed creds
+# without touching prod secrets. Default unchanged; production never sets it.
 #
 # TRANSPORT IS INFRA-SCOPED, CONTENT IS ORG-SCOPED (task_1784295189575):
-# the mailbox, gateway ssh and .10 ssh credentials belong to the machine
-# room, not to the org being backed up — every org's zip rides the same
-# transport, so SECRETS_FILE / DAILY_DEST / WEEKLY_DEST do NOT vary with
-# --org. What varies is the CONTENT (root, include set) and the NAMESPACE
-# (zip prefix, retain/remote dirs), all derived in configure_org().
+# the gateway ssh and .10 ssh credentials belong to the machine room, not
+# to the org being backed up — every org's zip rides the same transport, so
+# SECRETS_FILE does NOT vary with --org. What varies is the CONTENT (root,
+# include set) and the NAMESPACE (zip prefix, retain/remote dirs), all
+# derived in configure_org().
 SECRETS_FILE = Path(os.environ.get(
     "BACKUP_SECRETS_FILE",
     "/home/cortext/cortextos/orgs/silvermere-tech/secrets.env"))
-SIZE_LIMIT_MB = float(os.environ.get("BACKUP_SIZE_LIMIT_MB", "20"))
-DAILY_DEST = "bertha@silvermere.tech"
-WEEKLY_DEST = "steven.barker@silvermereconsulting.com"
-KEEP_DAILY = 7
 KEEP_LOCAL = 14
-BACKUP_SUBJECT_PREFIX = "[BACKUP]"
 KEEP_GATEWAY = 7
 KEEP_BUNDLES = 7
 
@@ -100,11 +82,11 @@ GENERIC_INCLUDE = [
 ]
 
 # Per-org extras beyond the generic core. Projects named here ride the CORE
-# (email-bound) zip; every OTHER project rides the FULL zip via the
-# swept_projects() sweep — so an org with no entry here (family) still gets
-# all its projects backed up, just on the scp tiers where no 20MB email
-# ceiling applies. That split is MEASURED at run time (zip sizes + the WARN
-# band), never a typed per-org number.
+# zip (the lean artifact, sized for the gateway's small LXC); every OTHER
+# project rides the FULL zip via the swept_projects() sweep — so an org with
+# no entry here (family) still gets all its projects backed up, on the tiers
+# with no size pressure. That split is MEASURED at run time (zip sizes
+# printed every run), never a typed per-org number.
 ORG_EXTRA_INCLUDE = {
     "silvermere-tech": [
         # Project docs (exclude clearspeak-studio/app — node_modules/build, ~641MB)
@@ -120,13 +102,11 @@ ORG_EXTRA_INCLUDE = {
         "projects/clearspeak-studio",  # node_modules/build/dist/.next stripped by EXCLUDE_DIRS
         "backups/umami",               # self-host Umami DB dump (written fresh by dump_umami_db() each run)
         # NOTE (2026-07-09): git bundles are deliberately NOT included here.
-        # EXCLUDE_DIRS strips every .git dir, so no repo history leaves this box —
-        # a real DR gap. The obvious fix (add "backups/git") was measured and
-        # REJECTED: it takes the zip from 13.3 MB to 30.67 MB, past SIZE_LIMIT_MB,
-        # so the email tier silently drops its attachment. That tier is also the
-        # documented restore path (restore.py fetches from IMAP), so we would have
-        # traded a history gap for a restore gap and been told nothing.
-        # Bundles go off-host via the gateway instead. See task_1783575583… .
+        # EXCLUDE_DIRS strips every .git dir, so no repo history leaves this
+        # box via the zip — bundles are their own tier (make_git_bundles →
+        # gateway/.10/R2). Folding them in would more than double the CORE
+        # zip (measured 13.3→30.67 MB) for copies the bundle tier already
+        # ships sha256-verified. See task_1783575583… .
     ],
 }
 
@@ -353,7 +333,7 @@ def build_zip(dest_path: str, extra_dirs: list = None) -> tuple[float, list[str]
 def retain_local(zip_path: str, date_str: str) -> str:
     """Copy the built zip to a durable local path + prune old copies.
     The on-box retained snapshot — guarantees a retained copy exists even when
-    the zip is oversized (no email attachment) AND FTPS is unconfigured."""
+    the zip is oversized AND FTPS is unconfigured."""
     try:
         LOCAL_RETAIN_DIR.mkdir(parents=True, exist_ok=True)
         dest = LOCAL_RETAIN_DIR / f"{ZIP_PREFIX}{date_str}.zip"
@@ -370,37 +350,6 @@ def retain_local(zip_path: str, date_str: str) -> str:
         return f"Local retain: {dest} ({size_mb:.2f} MB); pruned {pruned}, keeping last {KEEP_LOCAL}"
     except Exception as e:
         return f"Local retain: FAILED — {e}"
-
-
-def send_backup(smtp_host, smtp_port, sender, password, recipient, subject, body, zip_path=None):
-    if zip_path:
-        msg = MIMEMultipart("mixed")
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-        with open(zip_path, "rb") as f:
-            data = f.read()
-        part = MIMEBase("application", "zip")
-        part.set_payload(data)
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", "attachment",
-                        filename=os.path.basename(zip_path))
-        msg.attach(part)
-    else:
-        msg = MIMEText(body, "plain", "utf-8")
-
-    msg["From"] = sender
-    msg["To"] = recipient
-    msg["Subject"] = subject
-
-    # BACKUP_SMTP_PLAIN=1: test-surface override (harness body arms) — plain
-    # SMTP to a local sink, no TLS, no AUTH. The arms assert BODY CONTENT;
-    # transport is not the object under test. Default (unset) unchanged.
-    if os.environ.get("BACKUP_SMTP_PLAIN") == "1":
-        with smtplib.SMTP(smtp_host, smtp_port) as smtp:
-            smtp.send_message(msg)
-        return
-    with smtplib.SMTP_SSL(smtp_host, smtp_port) as smtp:
-        smtp.login(sender, password)
-        smtp.sendmail(sender, [recipient], msg.as_string())
 
 
 def _ftp_connect(secrets):
@@ -431,7 +380,7 @@ def _ftp_connect(secrets):
 
 
 def upload_to_ftp(secrets, zip_path: str) -> str:
-    """Upload zip_path via FTPS. Returns one-line status string for email body."""
+    """Upload zip_path via FTPS. Returns one-line status string for the report."""
     try:
         ftps, remote_dir = _ftp_connect(secrets)
     except Exception as e:
@@ -706,7 +655,7 @@ def upload_to_gateway(secrets, zip_path: str) -> str:
     """Step 2b — off-host copy of the zip to the OVH gateway over SSH/scp.
     Internal infra (our own box), so no spend/approval gate. Verifies the remote
     byte-size matches local before reporting success, then prunes to KEEP_GATEWAY.
-    Returns a one-line status string for the email body."""
+    Returns a one-line status string for the report."""
     host = secrets.get("TRAEFIK_GATEWAY_HOST", "").strip()
     user = secrets.get("TRAEFIK_GATEWAY_SSH_USER", "").strip()
     password = secrets.get("TRAEFIK_GATEWAY_SSH_PASSWORD", "").strip()
@@ -1256,92 +1205,6 @@ def upload_to_s3(secrets, artifacts):
         return False, f"S3 off-host: FAILED — {e}"
 
 
-def relocate_from_junk(host, port, user, password, subject, attempts=6, delay=5):
-    """Move a self-sent daily backup from INBOX.Junk back to INBOX.
-
-    Hostinger's spam filter heuristically files bertha->bertha automated mail
-    (base64 zip + automated pattern) into Junk — it is NOT an auth failure (SPF
-    passes). ManageSieve (port 4190) is TCP-open but resets real sessions
-    (firewalled to Hostinger's own hosts), so a server-side filter is not
-    reachable from here. Instead, after the send, find the message by exact
-    subject and IMAP UID-MOVE it to INBOX so retention + restore see it where
-    expected. Best-effort with a short retry for LDA delivery lag; failure is
-    non-fatal — restore.py also searches Junk as a safety net."""
-    import time
-    try:
-        with imaplib.IMAP4_SSL(host, port) as imap:
-            imap.login(user, password)
-            typ, caps = imap.capability()
-            has_move = b"MOVE" in caps[0].upper()
-            for _ in range(attempts):
-                imap.select("INBOX.Junk")
-                status, data = imap.search(None, f'SUBJECT "{subject}"')
-                seqs = data[0].split() if status == "OK" and data and data[0] else []
-                if seqs:
-                    moved = 0
-                    for seq in seqs:
-                        st, u = imap.fetch(seq, "(UID)")
-                        m = re.search(rb"UID (\d+)", (u[0] or b"") if u else b"")
-                        if not m:
-                            continue
-                        uid = m.group(1).decode()
-                        if has_move:
-                            imap.uid("MOVE", uid, "INBOX")
-                        else:
-                            imap.uid("COPY", uid, "INBOX")
-                            imap.uid("STORE", uid, "+FLAGS", "\\Deleted")
-                            imap.expunge()
-                        moved += 1
-                    if moved:
-                        print(f"IMAP relocate: moved {moved} backup(s) Junk -> INBOX")
-                        return True
-                time.sleep(delay)
-            print("IMAP relocate: backup not found in Junk "
-                  "(delivered straight to INBOX, or LDA lag > wait window)")
-            return False
-    except Exception as e:
-        print(f"WARN: IMAP relocate failed — {e} "
-              "(non-fatal; restore.py also searches Junk)", file=sys.stderr)
-        return False
-
-
-def prune_imap(host, port, user, password, keep_n=KEEP_DAILY):
-    """Delete oldest [BACKUP] emails FOR THIS ORG, keeping the last keep_n in
-    each folder.
-
-    Self-sent daily backups (bertha -> bertha) are spam-filtered into INBOX.Junk
-    by Hostinger, so retention must be enforced there too — pruning INBOX alone
-    leaves Junk to grow unbounded. restore.py reads both folders.
-
-    ORG-SCOPED (caught live 2026-07-18, first family run): all orgs share one
-    mailbox, and a bare `[BACKUP]` search counts every org's copies in one
-    keep_n window — the family run's very first mail displaced and DELETED the
-    oldest silvermere backup email. Subjects have always carried the org name
-    ("[BACKUP] <org> <date>"), so scoping the search string is sufficient for
-    the whole retention history, both orgs."""
-    try:
-        with imaplib.IMAP4_SSL(host, port) as imap:
-            imap.login(user, password)
-            for folder in ("INBOX", "INBOX.Junk"):
-                status, _ = imap.select(f'"{folder}"')
-                if status != "OK":
-                    continue  # folder may not exist on this mailbox
-                # Search for THIS org's backups (seq nums, oldest first)
-                status, data = imap.search(None, f'SUBJECT "{BACKUP_SUBJECT_PREFIX} {BACKUP_ORG} "')
-                if status != "OK" or not data or not data[0]:
-                    continue
-                uids = data[0].split()
-                to_delete = uids[:-keep_n] if len(uids) > keep_n else []
-                for uid in to_delete:
-                    imap.store(uid, "+FLAGS", "\\Deleted")
-                if to_delete:
-                    imap.expunge()
-                    print(f"IMAP prune [{folder}]: deleted {len(to_delete)} old "
-                          f"backup(s), kept {min(len(uids), keep_n)}")
-    except Exception as e:
-        print(f"WARN: IMAP prune failed — {e} (backup still sent)", file=sys.stderr)
-
-
 def dump_umami_db() -> str:
     """Pull the newest .10 umami pg_dump into ORG_ROOT/backups/umami so the
     file-collection step rides it into the daily zip. Best-effort: NEVER raises —
@@ -1383,10 +1246,8 @@ def main():
                         help=f"Org to back up (a directory under cortextos/orgs/). Default: {DEFAULT_ORG}. "
                              "Git bundles + umami dump run only in the default (infra) org's invocation — "
                              "_discover_repos() already spans every org.")
-    parser.add_argument("--weekly", action="store_true",
-                        help="Force weekly send (also send to Steven). Default: auto on Sundays.")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Build zip and report size; do not send.")
+                        help="Build zip and report size; do not upload.")
     parser.add_argument("--no-ftp", action="store_true",
                         help="Skip Step 2 FTPS upload even if configured.")
     parser.add_argument("--no-gateway", action="store_true",
@@ -1402,19 +1263,8 @@ def main():
         print(f"ERROR: secrets file not found: {SECRETS_FILE}", file=sys.stderr)
         sys.exit(1)
 
-    smtp_host = secrets["HOSTINGER_SMTP_HOST"]
-    smtp_port = int(secrets.get("HOSTINGER_SMTP_PORT", 465))
-    imap_host = secrets.get("HOSTINGER_IMAP_HOST", "imap.hostinger.com")
-    imap_port = int(secrets.get("HOSTINGER_IMAP_PORT", 993))
-    sender = secrets["HOSTINGER_EMAIL"]
-    password = secrets["HOSTINGER_EMAIL_APP_PASSWORD"]
-
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%Y-%m-%d")
-    time_str = now.strftime("%H:%M UTC")
-    subject = f"{BACKUP_SUBJECT_PREFIX} {BACKUP_ORG} {date_str} {time_str}"
-
-    is_weekly = args.weekly or (now.weekday() == 6)  # 6 = Sunday
 
     if INFRA_TIERS:
         print(f"Umami DB dump: {dump_umami_db()}")
@@ -1427,41 +1277,35 @@ def main():
         size_mb, skipped = build_zip(zip_path)
         print(f"Zip size: {size_mb:.2f} MB")
 
-        # CORE/FULL split (task_1784285554485): the 20MB email limit was
-        # silently deciding what the org protects (25 projects born outside a
-        # hand-list). CORE = INCLUDE_PATTERNS, rides EVERY tier including the
-        # size-bound email. FULL = CORE + the projects sweep, rides the scp
-        # tiers only (no size ceiling there). The two tiers protect different
-        # sets ON PURPOSE — a deliberate, documented divergence, not a decoy.
-        print(f"CORE zip {size_mb:.2f} MB (email + all tiers; set = INCLUDE_PATTERNS above)")
-        # WARN band derived from the limit (0.8x), never a second constant:
-        # agents/*/memory is 13.1 of CORE's 20.6MB uncompressed and grows
-        # daily, so the cliff returns on a schedule — this line makes it
-        # announce itself months out, in the report the 22:0xZ cron shows.
-        if size_mb > SIZE_LIMIT_MB * 0.8:
-            print(f"WARN: CORE zip {size_mb:.2f} MB approaching the {SIZE_LIMIT_MB:.0f} MB email limit "
-                  f"(band {SIZE_LIMIT_MB * 0.8:.1f} MB) — largest growth component is agents memory; "
-                  f"see pruning task_1784153366580")
+        # CORE/FULL split (task_1784285554485): CORE = INCLUDE_PATTERNS, the
+        # lean artifact — it exists for the gateway leg, whose LXC is small
+        # (~2.1G; see upload_to_gateway's headroom note). FULL = CORE + the
+        # projects sweep, rides the roomy tiers (.10, R2). The two tiers
+        # protect different sets ON PURPOSE — a deliberate, documented
+        # divergence, not a decoy. (The 20MB email limit that originally
+        # forced this split left with the email tier, 2026-07-19; the
+        # gateway capacity reason stands on its own.)
+        print(f"CORE zip {size_mb:.2f} MB (gateway + all tiers; set = INCLUDE_PATTERNS above)")
 
         swept, n_swept, n_census = swept_projects()
         print(f"projects swept: {n_swept} of {n_census} (census); "
               f"own-repo projects ride the bundle tier")
         full_path = os.path.join(tmp, f"{ZIP_PREFIX}full-{date_str}.zip")
         full_size, full_skipped = build_zip(full_path, extra_dirs=swept)
-        print(f"FULL zip {full_size:.2f} MB — projects sweep rides scp tiers only (email carries CORE)")
+        print(f"FULL zip {full_size:.2f} MB — projects sweep rides the .10 + R2 tiers (gateway carries CORE)")
 
         if skipped:
             print(f"Excluded {len(skipped)} file(s) (credentials/binaries)")
 
         # Durable on-box retained copy FIRST — the must-have safety net, done
-        # before email/FTP so a retained snapshot exists even if those steps fail.
+        # before the upload tiers so a retained snapshot exists even if they fail.
         if args.dry_run:
             local_status = f"Local retain: dry-run — would copy to {LOCAL_RETAIN_DIR}"
         else:
             local_status = retain_local(zip_path, date_str)
         print(local_status)
 
-        # Step 2 — FTPS off-site upload (runs first so email body can report status)
+        # Step 2 — FTPS off-site upload (only if configured; currently unconfigured)
         if args.no_ftp:
             ftp_status = "FTP: skipped (--no-ftp)"
         elif args.dry_run:
@@ -1565,122 +1409,30 @@ def main():
         print(r2_line)
         r2_footprint_over = not r2_ok
 
-        over_limit = size_mb > SIZE_LIMIT_MB
-        if over_limit:
-            print(f"WARN: zip ({size_mb:.1f} MB) exceeds {SIZE_LIMIT_MB} MB limit — sending without attachment")
-            body = (
-                f"cortextOS org backup — {date_str}\n\n"
-                f"Zip size: {size_mb:.1f} MB — EXCEEDS EMAIL LIMIT ({SIZE_LIMIT_MB} MB).\n"
-                f"Attachment omitted. Retained copies:\n"
-                f"  {local_status}\n"
-                f"  {ftp_status}\n"
-                f"  {gw_status}\n"
-                f"  {sec_status}\n"
-                f"  {s3_status}\n\n"
-                f"Excluded {len(skipped)} credential/binary file(s).\n"
-            )
-            attach = None
-        else:
-            body = (
-                f"cortextOS org backup — {date_str}\n\n"
-                f"Zip size: {size_mb:.2f} MB\n"
-                f"Contents: knowledge.md, context.json, goals.json, agent configs + bootstrap + memory, "
-                f"docs, research, scripts, project docs (clearspeak-studio/app excluded).\n"
-                f"Clean-backup: derived PDFs with a source .md are EXCLUDED (rebuild via "
-                f"doc-to-pdf.js on restore); orphan/external PDFs are kept.\n"
-                f"Excluded credentials: secrets.env, gsc-service-account.json, .env files.\n\n"
-                f"Excluded {len(skipped)} additional credential/binary/derived file(s).\n\n"
-                f"This attachment is the CORE zip (email-size-bound). The FULL zip "
-                f"(CORE + the projects sweep, {full_size:.2f} MB) rides the scp tiers only.\n"
-                f"Retained copies:\n  {local_status}\n  {ftp_status}\n  {gw_status}\n"
-                f"  {sec_status}\n"
-                f"  {s3_status}\n"
-                f"  {bundle_status}\n\n"
-                f"Restore: use scripts/restore.py to fetch + unzip from IMAP.\n"
-            )
-            attach = zip_path
-
         if args.dry_run:
-            print(f"DRY RUN — would send to {DAILY_DEST}" + (f" + {WEEKLY_DEST}" if is_weekly else ""))
             print(f"DRY RUN — {ftp_status}")
             print(f"DRY RUN — {gw_status}")
             print(f"DRY RUN — {s3_status}")
-            if over_limit:
-                print("DRY RUN — zip over limit, would send without attachment")
             return
 
-        # Daily send → bertha (self-archive)
-        # Email tier is HANDLED, not trusted (harness arm email-loud): an
-        # unhandled SMTP failure used to kill the run mid-flight — after the
-        # gateway upload, before IMAP prune and the weekly — with a raw
-        # traceback nobody reads. Now: the tier records FAILED, its dependents
-        # (relocate/prune, which need the mail to exist) are skipped with a
-        # printed reason, later tiers still run, and the tier-failure exit at
-        # the bottom attributes it loudly.
-        email_status = "Email: not attempted"
-        print(f"Sending daily backup to {DAILY_DEST}...")
-        try:
-            send_backup(smtp_host, smtp_port, sender, password, DAILY_DEST, subject, body, attach)
-            email_status = f"Email: sent ({size_mb:.2f} MB {'+ attachment' if attach else 'no attachment'})"
-            print(f"OK  daily backup sent ({size_mb:.2f} MB {'+ attachment' if attach else 'no attachment'})")
-        except Exception as e:
-            email_status = f"Email: FAILED — {e}"
-            print(email_status)
+        # EMAIL TIER REMOVED 2026-07-19 (Steve directive). The mailbox copy
+        # (daily attach to bertha@ + weekly notice + IMAP self-prune) was made
+        # redundant by the R2 tier — off-vendor, encrypted, restore-proven —
+        # and carried a standing size cliff (the mailbox's 35MB wire ceiling
+        # vs daily CORE growth). No send is attempted, not "skipped": the
+        # send path no longer exists in this file. Restore: restore.py
+        # (fetches from .10) or the R2 runbook it points at.
 
-        if email_status.startswith("Email: sent"):
-            # Relocate self-sent backup out of Junk (Hostinger spam-files it) so it
-            # lands in INBOX where retention + restore expect it. Best-effort.
-            relocate_from_junk(imap_host, imap_port, sender, password, subject)
-
-            # IMAP prune — keep last KEEP_DAILY daily backups (INBOX + Junk)
-            prune_imap(imap_host, imap_port, sender, password, keep_n=KEEP_DAILY)
-        else:
-            print("Skipping Junk-relocate + IMAP prune (no mail was sent this run)")
-
-        # Weekly send → Steven: NOTIFICATION ONLY (no attachment).
-        # The recipient's mail provider (mailchannels) HARD-BOUNCES .zip attachments
-        # ("550 5.7.1 attachment type not allowed"), so attaching the zip just NDRs.
-        # The off-site copy is served by the gateway copy (and OVH FTPS once wired),
-        # not the mailbox — so this is a status notice + pointer, never an attachment.
-        if is_weekly:
-            print(f"Sending weekly status notice to {WEEKLY_DEST}...")
-            weekly_subject = f"{subject} [weekly status]"
-            weekly_body = (
-                f"Weekly backup status — {date_str}\n\n"
-                f"The silvermere-tech org backup ran successfully ({size_mb:.2f} MB, clean/"
-                f"source-of-truth).\n\n"
-                f"No attachment: your mail provider rejects .zip attachments "
-                f"(550 attachment-type-not-allowed), so the full zip is NOT emailed. "
-                f"Retained copies (the real safety net):\n"
-                f"  {local_status}\n"
-                f"  {gw_status}\n"
-                f"  {sec_status}\n"
-                f"  {s3_status}\n"
-                f"  {ftp_status}\n\n"
-                f"True off-site (OVH Backup Storage via FTPS) is being wired; until then the "
-                f"gateway copy on a separate box is the off-host safety. Ask engineer/chief "
-                f"for the full zip if you ever need to restore.\n"
-            )
-            try:
-                send_backup(smtp_host, smtp_port, sender, password, WEEKLY_DEST,
-                            weekly_subject, weekly_body, None)
-                print(f"OK  weekly status notice sent to {WEEKLY_DEST} (no attachment)")
-            except Exception as e:
-                # Weekly is a notice, not a data tier — record inside the email
-                # tier's status so it still exits loud, but never crash here.
-                email_status += f" | weekly notice FAILED — {e}"
-                print(f"Weekly notice: FAILED — {e}")
-
-        # Fail loudly, PER TIER, at the very end (harness arms gateway-loud /
-        # email-loud). Every tier ran; now every failure is attributed by name
-        # so the 22:0xZ cron read shows WHICH leg died, and the exit code
-        # makes the run un-ignorable. A status string containing FAILED that
-        # only ever landed in an email body is how the gateway tier could die
+        # Fail loudly, PER TIER, at the very end (harness arm gateway-loud).
+        # Every tier ran; now every failure is attributed by name so the
+        # 22:0xZ cron read shows WHICH leg died, and the exit code makes the
+        # run un-ignorable. A status string containing FAILED that only ever
+        # landed in a report body is how the gateway tier could die
         # best-effort-silently onto a full disk (task_1784280833929).
         tier_failures = []
         for tier, status in (("local-retain", local_status), ("ftp", ftp_status),
                              ("gateway", gw_status), ("secondary", sec_status),
-                             ("s3", s3_status), ("email", email_status)):
+                             ("s3", s3_status)):
             if "FAILED" in status:
                 tier_failures.append(tier)
                 print(f"ERROR: {tier} tier FAILED — {status}", file=sys.stderr)
@@ -1692,7 +1444,7 @@ def main():
 
     # Fail loudly. A backup that reports success while shipping no history is
     # worse than no backup: it buys false confidence and nobody looks again.
-    # The zip/email path has already succeeded by here, so this exit code says
+    # The zip tiers have already reported by here, so this exit code says
     # precisely "the git-history tier failed", and the cron surfaces it.
     if bundles_failed:
         print("ERROR: git-bundle tier FAILED — see per-leg status above "
