@@ -1240,6 +1240,72 @@ def dump_umami_db() -> str:
         return f"skipped (error: {e})"
 
 
+ODOO_HOST = os.environ.get("BACKUP_ODOO_TARGET", "cortext@10.10.10.103")
+ODOO_PG_CONTAINER = "odoo-postgres"
+KEEP_ODOO_DUMPS = 7  # per tenant, local dir (the zip/R2 tiers carry their own retention)
+
+
+def dump_odoo_dbs() -> tuple[bool, str]:
+    """PYLOT Odoo tenant dumps (Steve-authorized 2026-07-19, task_1784481103969).
+    Live Postgres on .103 — a file-level copy of a running PGDATA restores into
+    a broken database, so this tier is pg_dump per tenant: consistent snapshots,
+    gzipped into ORG_ROOT/backups/odoo/, riding the FULL zip + R2 (NOT the CORE
+    zip — the gateway artifact stays lean). Tenant set is DERIVED from
+    pg_database every run, never hand-listed: a tenant created tomorrow is
+    dumped tomorrow. LOUD tier: returns (ok, status); a failure joins
+    tier_failures and the run exits nonzero — .103 being down is a backup
+    failure, not a skip. Acceptance for any change here is a real restore into
+    a scratch database, watched — never a file appearing in a bucket."""
+    out_dir = ORG_ROOT / "backups" / "odoo"
+    ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+                "-o", "StrictHostKeyChecking=accept-new"]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Derived tenant enumeration (excludes templates + the maintenance db).
+        enum = subprocess.run(
+            ["ssh", *ssh_opts, ODOO_HOST,
+             f"docker exec {ODOO_PG_CONTAINER} psql -U odoo -d postgres -Atc "
+             "\"SELECT datname FROM pg_database WHERE datistemplate=false "
+             "AND datname <> current_database() ORDER BY datname\""],
+            capture_output=True, text=True, timeout=40)
+        if enum.returncode != 0:
+            return False, f"Odoo dumps: FAILED (enumerate: {enum.stderr.strip() or enum.returncode})"
+        tenants = [t for t in enum.stdout.split() if t]
+        if not tenants:
+            # Zero tenants is a FINDING, never a quiet success — the 07-19
+            # no-database scare is exactly what this line exists to catch.
+            return False, "Odoo dumps: FAILED (enumeration returned ZERO tenant databases)"
+        lines = []
+        for db in tenants:
+            dest = out_dir / f"{db}-{stamp}.sql.gz"
+            with open(dest, "wb") as fh:
+                dump = subprocess.run(
+                    ["ssh", *ssh_opts, ODOO_HOST,
+                     f"docker exec {ODOO_PG_CONTAINER} pg_dump -U odoo -d {db} | gzip -6"],
+                    stdout=fh, stderr=subprocess.PIPE, timeout=600)
+            size = dest.stat().st_size if dest.exists() else 0
+            # An empty or error-tailed dump must not ride the tiers looking like
+            # a backup: gzip integrity + non-trivial size are the floor here;
+            # the real acceptance (scratch restore) runs out-of-band.
+            if dump.returncode != 0 or size < 10_000:
+                dest.unlink(missing_ok=True)
+                return False, (f"Odoo dumps: FAILED ({db}: rc={dump.returncode}, "
+                               f"{size:,}B — {dump.stderr.decode(errors='replace').strip()[:120]})")
+            gzchk = subprocess.run(["gzip", "-t", str(dest)], capture_output=True)
+            if gzchk.returncode != 0:
+                dest.unlink(missing_ok=True)
+                return False, f"Odoo dumps: FAILED ({db}: gzip integrity check)"
+            lines.append(f"{db} {size/1024/1024:.1f}MB")
+            old = sorted(out_dir.glob(f"{db}-*.sql.gz"))
+            for stale in old[:-KEEP_ODOO_DUMPS]:
+                stale.unlink()
+        return True, (f"Odoo dumps: {len(tenants)} tenant(s) OK ({', '.join(lines)}) "
+                      f"-> backups/odoo (rides FULL zip + R2; keep {KEEP_ODOO_DUMPS}/tenant)")
+    except Exception as e:  # noqa: BLE001 — tier reports, main() attributes + exits
+        return False, f"Odoo dumps: FAILED — {e}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backup a cortextos org (content org-scoped, transport infra-scoped)")
     parser.add_argument("--org", default=DEFAULT_ORG,
@@ -1268,8 +1334,11 @@ def main():
 
     if INFRA_TIERS:
         print(f"Umami DB dump: {dump_umami_db()}")
+        odoo_ok, odoo_status = dump_odoo_dbs()
+        print(odoo_status)
     else:
         print(f"Umami DB dump: skipped — infra tier, runs in the {DEFAULT_ORG} invocation")
+        odoo_ok, odoo_status = True, "Odoo dumps: not run here — infra tier"
 
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = os.path.join(tmp, f"{ZIP_PREFIX}{date_str}.zip")
@@ -1291,7 +1360,10 @@ def main():
         print(f"projects swept: {n_swept} of {n_census} (census); "
               f"own-repo projects ride the bundle tier")
         full_path = os.path.join(tmp, f"{ZIP_PREFIX}full-{date_str}.zip")
-        full_size, full_skipped = build_zip(full_path, extra_dirs=swept)
+        # backups/odoo rides the FULL zip only (roomy tiers: .10 + R2); the
+        # CORE/gateway artifact stays lean — see dump_odoo_dbs.
+        full_extra = swept + ([ORG_ROOT / "backups" / "odoo"] if INFRA_TIERS else [])
+        full_size, full_skipped = build_zip(full_path, extra_dirs=full_extra)
         print(f"FULL zip {full_size:.2f} MB — projects sweep rides the .10 + R2 tiers (gateway carries CORE)")
 
         if skipped:
@@ -1432,7 +1504,7 @@ def main():
         tier_failures = []
         for tier, status in (("local-retain", local_status), ("ftp", ftp_status),
                              ("gateway", gw_status), ("secondary", sec_status),
-                             ("s3", s3_status)):
+                             ("s3", s3_status), ("odoo-dump", odoo_status)):
             if "FAILED" in status:
                 tier_failures.append(tier)
                 print(f"ERROR: {tier} tier FAILED — {status}", file=sys.stderr)
