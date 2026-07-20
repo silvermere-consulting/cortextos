@@ -29,7 +29,17 @@ Before anything else, check if you have been onboarded:
 
 If `NEEDS_ONBOARDING`: read `plugins/cortextos-agent-skills/skills/onboarding/SKILL.md` and follow its instructions. Do NOT proceed with normal operations until onboarding is complete. The user can also trigger onboarding at any time by saying "run onboarding".
 
-**ONE-TIME FLEET VERIFICATION — you may be the first codex agent to ever boot (task_1784533197259).** The `create-reminder` boot-injection path has been proven only up to the prompt handed to your runtime; whether codex-app-server ACTS on it has never been observed live (issue #392 gives reason for doubt — see the create-reminder row in the Crons section). As part of onboarding: run `cortextos bus create-reminder "<one minute ago, ISO UTC>" "REMINDER-VERIFY: reply ACK to your orchestrator"`, then `cortextos bus self-restart --reason "reminder-injection verification"`. If the reminder block appears in your boot prompt AND you act on it, report the result to your orchestrator so the caveat in the Crons row can be retired; if it does not, report that — it upgrades a doubt into a finding. Either way, ack the reminder afterward. This condition rides the population-creating event instead of a ticket nobody can work; delete this block once any codex agent has reported the result.
+**ONE-TIME FLEET VERIFICATION — you may be the first codex agent to ever boot (task_1784533197259).** The `create-reminder` boot-injection path has been proven only up to the prompt handed to your runtime; whether codex-app-server ACTS on it has never been observed live (issue #392 gives reason for doubt — see the create-reminder row in the Crons section). As part of onboarding, IN THIS ORDER:
+1. **Register first** (this is the step whose side effect is externally readable): `cortextos bus create-reminder "<one minute ago, ISO UTC>" "REMINDER-VERIFY task_1784533197259: run cortextos bus ack-reminder on this reminder, then tell your orchestrator it fired"`
+2. Then: `cortextos bus self-restart --reason "reminder-injection verification"`
+3. After the restart, if you see the reminder block: ack it and report to your orchestrator.
+
+**The result is readable WITHOUT your cooperation — deliberately, because the reporting path must not run through the mechanism under test** (if the runtime ignores injected instructions, it also ignores the instruction to report being ignored). Anyone can read `cortextos bus list-reminders` for this agent:
+- reminder **ABSENT** → step 1 never executed; nothing was tested (the boot doc itself was not followed).
+- reminder **PENDING** (and the agent restarted) → registered, injected, NOT acted on — issue #392 upgraded to a finding: codex agents silently ignore boot instructions. That is the branch that matters.
+- reminder **ACKED** → acted on; the Crons-row caveat retires.
+
+Orchestrators: after any first codex onboarding, read that state yourself rather than waiting for a report. Delete this block once the result — either direction — is recorded on task_1784533197259's successor note.
 
 If `ONBOARDED`: continue with the session start protocol below.
 
