@@ -122,8 +122,17 @@ restore(){
     say "heartbeat schedule untouched by this run — nothing to restore (SCHEDULE_CHANGED=0)"
   fi
   # 3. daemon back to production profile: restart from a shell with the vars EXPLICITLY UNSET.
+  # ⚠️ STOPGAP, NOT THE FIX (2026-07-20): CTX_AGENT_NAME/CTX_ORG are stripped here because a
+  # detached launch runs restore() from THIS agent's shell, and pm2 restart --update-env would
+  # otherwise stamp the agent's identity onto the daemon (07:29:13Z: daemon 29096 inherited
+  # CTX_AGENT_NAME=engineer and the watchdog then clobbered engineer's heartbeat row all morning).
+  # Extending the strip-list is EXACTLY the construction analyst showed already fails, made longer —
+  # a denylist that leaks whatever it forgets. The real fix is a measured allowlist for what pm2
+  # restart should carry, filed separately. This line only stops THIS run from re-poisoning the
+  # daemon; it does not close the bug.
   env -u CTX_WATCHDOG_CHECK_MS -u CTX_WATCHDOG_GRACE_MS -u CTX_WATCHDOG_VERIFY_MS \
       -u CTX_WATCHDOG_WINDOW_MS -u CTX_WATCHDOG_FREEZE_N \
+      -u CTX_AGENT_NAME -u CTX_ORG \
       pm2 restart "$DAEMON_PM2_NAME" --update-env >/dev/null 2>&1
   sleep 5
   local dp; dp=$(daemon_pid)
