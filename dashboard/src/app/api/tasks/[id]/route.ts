@@ -269,7 +269,11 @@ export async function PATCH(
       // Use complete-task.sh for completion (handles additional side effects).
       // summaryArg is capped and passed as a positional arg; the bus script
       // quotes "$2" and exec's node directly, so no shell interpolation occurs.
-      const summaryArg = capText(outputSummary);
+      // The dashboard's "Add note (optional)" box sends `note` on Complete too;
+      // it was dropped here (this branch only read outputSummary, which the
+      // browser never sends) — so a note typed on Complete vanished. Fall back
+      // to note so it lands as the completion result (Steve-authorised 2026-07-20).
+      const summaryArg = capText(outputSummary ?? note);
       spawnResult = spawnSync(
         'bash',
         [path.join(frameworkRoot, 'bus', 'complete-task.sh'), id, summaryArg],
