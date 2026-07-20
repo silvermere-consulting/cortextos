@@ -270,9 +270,12 @@ export class FrozenTurnWatchdog {
         `frozen = unanswered >= ${this.opt.freezeThreshold}; last_real_response = max(heartbeat.json own-status ts, newest agent-authored analytics row); ` +
         `fires_today_utc = 'fired' rows since UTC midnight; ` +
         // The pointer rides IN the series so a cold query of the new name learns the
-        // predecessor exists — otherwise the three good 2026-07-19 rows are visible
-        // only to readers who happened to open the runbook first (analyst, 2026-07-20).
-        `predecessor series: orchestrator_freeze_proximity (trust only its derived:true rows — 3, all 2026-07-19; the 59 hand-filled rows are excluded)`,
+        // predecessor exists — otherwise its few good derived rows are visible only
+        // to readers who happened to open the runbook first (analyst, 2026-07-20).
+        // Deliberately NO counts here: "3 rows, 59 excluded" was a reading, not the
+        // rule, and a snapshot inside an unchecked string goes stale silently. The
+        // predicate half is durable; the tallies live where they can be re-derived.
+        `predecessor series: orchestrator_freeze_proximity (trust only its derived:true rows; all others are hand-filled and excluded)`,
     };
   }
 
