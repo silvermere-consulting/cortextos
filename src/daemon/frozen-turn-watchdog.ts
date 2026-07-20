@@ -268,7 +268,11 @@ export class FrozenTurnWatchdog {
       predicate:
         `unanswered = heartbeat-cron 'fired' rows with ts > last_real_response AND now-ts > ${this.opt.graceMs}ms; ` +
         `frozen = unanswered >= ${this.opt.freezeThreshold}; last_real_response = max(heartbeat.json own-status ts, newest agent-authored analytics row); ` +
-        `fires_today_utc = 'fired' rows since UTC midnight`,
+        `fires_today_utc = 'fired' rows since UTC midnight; ` +
+        // The pointer rides IN the series so a cold query of the new name learns the
+        // predecessor exists — otherwise the three good 2026-07-19 rows are visible
+        // only to readers who happened to open the runbook first (analyst, 2026-07-20).
+        `predecessor series: orchestrator_freeze_proximity (trust only its derived:true rows — 3, all 2026-07-19; the 59 hand-filled rows are excluded)`,
     };
   }
 
