@@ -39,11 +39,22 @@ CTX_ROOT="${CTX_ROOT:-$HOME/.cortextos/default}"
 SUBJECT="chief"
 TIMEOUT_MIN=20
 ANNOUNCED=0
-for a in "$@"; do case "$a" in
-  --announced) ANNOUNCED=1;;
-  --agent) :;; --agent=*) SUBJECT="${a#*=}";;
-  --timeout-min=*) TIMEOUT_MIN="${a#*=}";;
-esac; done
+# D1 (chief's cold read 2026-07-20): the old `--agent) :;;` arm swallowed the FLAG and let its
+# VALUE fall through unmatched, so the space form documented in the usage line above silently kept
+# SUBJECT=chief — i.e. following the docs to wedge another agent wedged the orchestrator instead.
+# Both forms are handled here, and an unrecognised argument now DIES rather than being ignored:
+# a typo'd flag on a script that SIGSTOPs live agents must never degrade to "run with defaults".
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --announced) ANNOUNCED=1;;
+    --agent) shift; [ $# -gt 0 ] || { echo "[wedge-sim] ABORT: --agent needs a value" >&2; exit 2; }; SUBJECT="$1";;
+    --agent=*) SUBJECT="${1#*=}";;
+    --timeout-min) shift; [ $# -gt 0 ] || { echo "[wedge-sim] ABORT: --timeout-min needs a value" >&2; exit 2; }; TIMEOUT_MIN="$1";;
+    --timeout-min=*) TIMEOUT_MIN="${1#*=}";;
+    *) echo "[wedge-sim] ABORT: unrecognised argument '$1'" >&2; exit 2;;
+  esac
+  shift
+done
 
 say(){ printf '[wedge-sim] %s\n' "$*"; }
 die(){ say "ABORT: $*"; exit 2; }
@@ -116,13 +127,36 @@ restore(){
   esac
   # 4. R4 byte check on the pm2 dump (control-tested: the grep must find a known marker we add+remove).
   local dump="$HOME/.pm2/dump.pm2"
-  if [ -r "$dump" ]; then
+  # D3, part 1 — VALIDITY BEFORE VERDICT. A canary-on-a-copy control proves the READER works; it
+  # fires just as happily on an EMPTY file, so it cannot separate "no CTX_WATCHDOG_ in a real dump"
+  # from "no CTX_WATCHDOG_ because there is nothing here" — which was chief's actual demonstration.
+  # The dump must first be shown to be a populated pm2 dump: non-trivial size AND carrying the
+  # daemon we just restarted. Only then is a negative grep a negative.
+  if [ -r "$dump" ] && [ "$(wc -c < "$dump" 2>/dev/null || echo 0)" -lt 200 ]; then
+    say "RED: dump.pm2 is empty/trivial ($(wc -c < "$dump" 2>/dev/null || echo 0) bytes) — a clean grep here means NOTHING TO SEE, not nothing there. Verdict UNRESOLVABLE."
+    FAILED=1
+  elif [ -r "$dump" ] && ! /usr/bin/grep -q "$DAEMON_PM2_NAME" "$dump"; then
+    say "RED: dump.pm2 does not mention $DAEMON_PM2_NAME — it is not the dump for the process under test. Verdict UNRESOLVABLE."
+    FAILED=1
+  elif [ -r "$dump" ]; then
     if /usr/bin/grep -q 'CTX_WATCHDOG_' "$dump"; then
       say "RED: dump.pm2 carries CTX_WATCHDOG_* — a pm2 resurrect would resurrect the short profile. Clean-env 'pm2 save' needed, then re-check."
       FAILED=1
     else
-      printf 'CTX_WATCHDOG_CANARY' | /usr/bin/grep -q 'CTX_WATCHDOG_' && say "dump.pm2 clean of CTX_WATCHDOG_* (byte layer, detector control fired)" \
-        || { say "RED: dump byte-detector control failed — dump verdict VOID"; FAILED=1; }
+      # D3 (chief's cold read): the old control piped a canary through grep's STDIN, which proves
+      # only that grep matches — never that THIS FILE is readable, non-empty or greppable. An empty
+      # dump gave rc=1 (read as clean) while the pipe control still fired. R3 demands the probe fire
+      # on a target KNOWN to carry the string, so the control now runs against a COPY OF THE DUMP
+      # with a canary appended: same file, same reader, known-positive.
+      local dumpctl; dumpctl=$(mktemp)
+      if cat "$dump" > "$dumpctl" 2>/dev/null && printf '\nCTX_WATCHDOG_CANARY_CONTROL\n' >> "$dumpctl" \
+         && /usr/bin/grep -q 'CTX_WATCHDOG_' "$dumpctl"; then
+        say "dump.pm2 clean of CTX_WATCHDOG_* (byte layer; control fired on a canaried COPY of this file)"
+      else
+        say "RED: dump byte-detector control failed on a canaried copy — this file cannot be matched, verdict VOID (empty/unreadable dump reads identical to clean)"
+        FAILED=1
+      fi
+      rm -f "$dumpctl"
     fi
   else
     say "RED: dump.pm2 unreadable — byte-layer verdict UNRESOLVABLE, not clean"; FAILED=1
@@ -131,12 +165,21 @@ restore(){
   pm2 logs "$DAEMON_PM2_NAME" --lines 200 --nostream 2>/dev/null | /usr/bin/grep -E "$PROD_START_RE" | tail -1 \
     && say "start line shows production profile" || { say "RED: no production start line found in recent daemon log"; FAILED=1; }
   # 6. no collateral: no OTHER agent got watchdog-restarted during the sim window.
+  # D2 (chief's cold read): the old form piped find into `while read`, so the loop body ran in a
+  # SUBSHELL — its FAILED=1 died with the subshell and collateral damage printed RED while the
+  # script still exited 0, contradicting R1 for the one assert covering NON-subject agents.
+  # Command substitution keeps the count in THIS shell.
   say "collateral check: watchdog events for non-$SUBJECT agents since sim start:"
-  local evroot="$CTX_ROOT/orgs"
-  find "$evroot" -path '*analytics/events/*' -name "$(date -u +%Y-%m-%d).jsonl" 2>/dev/null \
+  local evroot="$CTX_ROOT/orgs" collateral
+  collateral=$(find "$evroot" -path '*analytics/events/*' -name "$(date -u +%Y-%m-%d).jsonl" 2>/dev/null \
     | /usr/bin/grep -v "/events/$SUBJECT/" \
-    | xargs -r /usr/bin/grep -l 'watchdog_auto_restart' 2>/dev/null \
-    | while read -r f; do say "RED: collateral watchdog restart in $f"; done
+    | xargs -r /usr/bin/grep -l 'watchdog_auto_restart' 2>/dev/null)
+  if [ -n "$collateral" ]; then
+    while IFS= read -r f; do [ -n "$f" ] && say "RED: collateral watchdog restart in $f"; done <<< "$collateral"
+    FAILED=1   # runs in THIS shell — a collateral red can now actually fail the run
+  else
+    say "no collateral watchdog restarts on other agents"
+  fi
 }
 FAILED=0
 trap restore EXIT
@@ -170,7 +213,15 @@ SP=$(subject_pid) || die "no live $SUBJECT claude pid"
 kill -STOP "$SP" || die "SIGSTOP failed"
 say "wedged $SUBJECT pid $SP at $(date -u +%H:%M:%SZ)"
 DEADLINE=$(( $(date +%s) + TIMEOUT_MIN*60 ))
-EVFILE="$CTX_ROOT/orgs/silvermere-tech/analytics/events/$SUBJECT/$(date -u +%Y-%m-%d).jsonl"
+# D1-compound (chief): this hardcoded silvermere-tech, so a jones/othe subject would watch the
+# WRONG ORG's event dir and report a false FAIL. Derive the org from the registry instead.
+SUBJECT_ORG=$(python3 -c "
+import json,sys
+try: print((json.load(open('$CTX_ROOT/config/enabled-agents.json')).get('$SUBJECT') or {}).get('org',''))
+except Exception: print('')" 2>/dev/null)
+[ -n "$SUBJECT_ORG" ] || die "cannot resolve org for $SUBJECT from enabled-agents.json — refusing to watch a guessed event path"
+say "subject org resolved: $SUBJECT_ORG"
+EVFILE="$CTX_ROOT/orgs/$SUBJECT_ORG/analytics/events/$SUBJECT/$(date -u +%Y-%m-%d).jsonl"
 ESCALATED=0
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   # rung-3 escalation event?
