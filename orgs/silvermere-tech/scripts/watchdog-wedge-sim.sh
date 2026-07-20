@@ -90,21 +90,36 @@ env_has(){
 }
 
 ORIG_SCHEDULE=""   # captured before mutation, restored in trap
+SCHEDULE_CHANGED=0 # restore only undoes what phase 1 actually did
+WEDGED=0           # restore only un-wedges if phase 2 was reached
 RESTORED=0
 restore(){
   [ "$RESTORED" = 1 ] && return
   RESTORED=1
   say "=== STRUCTURAL RESTORE (EXIT trap — runs regardless of how the sim ended) ==="
   # 1. un-wedge: SIGCONT anything stopped, then a clean subject restart.
-  local sp; sp=$(subject_pid || true)
-  [ -n "${sp:-}" ] && kill -CONT "$sp" 2>/dev/null && say "SIGCONT sent to $SUBJECT pid $sp"
-  cortextos restart "$SUBJECT" >/dev/null 2>&1 && say "$SUBJECT restarted clean"
+  if [ "${WEDGED:-0}" = 1 ]; then
+    local sp; sp=$(subject_pid || true)
+    [ -n "${sp:-}" ] && kill -CONT "$sp" 2>/dev/null && say "SIGCONT sent to $SUBJECT pid $sp"
+    cortextos restart "$SUBJECT" >/dev/null 2>&1 && say "$SUBJECT restarted clean"
+  else
+    say "$SUBJECT was never wedged (abort before phase 2) — no SIGCONT, no restart (first live run cycled the subject for nothing here)"
+  fi
   # 2. restore the heartbeat schedule from the value captured at start (never from memory).
-  if [ -n "$ORIG_SCHEDULE" ]; then
-    cortextos bus update-cron "$SUBJECT" heartbeat --schedule "$ORIG_SCHEDULE" >/dev/null 2>&1
+  if [ "${SCHEDULE_CHANGED:-0}" = 1 ] && [ -n "$ORIG_SCHEDULE" ]; then
+    # First live run printed "restored: 1h" for a mutation that NEVER RAN (phase 1 died
+    # before changing anything, and this line then read back the unchanged value and
+    # called it success — a green from an operation that never happened, with its own
+    # failure suppressed by >/dev/null). Now: only restore what was actually changed,
+    # let the mutation speak, and read back as the assert.
+    if ! cortextos bus update-cron "$SUBJECT" heartbeat --interval "$ORIG_SCHEDULE"; then
+      say "RED: schedule restore mutation FAILED — heartbeat may still be on the sim interval. FIX BY HAND NOW"; FAILED=1
+    fi
     local now_sched
     now_sched=$(cortextos bus list-crons "$SUBJECT" 2>/dev/null | /usr/bin/grep -E '^\s*heartbeat' | awk '{print $2}')
-    if [ "$now_sched" = "$ORIG_SCHEDULE" ]; then say "heartbeat schedule restored: $now_sched"; else say "RED: heartbeat schedule is '$now_sched', wanted '$ORIG_SCHEDULE' — FIX BY HAND NOW"; FAILED=1; fi
+    if [ "$now_sched" = "$ORIG_SCHEDULE" ]; then say "heartbeat schedule restored: $now_sched (mutation ran + read-back matches)"; else say "RED: heartbeat schedule is '$now_sched', wanted '$ORIG_SCHEDULE' — FIX BY HAND NOW"; FAILED=1; fi
+  else
+    say "heartbeat schedule untouched by this run — nothing to restore (SCHEDULE_CHANGED=0)"
   fi
   # 3. daemon back to production profile: restart from a shell with the vars EXPLICITLY UNSET.
   env -u CTX_WATCHDOG_CHECK_MS -u CTX_WATCHDOG_GRACE_MS -u CTX_WATCHDOG_VERIFY_MS \
@@ -200,7 +215,10 @@ ORIG_SCHEDULE=$(cortextos bus list-crons "$SUBJECT" 2>/dev/null | /usr/bin/grep 
 say "captured $SUBJECT heartbeat schedule: $ORIG_SCHEDULE"
 
 say "=== PHASE 1: short watchdog profile + fast stimulus ==="
-cortextos bus update-cron "$SUBJECT" heartbeat --schedule 2m || die "failed to set 2m heartbeat schedule"
+# --interval is the REAL flag (measured: update-cron --help). --schedule was a TOOLS.md
+# phantom this script copied; first live run aborted here (2026-07-20 07:29Z).
+cortextos bus update-cron "$SUBJECT" heartbeat --interval 2m || die "failed to set 2m heartbeat schedule"
+SCHEDULE_CHANGED=1
 eval "env $SHORT_PROFILE pm2 restart $DAEMON_PM2_NAME --update-env" >/dev/null || die "daemon restart (short profile) failed"
 sleep 5
 DP=$(daemon_pid)
@@ -211,6 +229,7 @@ say "short profile live on daemon pid $DP"
 say "=== PHASE 2: wedge $SUBJECT (SIGSTOP), re-wedge each respawn, await rung-3 ==="
 SP=$(subject_pid) || die "no live $SUBJECT claude pid"
 kill -STOP "$SP" || die "SIGSTOP failed"
+WEDGED=1
 say "wedged $SUBJECT pid $SP at $(date -u +%H:%M:%SZ)"
 DEADLINE=$(( $(date +%s) + TIMEOUT_MIN*60 ))
 # D1-compound (chief): this hardcoded silvermere-tech, so a jones/othe subject would watch the
