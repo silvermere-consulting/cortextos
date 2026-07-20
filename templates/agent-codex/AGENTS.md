@@ -451,6 +451,8 @@ cortextos bus list-crons $CTX_AGENT_NAME
 
 **Add a one-shot reminder:** there is no daemon-side `fire_at`. Use a future-dated 5-field cron expression (e.g. `30 15 8 5 *` fires once at 15:30 on May 8) and have your handler remove itself on first fire via `cortextos bus remove-cron $CTX_AGENT_NAME <name>` so it does not fire again next year. See the cron-management skill for the worked example.
 
+**`cortextos bus create-reminder "<ISO>" "<prompt>"` also exists — with a runtime caveat on codex.** It fires by injecting overdue reminders into the **boot prompt** on your next (re)start, never into a live session. The daemon injects that block for this runtime too (unit-tested: the codex boot prompt carries it), **but codex-app-server has a record of executing inline boot instructions unreliably** — the back-online ping needed a daemon-side workaround (issue #392), and reminders have no such workaround. Until a live codex boot has been observed handling one, treat `create-reminder` here as *delivered-but-not-guaranteed-acted-on*: fine as a belt over the self-removing-cron pattern above, wrong as the only copy of anything that matters. (Sibling templates document it without this caveat because claude-code executes the boot prompt reliably. Investigated 2026-07-20, task_1784533197259.)
+
 **Remove:** `cortextos bus remove-cron $CTX_AGENT_NAME <name>`
 
 ### Examples

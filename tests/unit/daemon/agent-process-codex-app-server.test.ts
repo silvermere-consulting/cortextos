@@ -49,8 +49,13 @@ vi.mock('../../../src/utils/env.js', () => ({
   resolveEnv: vi.fn().mockReturnValue({ instanceId: 'test', ctxRoot: '/tmp/test' }),
 }));
 
-vi.mock('../../../src/bus/reminders.js', () => ({
+// Mutable holder (fsMocks pattern) so individual tests can arm overdue
+// reminders — see the create-reminder injection tests (task_1784533197259).
+const reminderMocks = {
   getOverdueReminders: vi.fn().mockReturnValue([]),
+};
+vi.mock('../../../src/bus/reminders.js', () => ({
+  get getOverdueReminders() { return reminderMocks.getOverdueReminders; },
 }));
 
 vi.mock('../../../src/utils/paths.js', () => ({
@@ -105,6 +110,7 @@ beforeEach(() => {
   mockCodexAppServerPty.setTelegramHandle.mockClear();
   mockInjectMessage.mockClear();
   fsMocks.existsSync.mockReset().mockReturnValue(false);
+  reminderMocks.getOverdueReminders.mockReset().mockReturnValue([]);
   fsMocks.readFileSync.mockReset();
   fsMocks.writeFileSync.mockReset();
   fsMocks.appendFileSync.mockReset();
@@ -112,6 +118,38 @@ beforeEach(() => {
 });
 
 describe('AgentProcess codex-app-server runtime', () => {
+  // task_1784533197259: agent-codex/AGENTS.md omits create-reminder. These two
+  // tests settle the INJECTION half at the boundary the daemon controls: the
+  // boot prompt handed to CodexAppServerPTY.spawn carries the overdue-reminder
+  // block through the SAME shared buildBootPrompt path as claude-code. What
+  // they deliberately do NOT settle: whether the codex runtime ACTS on the
+  // inline block — issue #392 documents that codex-app-server executes inline
+  // boot instructions unreliably (the back-online ping needed a daemon-side
+  // compensation), and no such compensation exists for reminders. That half
+  // needs a live codex boot, unavailable on a box with no codex binary.
+  it('injects overdue reminders into the codex boot prompt (shared buildBootPrompt path)', async () => {
+    reminderMocks.getOverdueReminders.mockReturnValue([
+      { id: 'rem-test-1', fire_at: '2026-07-19T09:00:00Z', prompt: 'renew the TLS cert', status: 'pending' },
+    ]);
+    const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+    await ap.start();
+
+    expect(mockCodexAppServerPty.spawn).toHaveBeenCalledTimes(1);
+    const prompt = mockCodexAppServerPty.spawn.mock.calls[0][1] as string;
+    expect(prompt).toContain('1 overdue persistent reminder(s)');
+    expect(prompt).toContain('[rem-test-1] (due 2026-07-19T09:00:00Z): renew the TLS cert');
+    expect(prompt).toContain('cortextos bus ack-reminder');
+  });
+
+  it('codex boot prompt carries NO reminder block when none are overdue (known-negative)', async () => {
+    reminderMocks.getOverdueReminders.mockReturnValue([]);
+    const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+    await ap.start();
+
+    const prompt = mockCodexAppServerPty.spawn.mock.calls[0][1] as string;
+    expect(prompt).not.toContain('overdue persistent reminder');
+  });
+
   it('selects CodexAppServerPTY for runtime codex-app-server', async () => {
     const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
     await ap.start();
