@@ -29,6 +29,8 @@ Before anything else, check if you have been onboarded:
 
 If `NEEDS_ONBOARDING`: read `plugins/cortextos-agent-skills/skills/onboarding/SKILL.md` and follow its instructions. Do NOT proceed with normal operations until onboarding is complete. The user can also trigger onboarding at any time by saying "run onboarding".
 
+**ONE-TIME FLEET VERIFICATION — you may be the first codex agent to ever boot (task_1784533197259).** The `create-reminder` boot-injection path has been proven only up to the prompt handed to your runtime; whether codex-app-server ACTS on it has never been observed live (issue #392 gives reason for doubt — see the create-reminder row in the Crons section). As part of onboarding: run `cortextos bus create-reminder "<one minute ago, ISO UTC>" "REMINDER-VERIFY: reply ACK to your orchestrator"`, then `cortextos bus self-restart --reason "reminder-injection verification"`. If the reminder block appears in your boot prompt AND you act on it, report the result to your orchestrator so the caveat in the Crons row can be retired; if it does not, report that — it upgrades a doubt into a finding. Either way, ack the reminder afterward. This condition rides the population-creating event instead of a ticket nobody can work; delete this block once any codex agent has reported the result.
+
 If `ONBOARDED`: continue with the session start protocol below.
 
 ---
