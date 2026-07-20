@@ -152,22 +152,17 @@ function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken
   return null;
 }
 
-function sendCrashLoopAlertBestEffort(
+function sendOperatorAlertBestEffort(
   frameworkRoot: string,
-  crashCount: number,
-  errStr: string,
+  message: string,
+  label: string,
 ): boolean {
   const creds = getOperatorChatCreds(frameworkRoot);
   if (!creds) {
-    console.error('[daemon] Crash-loop alert: no operator chat configured ' +
+    console.error(`[daemon] ${label}: no operator chat configured ` +
       '(set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN, or ensure at least one agent .env exists)');
     return false;
   }
-  const message =
-    `🚨 CRITICAL: cortextos daemon is crash-looping\n` +
-    `${crashCount} crashes in 15 minutes\n` +
-    `Last error: ${errStr.slice(0, 500)}\n` +
-    `Next alert in 30 min if the pattern continues.`;
   try {
     const r = spawnSync('curl', [
       '-s', '--max-time', '3',
@@ -177,14 +172,93 @@ function sendCrashLoopAlertBestEffort(
       '--data-urlencode', `text=${message}`,
     ], { timeout: TELEGRAM_SEND_TIMEOUT_MS, stdio: 'pipe' });
     if (r.status === 0) {
-      console.error('[daemon] Crash-loop alert sent to operator chat');
+      console.error(`[daemon] ${label} sent to operator chat`);
       return true;
     }
-    console.error('[daemon] Crash-loop alert send failed (non-fatal)');
+    console.error(`[daemon] ${label} send failed (non-fatal)`);
     return false;
   } catch {
     return false;
   }
+}
+
+function sendCrashLoopAlertBestEffort(
+  frameworkRoot: string,
+  crashCount: number,
+  errStr: string,
+): boolean {
+  const message =
+    `🚨 CRITICAL: cortextos daemon is crash-looping\n` +
+    `${crashCount} crashes in 15 minutes\n` +
+    `Last error: ${errStr.slice(0, 500)}\n` +
+    `Next alert in 30 min if the pattern continues.`;
+  return sendOperatorAlertBestEffort(frameworkRoot, message, 'Crash-loop alert');
+}
+
+/**
+ * Where a rung-3 freeze escalation must go. The orchestrator is the normal
+ * route — but when the frozen agent IS the orchestrator (or no orchestrator
+ * resolves), routing through it would consult the wedged party, so the alert
+ * pages the operator chat directly instead. Every input maps to a target;
+ * there is deliberately no "drop it" arm (2026-07-19 blind spot: the old
+ * early-return made chief — the one agent that routes everything to the
+ * human — the one agent the alarm could not report).
+ */
+export type FrozenEscalationTarget =
+  | { kind: 'orchestrator'; orchestrator: string }
+  | { kind: 'operator'; reason: 'subject-is-orchestrator' | 'no-orchestrator' };
+
+export function deriveFrozenEscalationTarget(
+  orchestrator: string | undefined,
+  agent: string,
+): FrozenEscalationTarget {
+  if (orchestrator && orchestrator !== agent) return { kind: 'orchestrator', orchestrator };
+  return { kind: 'operator', reason: orchestrator ? 'subject-is-orchestrator' : 'no-orchestrator' };
+}
+
+export interface FrozenEscalationDeps {
+  /** Resolve the org's orchestrator name (context.json), or undefined. */
+  resolveOrchestrator: (org: string) => string | undefined;
+  /** Deliver a high-priority bus message to another agent in the org. */
+  sendToAgent: (org: string, to: string, text: string) => void;
+  /** Page the operator Telegram chat directly. Returns delivery success. */
+  pageOperator: (message: string) => boolean;
+  log: (msg: string) => void;
+}
+
+/**
+ * Route a rung-3 frozen-turn escalation. Exported (with injectable deps) so
+ * tests can watch BOTH branches fire — including subject==orchestrator, the
+ * branch the pre-2026-07-19 code silently dropped.
+ */
+export function escalateFrozenTurnImpl(
+  detail: FrozenTurnDetail,
+  org: string | undefined,
+  deps: FrozenEscalationDeps,
+): FrozenEscalationTarget {
+  const orchestrator = org ? deps.resolveOrchestrator(org) : undefined;
+  const target = deriveFrozenEscalationTarget(orchestrator, detail.agent);
+  const core =
+    `${detail.agent} appears frozen and TWO auto-restarts in the last hour did not recover it ` +
+    `(${detail.unansweredFires} unanswered heartbeat fires; last real response ${detail.lastRealHeartbeat ?? 'never'}). ` +
+    `Auto-restart is now paused for this agent for the rest of the hour. Manual check needed: \`cortextos restart ${detail.agent}\` ` +
+    `or inspect its PTY/logs for a wedged turn.`;
+
+  if (target.kind === 'orchestrator') {
+    // org is defined here: an orchestrator can only resolve from an org.
+    deps.sendToAgent(org as string, target.orchestrator, `🚨 WATCHDOG ESCALATION: ${core}`);
+    deps.log(`escalated ${detail.agent} freeze to ${target.orchestrator}`);
+    return target;
+  }
+
+  const why = target.reason === 'subject-is-orchestrator'
+    ? `the frozen agent IS the orchestrator${org ? ` of ${org}` : ''} — it cannot receive its own alarm`
+    : `no orchestrator resolved${org ? ` for org ${org}` : ' (agent org unknown)'}`;
+  const sent = deps.pageOperator(`🚨 WATCHDOG ESCALATION (paging operator: ${why}): ${core}`);
+  deps.log(sent
+    ? `escalated ${detail.agent} freeze DIRECTLY to the operator chat (${target.reason})`
+    : `OPERATOR PAGE FAILED for frozen ${detail.agent} (${target.reason}) — no reachable alert channel; set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN`);
+  return target;
 }
 
 /**
@@ -397,31 +471,30 @@ class Daemon {
   /**
    * Rung-3 escalation for the frozen-turn watchdog: after two auto-restarts in
    * the rolling hour failed to recover an agent, alert the org's orchestrator
-   * on the bus so a human/orchestrator can intervene. Best-effort — a failure
-   * here must never disrupt the watchdog loop.
+   * on the bus — or, when the frozen agent IS the orchestrator (or none
+   * resolves), page the operator Telegram chat directly. The routing lives in
+   * escalateFrozenTurnImpl so tests can watch both branches fire. Best-effort —
+   * a failure here must never disrupt the watchdog loop.
    */
   private escalateFrozenTurn(frameworkRoot: string, instanceId: string, detail: FrozenTurnDetail): void {
     try {
       const org = this.agentManager?.getAgentOrg(detail.agent);
-      if (!org) return;
-
-      // Resolve the org's orchestrator from context.json (chief for
-      // silvermere-tech, jones for family). Skip silently if unresolved.
-      let orchestrator: string | undefined;
-      try {
-        const ctx = JSON.parse(stripBom(readFileSync(join(frameworkRoot, 'orgs', org, 'context.json'), 'utf-8')));
-        orchestrator = ctx.orchestrator;
-      } catch { /* no context.json — skip */ }
-      if (!orchestrator || orchestrator === detail.agent) return;
-
-      const text =
-        `🚨 WATCHDOG ESCALATION: ${detail.agent} appears frozen and TWO auto-restarts in the last hour did not recover it ` +
-        `(${detail.unansweredFires} unanswered heartbeat fires; last real response ${detail.lastRealHeartbeat ?? 'never'}). ` +
-        `Auto-restart is now paused for this agent for the rest of the hour. Manual check needed: \`cortextos restart ${detail.agent}\` ` +
-        `or inspect its PTY/logs for a wedged turn.`;
-      const paths = resolvePaths(detail.agent, instanceId, org);
-      sendMessage(paths, detail.agent, orchestrator, 'high', text);
-      console.log(`[watchdog] escalated ${detail.agent} freeze to ${orchestrator}`);
+      escalateFrozenTurnImpl(detail, org, {
+        resolveOrchestrator: (o) => {
+          try {
+            const ctx = JSON.parse(stripBom(readFileSync(join(frameworkRoot, 'orgs', o, 'context.json'), 'utf-8')));
+            return typeof ctx.orchestrator === 'string' && ctx.orchestrator ? ctx.orchestrator : undefined;
+          } catch {
+            return undefined; // no context.json — impl routes to the operator page
+          }
+        },
+        sendToAgent: (o, to, text) => {
+          const paths = resolvePaths(detail.agent, instanceId, o);
+          sendMessage(paths, detail.agent, to, 'high', text);
+        },
+        pageOperator: (message) => sendOperatorAlertBestEffort(frameworkRoot, message, 'Watchdog escalation'),
+        log: (msg) => console.log(`[watchdog] ${msg}`),
+      });
     } catch (err) {
       console.error(`[watchdog] escalation failed for ${detail.agent}: ${err instanceof Error ? err.message : String(err)}`);
     }
