@@ -232,6 +232,47 @@ export class FrozenTurnWatchdog {
   }
 
   /**
+   * Machine-derived freeze-proximity snapshot for one agent — THE instrument
+   * behind the orchestrator_freeze_proximity metric (task_1784498913017).
+   * Derives every field from the same on-disk state and the same code path
+   * the recovery ladder uses (evaluate() + readHeartbeatFires()), so the
+   * metric can never drift from the watchdog's own counter. The predicate is
+   * emitted WITH each row so a reader can regenerate rather than trust.
+   * The 59 pre-2026-07-20 hand-filled rows (event name
+   * orchestrator_freeze_proximity) are NON-COMPARABLE with this output by
+   * construction — different event name, different provenance.
+   */
+  proximity(agent: string, now: number): {
+    agent: string;
+    unanswered_fires: number;
+    freeze_threshold: number;
+    grace_ms: number;
+    fires_today_utc: number;
+    last_real_response: string | null;
+    frozen: boolean;
+    derived: true;
+    predicate: string;
+  } {
+    const ev = this.evaluate(agent, now);
+    const dayStart = Date.parse(new Date(now).toISOString().split('T')[0] + 'T00:00:00Z');
+    const firesToday = this.readHeartbeatFires(agent).filter((t) => t >= dayStart && t <= now).length;
+    return {
+      agent,
+      unanswered_fires: ev.unansweredFires,
+      freeze_threshold: this.opt.freezeThreshold,
+      grace_ms: this.opt.graceMs,
+      fires_today_utc: firesToday,
+      last_real_response: ev.lastRealHeartbeat,
+      frozen: ev.frozen,
+      derived: true,
+      predicate:
+        `unanswered = heartbeat-cron 'fired' rows with ts > last_real_response AND now-ts > ${this.opt.graceMs}ms; ` +
+        `frozen = unanswered >= ${this.opt.freezeThreshold}; last_real_response = max(heartbeat.json own-status ts, newest agent-authored analytics row); ` +
+        `fires_today_utc = 'fired' rows since UTC midnight`,
+    };
+  }
+
+  /**
    * Pure derivation from on-disk state: count heartbeat-cron fires that are
    * grace-elapsed AND have no real agent response after them.
    */

@@ -2266,6 +2266,54 @@ busCommand
 // ---------------------------------------------------------------------------
 
 busCommand
+  .command('watchdog-proximity')
+  .description('Machine-derived freeze-proximity per agent — the watchdog\'s OWN counter (task_1784498913017). Replaces the hand-filled orchestrator_freeze_proximity metric; the 59 pre-2026-07-20 rows are non-comparable by construction (different event name, different provenance).')
+  .option('--agent <name...>', 'Agent(s) to report on (default: all enabled agents)')
+  .option('--emit-events', 'Also log one observer metric event per agent (event: watchdog_freeze_proximity)')
+  .action(async (opts: { agent?: string[]; emitEvents?: boolean }) => {
+    const env = resolveEnv();
+    const ctxRoot = join(require('os').homedir(), '.cortextos', env.instanceId);
+    const enabledFile = join(ctxRoot, 'config', 'enabled-agents.json');
+    let enabled: Record<string, { org?: string; enabled?: boolean }> = {};
+    try { enabled = JSON.parse(readFileSync(enabledFile, 'utf-8')); } catch { /* no registry — --agent still works */ }
+    const agents = opts.agent?.length
+      ? opts.agent
+      : Object.entries(enabled).filter(([, c]) => c.enabled !== false).map(([n]) => n);
+    if (!agents.length) {
+      console.error('CANNOT-TELL: no agents — enabled-agents.json unreadable and no --agent given');
+      process.exit(2);
+    }
+    for (const a of agents) { try { validateAgentName(a); } catch (err) { console.error(String(err)); process.exit(1); } }
+    // Same class, same readers, same predicate as the daemon's recovery ladder —
+    // NOT a reimplementation (the metric drifting from the watchdog's own counter
+    // is the defect this command exists to end). Recovery hooks are inert stubs;
+    // proximity() only reads.
+    const { FrozenTurnWatchdog } = require('../daemon/frozen-turn-watchdog.js');
+    const wd = new FrozenTurnWatchdog({
+      ctxRoot,
+      instanceId: env.instanceId,
+      getRunningAgents: () => [],
+      resolveOrg: (agent: string) => enabled[agent]?.org,
+      restartAgent: async () => { throw new Error('watchdog-proximity is read-only'); },
+    });
+    const now = Date.now();
+    const rows = agents.map((a) => ({ org: enabled[a]?.org ?? '', ...wd.proximity(a, now) }));
+    console.log(JSON.stringify(rows, null, 2));
+    if (opts.emitEvents) {
+      const { logObserverEvent } = require('../bus/event.js');
+      for (const r of rows) {
+        try {
+          const paths = resolvePaths(r.agent, env.instanceId, r.org || undefined);
+          logObserverEvent(paths, r.agent, r.org, 'metric', 'watchdog_freeze_proximity', r.frozen ? 'warning' : 'info', r as unknown as Record<string, unknown>);
+        } catch (err) {
+          console.error(`event emit failed for ${r.agent}: ${err instanceof Error ? err.message : String(err)}`);
+          process.exitCode = 2; // a metric emission that silently fails is the original defect
+        }
+      }
+    }
+  });
+
+busCommand
   .command('list-agents')
   .description('Discover all agents in the system with their status and roles')
   .option('--org <org>', 'Filter by organization')
