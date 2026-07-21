@@ -1,6 +1,7 @@
 import { AgentManager } from './agent-manager.js';
 import { IPCServer } from './ipc-server.js';
 import { FrozenTurnWatchdog, type FrozenTurnDetail } from './frozen-turn-watchdog.js';
+import { pageOperator, validateOperatorChat } from './operator-page.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
@@ -115,71 +116,15 @@ export function writeDaemonCrashedMarkers(ctxRoot: string): void {
   }
 }
 
-function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken: string } | null {
-  // Priority 1: explicit operator env (recommended for production).
-  const envChat = process.env.CTX_OPERATOR_CHAT_ID;
-  const envToken = process.env.CTX_OPERATOR_BOT_TOKEN;
-  if (envChat && envToken && /^\d+:[A-Za-z0-9_-]+$/.test(envToken)) {
-    return { chatId: envChat, botToken: envToken };
-  }
-  // Priority 2: fall back to the first agent's .env. Good enough for
-  // small single-operator installs — alert still lands SOMEWHERE visible.
-  try {
-    const orgsRoot = join(frameworkRoot, 'orgs');
-    if (!existsSync(orgsRoot)) return null;
-    const orgs = readdirSync(orgsRoot, { withFileTypes: true }).filter(d => d.isDirectory());
-    for (const org of orgs) {
-      const agentsRoot = join(orgsRoot, org.name, 'agents');
-      if (!existsSync(agentsRoot)) continue;
-      const agents = readdirSync(agentsRoot, { withFileTypes: true }).filter(d => d.isDirectory());
-      for (const a of agents) {
-        const envFile = join(agentsRoot, a.name, '.env');
-        if (!existsSync(envFile)) continue;
-        try {
-          const content = readFileSync(envFile, 'utf-8');
-          const tokenMatch = content.match(/^BOT_TOKEN=(.+)$/m);
-          const chatMatch = content.match(/^CHAT_ID=(.+)$/m);
-          if (!tokenMatch || !chatMatch) continue;
-          const botToken = tokenMatch[1].trim();
-          const chatId = envChat || chatMatch[1].trim();
-          if (/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
-            return { chatId, botToken };
-          }
-        } catch { /* skip this agent */ }
-      }
-    }
-  } catch { /* fall through */ }
-  return null;
-}
-
+// Operator-page primitive extracted to operator-page.ts (2026-07-21, F3):
+// it is the fleet's only alert path with no Claude turn in it, so it is a
+// general capability with multiple callers, not a rung-3 special case.
 function sendOperatorAlertBestEffort(
   frameworkRoot: string,
   message: string,
   label: string,
 ): boolean {
-  const creds = getOperatorChatCreds(frameworkRoot);
-  if (!creds) {
-    console.error(`[daemon] ${label}: no operator chat configured ` +
-      '(set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN, or ensure at least one agent .env exists)');
-    return false;
-  }
-  try {
-    const r = spawnSync('curl', [
-      '-s', '--max-time', '3',
-      '-X', 'POST',
-      `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
-      '-d', `chat_id=${creds.chatId}`,
-      '--data-urlencode', `text=${message}`,
-    ], { timeout: TELEGRAM_SEND_TIMEOUT_MS, stdio: 'pipe' });
-    if (r.status === 0) {
-      console.error(`[daemon] ${label} sent to operator chat`);
-      return true;
-    }
-    console.error(`[daemon] ${label} send failed (non-fatal)`);
-    return false;
-  } catch {
-    return false;
-  }
+  return pageOperator(frameworkRoot, message, label);
 }
 
 function sendCrashLoopAlertBestEffort(
@@ -378,14 +323,37 @@ class Daemon {
         } catch { /* observational only — never disrupt the watchdog */ }
       },
       escalate: (detail) => this.escalateFrozenTurn(frameworkRoot, instanceId, detail),
+      // COMMON-MODE ARM (2026-07-21, the 8h outage): ≥N agents concurrently
+      // frozen pages the operator directly, regardless of who the subject is.
+      // Rung-3 escalation alone routes specialists' alarms INTO the
+      // orchestrator's session — which in a common-mode failure (shared
+      // credential expiry) is exactly as dead as everyone else's.
+      pageOperator: (message) =>
+        pageOperator(frameworkRoot, message, 'Watchdog common-mode alarm'),
       logger: (msg) => console.log(`[watchdog] ${msg}`),
       checkIntervalMs: envNum('CTX_WATCHDOG_CHECK_MS'),
       graceMs: envNum('CTX_WATCHDOG_GRACE_MS'),
       verifyMs: envNum('CTX_WATCHDOG_VERIFY_MS'),
       rollingWindowMs: envNum('CTX_WATCHDOG_WINDOW_MS'),
       freezeThreshold: envNum('CTX_WATCHDOG_FREEZE_N'),
+      commonModeThreshold: envNum('CTX_WATCHDOG_COMMON_MODE_N'),
     });
     this.watchdog.start();
+
+    // Boot self-test: exercise the operator-page credentials (getMe + getChat,
+    // no message sent). A dead last-resort alarm must be loud while everything
+    // else is healthy — that is the only time anyone can hear it. Found the
+    // same day this was built: activity-channel.env missing for every org,
+    // announced only by a line nobody was reading. Same class.
+    try {
+      const v = validateOperatorChat(frameworkRoot);
+      if (v.ok) {
+        console.log(`[daemon] operator-page self-test OK: ${v.detail}`);
+      } else {
+        console.error(`[daemon] ⚠️ CRITICAL: operator-page self-test FAILED (${v.failed}): ${v.detail} — ` +
+          'the fleet CANNOT page the operator in a common-mode outage. Fix before relying on any alarm.');
+      }
+    } catch { /* self-test must never block boot */ }
 
     console.log(`[daemon] Running (pid: ${process.pid})`);
 

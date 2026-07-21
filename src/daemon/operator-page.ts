@@ -1,0 +1,190 @@
+/**
+ * operator-page.ts — the daemon's last-resort alert channel: a direct
+ * Telegram page to the operator with NO Claude turn anywhere in the path.
+ *
+ * WHY THIS IS A MODULE (2026-07-21, the 8h fleet outage): every other alert
+ * path in the system terminates in a Claude turn — rung-3 escalations go to
+ * the orchestrator's session, fleet-health runs inside agent sessions, the
+ * activity channel is posted by agents. A common-mode failure (the shared
+ * OAuth credential expiring) disabled every Claude turn at once, so the
+ * system could not report its own most likely total failure. This primitive
+ * uses only a bot token + curl: Telegram auth is independent of Anthropic
+ * auth, and the daemon survived the whole outage.
+ *
+ * It is deliberately a GENERAL capability ("the daemon can always reach
+ * Steven"), not a rung-3 special case — the same day this was built, a
+ * second dead notification path surfaced (activity-channel.env missing for
+ * every org, broadcasts silently failing since forever). Callers today:
+ * rung-3 escalation (subject-is-orchestrator / no-orchestrator), the
+ * watchdog common-mode arm, and the daemon crash-loop alert. Credential
+ * refresh-failure and expiry-warning legs join with F1/F2.
+ */
+
+import { existsSync, readFileSync, readdirSync } from 'fs';
+import { spawnSync } from 'child_process';
+import { join } from 'path';
+
+export const PAGE_SEND_TIMEOUT_MS = 3000; // bounded — callers may be crashing
+
+export interface OperatorChatCreds {
+  chatId: string;
+  botToken: string;
+}
+
+/**
+ * Resolve where an operator page goes.
+ * Priority 1: explicit CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN env.
+ * Priority 2: the first agent .env that defines BOT_TOKEN + CHAT_ID — good
+ * enough for small single-operator installs; the alert still lands SOMEWHERE
+ * a human reads.
+ */
+export function getOperatorChatCreds(frameworkRoot: string): OperatorChatCreds | null {
+  const envChat = process.env.CTX_OPERATOR_CHAT_ID;
+  const envToken = process.env.CTX_OPERATOR_BOT_TOKEN;
+  if (envChat && envToken && /^\d+:[A-Za-z0-9_-]+$/.test(envToken)) {
+    return { chatId: envChat, botToken: envToken };
+  }
+  try {
+    const orgsRoot = join(frameworkRoot, 'orgs');
+    if (!existsSync(orgsRoot)) return null;
+    const orgs = readdirSync(orgsRoot, { withFileTypes: true }).filter(d => d.isDirectory());
+    for (const org of orgs) {
+      const agentsRoot = join(orgsRoot, org.name, 'agents');
+      if (!existsSync(agentsRoot)) continue;
+      const agents = readdirSync(agentsRoot, { withFileTypes: true }).filter(d => d.isDirectory());
+      for (const a of agents) {
+        const envFile = join(agentsRoot, a.name, '.env');
+        if (!existsSync(envFile)) continue;
+        try {
+          const content = readFileSync(envFile, 'utf-8');
+          const tokenMatch = content.match(/^BOT_TOKEN=(.+)$/m);
+          const chatMatch = content.match(/^CHAT_ID=(.+)$/m);
+          if (!tokenMatch || !chatMatch) continue;
+          const botToken = tokenMatch[1].trim();
+          const chatId = envChat || chatMatch[1].trim();
+          if (/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
+            return { chatId, botToken };
+          }
+        } catch { /* skip this agent */ }
+      }
+    }
+  } catch { /* fall through */ }
+  return null;
+}
+
+/** Transport result: delivered is Telegram's own verdict, not curl's. */
+export interface PageTransportResult {
+  delivered: boolean;
+  detail: string;
+}
+
+export type PageTransport = (creds: OperatorChatCreds, text: string) => PageTransportResult;
+
+/**
+ * Default transport: curl POST to the Bot API.
+ *
+ * DELIVERY IS JUDGED BY TELEGRAM'S RESPONSE BODY ({"ok":true}), NOT curl's
+ * exit code. curl -s exits 0 on HTTP 4xx, so the previous exit-code check
+ * reported "sent" forever on a bad chat_id or revoked bot token — a
+ * check-that-cannot-fail in the one alarm that must never be one.
+ */
+export const curlPageTransport: PageTransport = (creds, text) => {
+  const r = spawnSync('curl', [
+    '-s', '--max-time', '3',
+    '-X', 'POST',
+    `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
+    '-d', `chat_id=${creds.chatId}`,
+    '--data-urlencode', `text=${text}`,
+  ], { timeout: PAGE_SEND_TIMEOUT_MS, stdio: 'pipe' });
+  if (r.status !== 0) {
+    return { delivered: false, detail: `curl exit ${r.status ?? 'null'}` };
+  }
+  const body = (r.stdout ?? Buffer.from('')).toString('utf-8');
+  if (/"ok"\s*:\s*true/.test(body)) {
+    return { delivered: true, detail: 'telegram ok:true' };
+  }
+  return { delivered: false, detail: `telegram refused: ${body.slice(0, 200)}` };
+};
+
+/** Result of the boot-time operator-chat self-test. */
+export interface OperatorChatValidation {
+  ok: boolean;
+  /** Which probe failed first, or 'none'. */
+  failed: 'no-creds' | 'getMe' | 'getChat' | 'none';
+  detail: string;
+}
+
+export type ValidationTransport = (url: string) => { status: number | null; body: string };
+
+const curlValidationTransport: ValidationTransport = (url) => {
+  const r = spawnSync('curl', ['-s', '--max-time', '3', url],
+    { timeout: PAGE_SEND_TIMEOUT_MS, stdio: 'pipe' });
+  return { status: r.status, body: (r.stdout ?? Buffer.from('')).toString('utf-8') };
+};
+
+/**
+ * Boot-time self-test: exercise the operator-page credentials WITHOUT
+ * messaging the operator. getMe proves the bot token is valid; getChat
+ * proves the chat is reachable by this bot. A dead alarm must be noisy
+ * while everything else is healthy — that is the only time anyone can
+ * hear it (chief, 2026-07-21). The full send path is proven by a one-time
+ * live delivery test, not re-proven noisily on every boot.
+ */
+export function validateOperatorChat(
+  frameworkRoot: string,
+  transport: ValidationTransport = curlValidationTransport,
+): OperatorChatValidation {
+  const creds = getOperatorChatCreds(frameworkRoot);
+  if (!creds) {
+    return { ok: false, failed: 'no-creds', detail: 'no operator chat credentials resolved (env or agent .env)' };
+  }
+  try {
+    const me = transport(`https://api.telegram.org/bot${creds.botToken}/getMe`);
+    if (me.status !== 0 || !/"ok"\s*:\s*true/.test(me.body)) {
+      return { ok: false, failed: 'getMe', detail: `bot token invalid or unreachable: ${me.body.slice(0, 200) || `curl exit ${me.status}`}` };
+    }
+    const chat = transport(`https://api.telegram.org/bot${creds.botToken}/getChat?chat_id=${encodeURIComponent(creds.chatId)}`);
+    if (chat.status !== 0 || !/"ok"\s*:\s*true/.test(chat.body)) {
+      return { ok: false, failed: 'getChat', detail: `chat ${creds.chatId} unreachable by bot: ${chat.body.slice(0, 200) || `curl exit ${chat.status}`}` };
+    }
+    return { ok: true, failed: 'none', detail: 'bot token valid, chat reachable' };
+  } catch (err) {
+    return { ok: false, failed: 'getMe', detail: `validation threw: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+export interface PageOperatorOptions {
+  /** Injectable transport for tests / live harness. Default: curl. */
+  transport?: PageTransport;
+  log?: (msg: string) => void;
+}
+
+/**
+ * Page the operator chat. Returns true only on Telegram-confirmed delivery.
+ * Best-effort: never throws — callers are often already in a failure path.
+ */
+export function pageOperator(
+  frameworkRoot: string,
+  message: string,
+  label: string,
+  opts: PageOperatorOptions = {},
+): boolean {
+  const log = opts.log ?? ((m: string) => console.error(m));
+  const creds = getOperatorChatCreds(frameworkRoot);
+  if (!creds) {
+    log(`[daemon] ${label}: no operator chat configured ` +
+      '(set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN, or ensure at least one agent .env exists)');
+    return false;
+  }
+  const transport = opts.transport ?? curlPageTransport;
+  try {
+    const result = transport(creds, message);
+    log(result.delivered
+      ? `[daemon] ${label} delivered to operator chat (${result.detail})`
+      : `[daemon] ${label} NOT delivered (${result.detail})`);
+    return result.delivered;
+  } catch (err) {
+    log(`[daemon] ${label} transport threw: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}

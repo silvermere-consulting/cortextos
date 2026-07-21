@@ -86,6 +86,15 @@ export interface FrozenTurnWatchdogOptions {
   }) => void;
   /** Escalate to the orchestrator (rung 3). */
   escalate?: (detail: FrozenTurnDetail) => void;
+  /**
+   * COMMON-MODE ARM (2026-07-21, the 8h outage): page the operator chat
+   * directly — no Claude turn in the path. Fired when ≥ commonModeThreshold
+   * agents are concurrently frozen: per-agent rung-3 escalation routes into
+   * the orchestrator's session, which in a common-mode failure (e.g. the
+   * shared OAuth credential expiring) is exactly as dead as every other
+   * session. Returns delivery success (Telegram-confirmed, not curl exit).
+   */
+  pageOperator?: (message: string) => boolean;
   logger?: (msg: string) => void;
   /** Injectable clock (ms) for tests. */
   now?: () => number;
@@ -95,6 +104,10 @@ export interface FrozenTurnWatchdogOptions {
   rollingWindowMs?: number;
   freezeThreshold?: number;
   heartbeatCronName?: string;
+  /** Concurrently-frozen agent count that trips the common-mode page. */
+  commonModeThreshold?: number;
+  /** Min interval between common-mode pages (re-pages while outage persists). */
+  commonModePageCooldownMs?: number;
 }
 
 interface AgentRuntimeState {
@@ -115,18 +128,22 @@ const DEFAULTS = {
   rollingWindowMs: 60 * 60_000, // recovery-attempt counter window: 1 hour
   freezeThreshold: 2, // N consecutive unanswered fires
   heartbeatCronName: 'heartbeat',
+  commonModeThreshold: 3, // N concurrently-frozen agents = common-mode failure
+  commonModePageCooldownMs: 60 * 60_000, // re-page hourly while it persists
 };
 
 export class FrozenTurnWatchdog {
   private readonly opt: Required<Omit<FrozenTurnWatchdogOptions,
-    'recordEvent' | 'escalate' | 'logger' | 'now' | 'instanceId'>> &
-    Pick<FrozenTurnWatchdogOptions, 'recordEvent' | 'escalate' | 'logger' | 'now' | 'instanceId'>;
+    'recordEvent' | 'escalate' | 'pageOperator' | 'logger' | 'now' | 'instanceId'>> &
+    Pick<FrozenTurnWatchdogOptions, 'recordEvent' | 'escalate' | 'pageOperator' | 'logger' | 'now' | 'instanceId'>;
   private readonly now: () => number;
   private readonly log: (msg: string) => void;
   private readonly state = new Map<string, AgentRuntimeState>();
   private timer: ReturnType<typeof setInterval> | null = null;
   /** Guard so an overrunning tick never overlaps the next interval. */
   private ticking = false;
+  /** Last successful common-mode page (ms); 0 = never. */
+  private lastCommonModePageAt = 0;
 
   constructor(options: FrozenTurnWatchdogOptions) {
     this.opt = {
@@ -136,12 +153,15 @@ export class FrozenTurnWatchdog {
       rollingWindowMs: options.rollingWindowMs ?? DEFAULTS.rollingWindowMs,
       freezeThreshold: options.freezeThreshold ?? DEFAULTS.freezeThreshold,
       heartbeatCronName: options.heartbeatCronName ?? DEFAULTS.heartbeatCronName,
+      commonModeThreshold: options.commonModeThreshold ?? DEFAULTS.commonModeThreshold,
+      commonModePageCooldownMs: options.commonModePageCooldownMs ?? DEFAULTS.commonModePageCooldownMs,
       ctxRoot: options.ctxRoot,
       getRunningAgents: options.getRunningAgents,
       resolveOrg: options.resolveOrg,
       restartAgent: options.restartAgent,
       recordEvent: options.recordEvent,
       escalate: options.escalate,
+      pageOperator: options.pageOperator,
       logger: options.logger,
       now: options.now,
       instanceId: options.instanceId,
@@ -177,6 +197,17 @@ export class FrozenTurnWatchdog {
     this.ticking = true;
     try {
       const agents = this.safe(() => this.opt.getRunningAgents(), [] as string[]);
+
+      // COMMON-MODE SWEEP — before per-agent recovery, and independent of it.
+      // evaluate() is a pure read of persistent on-disk state, so "frozen"
+      // accumulates until a REAL recovery clears it: a staggered cascade
+      // (one agent freezing every 20 min) still converges to N-concurrent
+      // unless recoveries are succeeding — and if they succeed, it is not a
+      // common-mode failure. The count is rolling by construction; no
+      // separate window bookkeeping needed (proven by the cascade fixture
+      // in watchdog-common-mode.test.ts, not asserted).
+      this.checkCommonMode(agents);
+
       for (const agent of agents) {
         try {
           await this.evaluateAndRecover(agent);
@@ -187,6 +218,55 @@ export class FrozenTurnWatchdog {
     } finally {
       this.ticking = false;
     }
+  }
+
+  /**
+   * ≥ commonModeThreshold concurrently-frozen agents = a failure with a
+   * shared cause (credential expiry, API outage, daemon-side breakage).
+   * Per-agent rung-3 escalation routes into the orchestrator's session —
+   * in a common-mode failure that session is exactly as dead as the rest
+   * (2026-07-20: 8h fleet outage, every specialist's rung-3 died in the
+   * orchestrator's logged-out session; the operator found out by noticing).
+   * This arm pages the operator directly, no Claude turn in the path.
+   * Re-pages on a cooldown while the condition persists. Cooldown restarts
+   * only on CONFIRMED delivery — a failed page must retry next tick, not
+   * silently sleep through the outage.
+   */
+  private checkCommonMode(agents: string[]): void {
+    if (!this.opt.pageOperator) return;
+    const now = this.now();
+    if (now - this.lastCommonModePageAt < this.opt.commonModePageCooldownMs) return;
+
+    const frozen: { agent: string; unanswered: number; lastReal: string | null }[] = [];
+    for (const agent of agents) {
+      try {
+        const ev = this.evaluate(agent, now);
+        if (ev.frozen) frozen.push({ agent, unanswered: ev.unansweredFires, lastReal: ev.lastRealHeartbeat });
+      } catch { /* one unreadable agent must not break the sweep */ }
+    }
+    if (frozen.length < this.opt.commonModeThreshold) return;
+
+    const names = frozen.map((f) => `${f.agent} (${f.unanswered} unanswered, last real ${f.lastReal ?? 'never'})`).join('; ');
+    const message =
+      `🚨🚨 COMMON-MODE FLEET FAILURE: ${frozen.length} of ${agents.length} agents concurrently frozen — ` +
+      `a shared cause (credential expiry, API outage) is likely and per-agent auto-restart will NOT fix it. ` +
+      `Frozen: ${names}. ` +
+      `Check: OAuth expiry (cortextos bus list-oauth-accounts), then agent stdout for "Login expired".`;
+
+    const delivered = this.safe(() => this.opt.pageOperator!(message), false);
+    if (delivered) this.lastCommonModePageAt = now;
+    this.log(delivered
+      ? `common-mode page delivered (${frozen.length} frozen)`
+      : `common-mode page NOT delivered (${frozen.length} frozen) — will retry next tick`);
+
+    const org = this.opt.resolveOrg(frozen[0].agent) ?? '';
+    this.record(frozen[0].agent, org, 'error', 'watchdog_common_mode', 'error', {
+      frozen_count: frozen.length,
+      running_count: agents.length,
+      frozen_agents: frozen.map((f) => f.agent),
+      page_delivered: delivered,
+      threshold: this.opt.commonModeThreshold,
+    });
   }
 
   private agentState(agent: string): AgentRuntimeState {
