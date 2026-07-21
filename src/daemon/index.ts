@@ -119,12 +119,20 @@ export function writeDaemonCrashedMarkers(ctxRoot: string): void {
 // Operator-page primitive extracted to operator-page.ts (2026-07-21, F3):
 // it is the fleet's only alert path with no Claude turn in it, so it is a
 // general capability with multiple callers, not a rung-3 special case.
+//
+// requireExplicit EVERYWHERE (chief's call, 2026-07-21): the fallback was
+// exercised 24 times across the 8h outage and produced zero alerting value
+// at real cost — pages at a person with no context or ability to act, while
+// the operator learned nothing. "Page-to-wrong-chat beats page-to-nobody"
+// was tested at scale and it lost. All operator pages send only to the chat
+// chosen by CTX_OPERATOR_* config; unconfigured = inert-and-loud (the boot
+// self-test goes red, re-checked hourly, evented to each org's orchestrator).
 function sendOperatorAlertBestEffort(
   frameworkRoot: string,
   message: string,
   label: string,
 ): boolean {
-  return pageOperator(frameworkRoot, message, label);
+  return pageOperator(frameworkRoot, message, label, { requireExplicit: true });
 }
 
 function sendCrashLoopAlertBestEffort(
@@ -343,23 +351,21 @@ class Daemon {
     });
     this.watchdog.start();
 
-    // Boot self-test: exercise the operator-page credentials (getMe + getChat,
-    // no message sent). A dead last-resort alarm must be loud while everything
-    // else is healthy — that is the only time anyone can hear it. Found the
-    // same day this was built: activity-channel.env missing for every org,
-    // announced only by a line nobody was reading. Same class.
-    try {
-      // requireExplicit: a fallback-resolved chat passes reachability while
-      // paging the wrong human (measured 2026-07-21). The daemon's green must
-      // mean "the alarm reaches the operator", not "an alarm works".
-      const v = validateOperatorChat(frameworkRoot, undefined, { requireExplicit: true });
-      if (v.ok) {
-        console.log(`[daemon] operator-page self-test OK: ${v.detail}`);
-      } else {
-        console.error(`[daemon] ⚠️ CRITICAL: operator-page self-test FAILED (${v.failed}): ${v.detail} — ` +
-          'the fleet CANNOT page the operator in a common-mode outage. Fix before relying on any alarm.');
-      }
-    } catch { /* self-test must never block boot */ }
+    // Operator-page self-test: at boot and hourly thereafter. A dead
+    // last-resort alarm must be loud while everything else is healthy — and
+    // loud INTO A CHANNEL WITH A READER (chief, 2026-07-21): a CRITICAL log
+    // only a person tailing the daemon would see is a near-side register
+    // with extra steps. Red raises a bus event on each org's orchestrator
+    // (activity feed + analyst's sweeps) and persists a marker any check
+    // can read. requireExplicit because a fallback-resolved chat passes
+    // reachability while paging the wrong human — green must mean "the
+    // alarm reaches the operator", not "an alarm works".
+    this.runOperatorSelfTest(frameworkRoot, instanceId);
+    const selfTestTimer = setInterval(
+      () => this.runOperatorSelfTest(frameworkRoot, instanceId),
+      60 * 60_000,
+    );
+    if (typeof selfTestTimer.unref === 'function') selfTestTimer.unref();
 
     console.log(`[daemon] Running (pid: ${process.pid})`);
 
@@ -440,6 +446,65 @@ class Daemon {
         unlinkSync(pidFile);
       } catch { /* ignore */ }
     });
+  }
+
+  /**
+   * Validate the operator-page path and make a red result land where it has
+   * readers: CRITICAL daemon log + persistent marker
+   * (state/.operator-page-selftest.json) + an `operator_page_selftest_failed`
+   * bus event on each org's orchestrator (dashboard activity feed, analyst
+   * sweeps, chief's own stream). Runs at boot and hourly. Best-effort at
+   * every step — the self-test must never disrupt the daemon.
+   */
+  private runOperatorSelfTest(frameworkRoot: string, instanceId: string): void {
+    try {
+      const v = validateOperatorChat(frameworkRoot, undefined, { requireExplicit: true });
+
+      // Persistent marker: any check (heartbeat, census, fleet sweeps) can
+      // read the current verdict without parsing logs.
+      try {
+        const stateDir = join(this.ctxRoot, 'state');
+        ensureDir(stateDir);
+        writeFileSync(
+          join(stateDir, '.operator-page-selftest.json'),
+          JSON.stringify({ ok: v.ok, failed: v.failed, detail: v.detail, checked_at: new Date().toISOString() }, null, 2),
+          'utf-8',
+        );
+      } catch { /* marker is best-effort */ }
+
+      if (v.ok) {
+        console.log(`[daemon] operator-page self-test OK: ${v.detail}`);
+        return;
+      }
+
+      console.error(`[daemon] ⚠️ CRITICAL: operator-page self-test FAILED (${v.failed}): ${v.detail} — ` +
+        'the fleet CANNOT page the operator in a common-mode outage. Fix before relying on any alarm.');
+
+      // Event per org, attributed to its orchestrator (falls back to the
+      // org's first agent) — the streams that actually get read.
+      const agents = this.agentManager?.getAgentNames() ?? [];
+      const orgFirstAgent = new Map<string, string>();
+      for (const a of agents) {
+        const org = this.agentManager?.getAgentOrg(a);
+        if (org && !orgFirstAgent.has(org)) orgFirstAgent.set(org, a);
+      }
+      for (const [org, firstAgent] of orgFirstAgent) {
+        try {
+          let target = firstAgent;
+          try {
+            const ctx = JSON.parse(stripBom(readFileSync(join(frameworkRoot, 'orgs', org, 'context.json'), 'utf-8')));
+            if (typeof ctx.orchestrator === 'string' && ctx.orchestrator) target = ctx.orchestrator;
+          } catch { /* no context.json — first agent carries it */ }
+          logObserverEvent(
+            resolvePaths(target, instanceId, org), target, org,
+            'error', 'operator_page_selftest_failed', 'error',
+            { failed: v.failed, detail: v.detail },
+          );
+        } catch { /* per-org best-effort */ }
+      }
+    } catch (err) {
+      console.error(`[daemon] operator-page self-test threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
