@@ -2,7 +2,7 @@ import { AgentManager } from './agent-manager.js';
 import { IPCServer } from './ipc-server.js';
 import { FrozenTurnWatchdog, type FrozenTurnDetail } from './frozen-turn-watchdog.js';
 import { pageOperator, validateOperatorChat } from './operator-page.js';
-import { CredentialRefresher } from './credential-refresh.js';
+import { CredentialRefresher, buildCredentialGate } from './credential-refresh.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
@@ -342,6 +342,9 @@ class Daemon {
       // the fallback walk happens to find (24 mis-addressed pages, 2026-07-20).
       pageOperator: (message) =>
         pageOperator(frameworkRoot, message, 'Watchdog common-mode alarm', { requireExplicit: true }),
+      // F2: hold recovery rungs when a restart provably cannot help
+      // (credential expired / token refused). See credential-refresh.ts.
+      credentialGate: buildCredentialGate({ ctxRoot: this.ctxRoot }),
       logger: (msg) => console.log(`[watchdog] ${msg}`),
       checkIntervalMs: envNum('CTX_WATCHDOG_CHECK_MS'),
       graceMs: envNum('CTX_WATCHDOG_GRACE_MS'),

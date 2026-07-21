@@ -215,6 +215,54 @@ export function writeCredentialsStore(homeDirPath: string, family: TokenFamily):
 
 // --- the refresher ---
 
+/**
+ * F2: build the watchdog's credential gate. ok:false ONLY when a restart
+ * provably cannot help: the newest on-disk family is expired, or the current
+ * access token probes TOKEN_BAD. CANNOT_TELL and every error fail OPEN
+ * toward recovery — a wrong restart costs a wasted rung; a wrong hold costs
+ * an unrecovered agent. Probe results are memoized (default 120s) so eight
+ * frozen agents on one-minute ticks do not hammer the endpoint.
+ */
+export function buildCredentialGate(opts: {
+  ctxRoot: string;
+  homeDir?: string;
+  probe?: ProbeFn;
+  now?: () => number;
+  memoMs?: number;
+}): () => Promise<{ ok: boolean; reason: string }> {
+  const homeDirPath = opts.homeDir ?? homedir();
+  const probe = opts.probe ?? ((t: string) => probeAccessToken(t));
+  const now = opts.now ?? (() => Date.now());
+  const memoMs = opts.memoMs ?? 120_000;
+  let memo: { at: number; result: { ok: boolean; reason: string } } | null = null;
+
+  return async () => {
+    const t = now();
+    if (memo && t - memo.at < memoMs) return memo.result;
+
+    let result: { ok: boolean; reason: string };
+    try {
+      const a = readCredentialsStore(homeDirPath).family;
+      const b = readAccountsStore(opts.ctxRoot).family;
+      const family = a && b ? (a.expires_at >= b.expires_at ? a : b) : (a ?? b);
+      if (!family) {
+        result = { ok: true, reason: 'no credential stores to judge — failing open toward recovery' };
+      } else if (family.expires_at <= t) {
+        result = { ok: false, reason: `credential expired at ${new Date(family.expires_at).toISOString()}` };
+      } else {
+        const p = await probe(family.access_token);
+        result = p.verdict === 'TOKEN_BAD'
+          ? { ok: false, reason: `current token refused by API (${p.detail})` }
+          : { ok: true, reason: p.verdict === 'VALID' ? 'token verified' : `probe ${p.detail} — failing open toward recovery` };
+      }
+    } catch (err) {
+      result = { ok: true, reason: `gate error (${err instanceof Error ? err.message : String(err)}) — failing open toward recovery` };
+    }
+    memo = { at: t, result };
+    return result;
+  };
+}
+
 export interface CredentialRefresherOptions {
   ctxRoot: string;
   homeDir?: string;

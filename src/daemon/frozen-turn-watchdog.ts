@@ -95,6 +95,19 @@ export interface FrozenTurnWatchdogOptions {
    * session. Returns delivery success (Telegram-confirmed, not curl exit).
    */
   pageOperator?: (message: string) => boolean;
+  /**
+   * CREDENTIAL GATE (F2, 2026-07-21): consulted BEFORE any recovery rung is
+   * burned. Returns ok:false when a restart provably cannot help — the
+   * shared credential is expired on disk or the current token probes
+   * TOKEN_BAD. On ok:false the watchdog HOLDS: no restart, no attempt slot
+   * consumed, an event emitted; the credential refresher owns the paging.
+   * CANNOT_TELL must map to ok:true — a usage-API blip must never block
+   * real recovery (fail-open toward restarting; the safe side here is the
+   * recovery side). 2026-07-20 under this gate: zero pointless respawns
+   * instead of ~16, zero in-band escalations into the orchestrator's
+   * equally-dead session instead of 40.
+   */
+  credentialGate?: () => Promise<{ ok: boolean; reason: string }>;
   logger?: (msg: string) => void;
   /** Injectable clock (ms) for tests. */
   now?: () => number;
@@ -134,8 +147,8 @@ const DEFAULTS = {
 
 export class FrozenTurnWatchdog {
   private readonly opt: Required<Omit<FrozenTurnWatchdogOptions,
-    'recordEvent' | 'escalate' | 'pageOperator' | 'logger' | 'now' | 'instanceId'>> &
-    Pick<FrozenTurnWatchdogOptions, 'recordEvent' | 'escalate' | 'pageOperator' | 'logger' | 'now' | 'instanceId'>;
+    'recordEvent' | 'escalate' | 'pageOperator' | 'credentialGate' | 'logger' | 'now' | 'instanceId'>> &
+    Pick<FrozenTurnWatchdogOptions, 'recordEvent' | 'escalate' | 'pageOperator' | 'credentialGate' | 'logger' | 'now' | 'instanceId'>;
   private readonly now: () => number;
   private readonly log: (msg: string) => void;
   private readonly state = new Map<string, AgentRuntimeState>();
@@ -162,6 +175,7 @@ export class FrozenTurnWatchdog {
       recordEvent: options.recordEvent,
       escalate: options.escalate,
       pageOperator: options.pageOperator,
+      credentialGate: options.credentialGate,
       logger: options.logger,
       now: options.now,
       instanceId: options.instanceId,
@@ -395,6 +409,37 @@ export class FrozenTurnWatchdog {
   private async recover(agent: string, ev: { unansweredFires: number; lastRealHeartbeat: string | null }, now: number): Promise<void> {
     const st = this.agentState(agent);
     const org = this.opt.resolveOrg(agent) ?? '';
+
+    // F2 CREDENTIAL GATE: if a restart provably cannot help (credential
+    // expired / token refused), HOLD — no restart, no attempt slot burned,
+    // no in-band escalation to an orchestrator who is equally logged out.
+    // The refresher owns paging, so responsibility for telling the operator
+    // sits in exactly one place. Gate errors and CANNOT_TELL fail OPEN
+    // toward recovery: a wrong restart costs a wasted rung; a wrong hold
+    // costs an unrecovered agent — not comparable. KNOWN RESIDUAL (chief,
+    // 2026-07-21): a persistently degraded probe plus a real common-mode
+    // failure burns rungs and pages, i.e. last-night behaviour — strictly
+    // better than not recovering, and the gate does NOT cover that case.
+    if (this.opt.credentialGate) {
+      let gate: { ok: boolean; reason: string };
+      try {
+        gate = await this.opt.credentialGate();
+      } catch (err) {
+        gate = { ok: true, reason: `gate threw (${err instanceof Error ? err.message : String(err)}) — failing open toward recovery` };
+      }
+      if (!gate.ok) {
+        this.record(agent, org, 'error', 'watchdog_hold_credential', 'warning', {
+          reason: gate.reason,
+          unanswered_fires: ev.unansweredFires,
+          last_real_hb: ev.lastRealHeartbeat,
+        });
+        this.log(`${agent}: frozen but HOLDING recovery — ${gate.reason} (restart cannot mint a credential; refresher owns paging)`);
+        // Re-judge after the verify window; the frozen state persists on
+        // disk, so detection (and the common-mode arm) keep seeing it.
+        st.recoveringUntil = now + this.opt.verifyMs;
+        return;
+      }
+    }
 
     // Prune the rolling-hour attempt window, then the rung = next attempt number.
     st.attempts = st.attempts.filter((t) => now - t < this.opt.rollingWindowMs);
