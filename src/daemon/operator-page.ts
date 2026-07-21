@@ -169,7 +169,11 @@ export function validateOperatorChat(
     if (chat.status !== 0 || !/"ok"\s*:\s*true/.test(chat.body)) {
       return { ok: false, failed: 'getChat', detail: `chat ${creds.chatId} unreachable by bot: ${chat.body.slice(0, 200) || `curl exit ${chat.status}`}` };
     }
-    return { ok: true, failed: 'none', detail: 'bot token valid, chat reachable' };
+    // The green NAMES the chat it validated (source included): the
+    // post-deploy check must confirm "green AND addressed to the operator",
+    // and a green that does not say who it is addressed to would force the
+    // checker back to the old reachability-only reading (chief, 2026-07-21).
+    return { ok: true, failed: 'none', detail: `bot token valid, chat ${creds.chatId} reachable (source: ${creds.source})` };
   } catch (err) {
     return { ok: false, failed: 'getMe', detail: `validation threw: ${err instanceof Error ? err.message : String(err)}` };
   }
