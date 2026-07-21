@@ -88,6 +88,28 @@ describe('pageOperator', () => {
     const boom: PageTransport = () => { throw new Error('network down'); };
     expect(pageOperator(frameworkRoot, 'msg', 'test', { transport: boom, log: () => {} })).toBe(false);
   });
+
+  // 2026-07-20: 24 rung-3 pages targeted a non-operator chat via the fallback
+  // walk. A NEW alert capability shipped before the env config would have
+  // multiplied them. requireExplicit makes that state inert-and-loud: the
+  // transport must never even be invoked on fallback-resolved creds.
+  it('requireExplicit: refuses fallback-resolved creds WITHOUT invoking the transport', () => {
+    creds(); // fallback only
+    let transportCalls = 0;
+    const counting: PageTransport = () => { transportCalls++; return { delivered: true, detail: 'ok' }; };
+    const logs: string[] = [];
+    const sent = pageOperator(frameworkRoot, 'msg', 'test', { transport: counting, requireExplicit: true, log: (m) => logs.push(m) });
+    expect(sent).toBe(false);
+    expect(transportCalls).toBe(0);
+    expect(logs.join('\n')).toContain('REFUSING to page');
+  });
+
+  it('requireExplicit: env-resolved creds still send', () => {
+    process.env.CTX_OPERATOR_CHAT_ID = '8704100535';
+    process.env.CTX_OPERATOR_BOT_TOKEN = '123:abc';
+    const ok: PageTransport = () => ({ delivered: true, detail: 'telegram ok:true' });
+    expect(pageOperator(frameworkRoot, 'msg', 'test', { transport: ok, requireExplicit: true, log: () => {} })).toBe(true);
+  });
 });
 
 describe('validateOperatorChat (boot self-test)', () => {

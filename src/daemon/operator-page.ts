@@ -179,6 +179,18 @@ export interface PageOperatorOptions {
   /** Injectable transport for tests / live harness. Default: curl. */
   transport?: PageTransport;
   log?: (msg: string) => void;
+  /**
+   * Refuse to send via FALLBACK-resolved creds — send only to the chat
+   * explicitly chosen by CTX_OPERATOR_* config. For NEW alert capabilities
+   * (the common-mode arm) this makes the misconfigured state inert-and-loud
+   * instead of a multiplier at the wrong chat: on 2026-07-20, 24 rung-3
+   * pages targeted a non-operator chat overnight via the fallback; had the
+   * common-mode arm shipped before the env config, it would have ADDED
+   * pages to the wrong human rather than reached the operator. Existing
+   * callers (rung-3, crash-loop) keep fallback behaviour — changing their
+   * semantics is a separate, deliberate decision.
+   */
+  requireExplicit?: boolean;
 }
 
 /**
@@ -196,6 +208,12 @@ export function pageOperator(
   if (!creds) {
     log(`[daemon] ${label}: no operator chat configured ` +
       '(set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN, or ensure at least one agent .env exists)');
+    return false;
+  }
+  if (opts.requireExplicit && creds.source !== 'env') {
+    log(`[daemon] ${label}: REFUSING to page — operator chat resolved by fallback to ${creds.chatId} ` +
+      '(not chosen by config). Set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN. ' +
+      'A page to an unchosen chat is noise at a stranger, not an alarm.');
     return false;
   }
   const transport = opts.transport ?? curlPageTransport;

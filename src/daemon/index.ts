@@ -328,8 +328,11 @@ class Daemon {
       // Rung-3 escalation alone routes specialists' alarms INTO the
       // orchestrator's session — which in a common-mode failure (shared
       // credential expiry) is exactly as dead as everyone else's.
+      // requireExplicit: the arm is a NEW capability — without CTX_OPERATOR_*
+      // it must be inert-and-loud, never a page multiplier at whatever chat
+      // the fallback walk happens to find (24 mis-addressed pages, 2026-07-20).
       pageOperator: (message) =>
-        pageOperator(frameworkRoot, message, 'Watchdog common-mode alarm'),
+        pageOperator(frameworkRoot, message, 'Watchdog common-mode alarm', { requireExplicit: true }),
       logger: (msg) => console.log(`[watchdog] ${msg}`),
       checkIntervalMs: envNum('CTX_WATCHDOG_CHECK_MS'),
       graceMs: envNum('CTX_WATCHDOG_GRACE_MS'),
