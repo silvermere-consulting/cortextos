@@ -2,6 +2,7 @@ import { AgentManager } from './agent-manager.js';
 import { IPCServer } from './ipc-server.js';
 import { FrozenTurnWatchdog, type FrozenTurnDetail } from './frozen-turn-watchdog.js';
 import { pageOperator, validateOperatorChat } from './operator-page.js';
+import { CredentialRefresher } from './credential-refresh.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
@@ -366,6 +367,23 @@ class Daemon {
       60 * 60_000,
     );
     if (typeof selfTestTimer.unref === 'function') selfTestTimer.unref();
+
+    // F1: proactive credential refresh — the fleet's shared Claude token
+    // must never expire while the daemon lives (2026-07-20: expiry logged
+    // out all agents for 8h; restarts cannot mint a credential). One tick
+    // every 5 minutes: cheap file reads; network only inside T-30. Design +
+    // pinned deadline semantics: see credential-refresh.ts header.
+    const credRefresher = new CredentialRefresher({
+      ctxRoot: this.ctxRoot,
+      page: (message) => pageOperator(frameworkRoot, message, 'Credential refresh', { requireExplicit: true }),
+      log: (msg) => console.log(`[cred-refresh] ${msg}`),
+    });
+    const credTimer = setInterval(() => {
+      credRefresher.tick().catch((err) =>
+        console.error(`[cred-refresh] tick threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`));
+    }, 5 * 60_000);
+    if (typeof credTimer.unref === 'function') credTimer.unref();
+    void credRefresher.tick().catch(() => { /* first pass best-effort */ });
 
     console.log(`[daemon] Running (pid: ${process.pid})`);
 
