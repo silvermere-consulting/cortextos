@@ -45,12 +45,12 @@ describe('getOperatorChatCreds', () => {
     process.env.CTX_OPERATOR_CHAT_ID = '111';
     process.env.CTX_OPERATOR_BOT_TOKEN = '123:abcDEF_-xyz';
     writeAgentEnv('o', 'a', 'BOT_TOKEN=999:other\nCHAT_ID=222\n');
-    expect(getOperatorChatCreds(frameworkRoot)).toEqual({ chatId: '111', botToken: '123:abcDEF_-xyz' });
+    expect(getOperatorChatCreds(frameworkRoot)).toEqual({ chatId: '111', botToken: '123:abcDEF_-xyz', source: 'env' });
   });
 
   it('falls back to the first agent .env with BOT_TOKEN + CHAT_ID', () => {
     writeAgentEnv('o', 'a', 'BOT_TOKEN=123:abcDEF\nCHAT_ID=42\n');
-    expect(getOperatorChatCreds(frameworkRoot)).toEqual({ chatId: '42', botToken: '123:abcDEF' });
+    expect(getOperatorChatCreds(frameworkRoot)).toEqual({ chatId: '42', botToken: '123:abcDEF', source: 'fallback' });
   });
 
   it('rejects malformed bot tokens; returns null when nothing resolves', () => {
@@ -129,5 +129,34 @@ describe('validateOperatorChat (boot self-test)', () => {
     const v = validateOperatorChat(frameworkRoot, t);
     expect(v.ok).toBe(false);
     expect(v.failed).toBe('no-creds');
+  });
+
+  // DELIVERABILITY IS NOT ADDRESSEE: measured 2026-07-21, the fallback chat
+  // was reachable, getMe+getChat green — and the wrong human. Under
+  // requireExplicit (how the daemon boot calls this), a fallback-resolved
+  // chat must FAIL even though every network probe would pass.
+  it('requireExplicit: fallback-resolved creds fail as not-explicit even when fully reachable', () => {
+    creds(); // agent .env fallback only — no CTX_OPERATOR_* env
+    const allGreen: ValidationTransport = () => ({ status: 0, body: '{"ok":true,"result":{}}' });
+    const v = validateOperatorChat(frameworkRoot, allGreen, { requireExplicit: true });
+    expect(v.ok).toBe(false);
+    expect(v.failed).toBe('not-explicit');
+    expect(v.detail).toContain('CTX_OPERATOR_CHAT_ID');
+  });
+
+  it('requireExplicit: env-resolved creds pass (the chosen chat, asserted by config)', () => {
+    process.env.CTX_OPERATOR_CHAT_ID = '8704100535';
+    process.env.CTX_OPERATOR_BOT_TOKEN = '123:abcDEF';
+    const allGreen: ValidationTransport = () => ({ status: 0, body: '{"ok":true,"result":{}}' });
+    const v = validateOperatorChat(frameworkRoot, allGreen, { requireExplicit: true });
+    expect(v).toMatchObject({ ok: true, failed: 'none' });
+  });
+
+  it('creds carry their source: env vs fallback are distinguishable', () => {
+    creds();
+    expect(getOperatorChatCreds(frameworkRoot)?.source).toBe('fallback');
+    process.env.CTX_OPERATOR_CHAT_ID = '1';
+    process.env.CTX_OPERATOR_BOT_TOKEN = '123:abc';
+    expect(getOperatorChatCreds(frameworkRoot)?.source).toBe('env');
   });
 });

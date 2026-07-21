@@ -346,7 +346,10 @@ class Daemon {
     // same day this was built: activity-channel.env missing for every org,
     // announced only by a line nobody was reading. Same class.
     try {
-      const v = validateOperatorChat(frameworkRoot);
+      // requireExplicit: a fallback-resolved chat passes reachability while
+      // paging the wrong human (measured 2026-07-21). The daemon's green must
+      // mean "the alarm reaches the operator", not "an alarm works".
+      const v = validateOperatorChat(frameworkRoot, undefined, { requireExplicit: true });
       if (v.ok) {
         console.log(`[daemon] operator-page self-test OK: ${v.detail}`);
       } else {

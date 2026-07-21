@@ -29,6 +29,14 @@ export const PAGE_SEND_TIMEOUT_MS = 3000; // bounded — callers may be crashing
 export interface OperatorChatCreds {
   chatId: string;
   botToken: string;
+  /**
+   * How the creds were resolved. 'env' = explicit CTX_OPERATOR_* config —
+   * the operator chat someone actually CHOSE. 'fallback' = first agent .env
+   * found on disk — reachable, but nobody chose it, and today it resolves to
+   * the wrong human (2026-07-21: pages routed to a non-operator chat; the
+   * defect had been ticketed for 11 days as the crash-loop mis-routing).
+   */
+  source: 'env' | 'fallback';
 }
 
 /**
@@ -42,7 +50,7 @@ export function getOperatorChatCreds(frameworkRoot: string): OperatorChatCreds |
   const envChat = process.env.CTX_OPERATOR_CHAT_ID;
   const envToken = process.env.CTX_OPERATOR_BOT_TOKEN;
   if (envChat && envToken && /^\d+:[A-Za-z0-9_-]+$/.test(envToken)) {
-    return { chatId: envChat, botToken: envToken };
+    return { chatId: envChat, botToken: envToken, source: 'env' };
   }
   try {
     const orgsRoot = join(frameworkRoot, 'orgs');
@@ -63,7 +71,7 @@ export function getOperatorChatCreds(frameworkRoot: string): OperatorChatCreds |
           const botToken = tokenMatch[1].trim();
           const chatId = envChat || chatMatch[1].trim();
           if (/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
-            return { chatId, botToken };
+            return { chatId, botToken, source: 'fallback' };
           }
         } catch { /* skip this agent */ }
       }
@@ -110,7 +118,7 @@ export const curlPageTransport: PageTransport = (creds, text) => {
 export interface OperatorChatValidation {
   ok: boolean;
   /** Which probe failed first, or 'none'. */
-  failed: 'no-creds' | 'getMe' | 'getChat' | 'none';
+  failed: 'no-creds' | 'not-explicit' | 'getMe' | 'getChat' | 'none';
   detail: string;
 }
 
@@ -133,10 +141,24 @@ const curlValidationTransport: ValidationTransport = (url) => {
 export function validateOperatorChat(
   frameworkRoot: string,
   transport: ValidationTransport = curlValidationTransport,
+  opts: { requireExplicit?: boolean } = {},
 ): OperatorChatValidation {
   const creds = getOperatorChatCreds(frameworkRoot);
   if (!creds) {
     return { ok: false, failed: 'no-creds', detail: 'no operator chat credentials resolved (env or agent .env)' };
+  }
+  // DELIVERABILITY IS NOT ADDRESSEE (chief, 2026-07-21). A fallback-resolved
+  // chat is reachable but nobody CHOSE it — measured today it was the wrong
+  // human, and getMe/getChat passed on it anyway. Under requireExplicit the
+  // self-test refuses a green it cannot earn: the expected chat must be
+  // asserted BY configuration (CTX_OPERATOR_CHAT_ID), not merely reachable.
+  if (opts.requireExplicit && creds.source !== 'env') {
+    return {
+      ok: false,
+      failed: 'not-explicit',
+      detail: `operator chat resolved by FALLBACK to chat ${creds.chatId} (first agent .env) — ` +
+        'reachable but not chosen; set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN so pages go to the operator, not whoever sorts first',
+    };
   }
   try {
     const me = transport(`https://api.telegram.org/bot${creds.botToken}/getMe`);
