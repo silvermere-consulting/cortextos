@@ -109,7 +109,23 @@ export const curlPageTransport: PageTransport = (creds, text) => {
   }
   const body = (r.stdout ?? Buffer.from('')).toString('utf-8');
   if (/"ok"\s*:\s*true/.test(body)) {
-    return { delivered: true, detail: 'telegram ok:true' };
+    // Persist the RE-CHECKABLE evidence, not just the verdict. The first
+    // live delivery proof (2026-07-21 08:32Z) discarded the body; when the
+    // recipient then said "no message arrived", the proof rested on a
+    // regex reading nobody could re-run. message_id + date make a delivery
+    // claim auditable after the fact: a message that Telegram assigned an
+    // id and a timestamp is IN the chat history, findable by a human
+    // scrolling to that moment.
+    let evidence = '';
+    try {
+      const parsed = JSON.parse(body) as { result?: { message_id?: number; date?: number; chat?: { id?: number } } };
+      const m = parsed.result;
+      if (m?.message_id !== undefined) {
+        const when = m.date !== undefined ? new Date(m.date * 1000).toISOString() : 'unknown-time';
+        evidence = ` message_id=${m.message_id} chat=${m.chat?.id ?? creds.chatId} at=${when}`;
+      }
+    } catch { /* evidence is best-effort; the verdict stands on the regex */ }
+    return { delivered: true, detail: `telegram ok:true${evidence}` };
   }
   return { delivered: false, detail: `telegram refused: ${body.slice(0, 200)}` };
 };
