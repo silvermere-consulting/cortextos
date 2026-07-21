@@ -283,3 +283,36 @@ describe('marker lifecycle (classify → clearEndMarkers → classify)', () => {
     expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('session-refresh'); // firing #2 — no false crash
   });
 });
+
+// 2026-07-21, third-sender finding: status notices must go ONLY to an
+// explicitly configured recipient. CHAT_ID (the conversational chat) is not
+// one — for a single-agent org it is a person who never asked for ops noise
+// (3 restart notices over 11 days, measured). The skip must be loggable so
+// the silence is attributable, and plain no-credentials must not log spam.
+import { resolveStatusRecipient } from '../../../src/hooks/hook-crash-alert';
+
+describe('resolveStatusRecipient', () => {
+  it('sends only when CTX_STATUS_CHAT_ID is explicitly set', () => {
+    const r = resolveStatusRecipient({ BOT_TOKEN: '123:abc', CTX_STATUS_CHAT_ID: '999', CHAT_ID: '111' });
+    expect(r.chatId).toBe('999'); // the chosen chat, NOT the conversational one
+    expect(r.logSkip).toBe(false);
+  });
+
+  it('CHAT_ID alone does NOT make a recipient — skip, and log it', () => {
+    const r = resolveStatusRecipient({ BOT_TOKEN: '123:abc', CHAT_ID: '8465948173' });
+    expect(r.chatId).toBeNull();
+    expect(r.logSkip).toBe(true);
+    expect(r.skipReason).toContain('no-CTX_STATUS_CHAT_ID');
+  });
+
+  it('no credentials at all — silent skip, no log spam', () => {
+    const r = resolveStatusRecipient({});
+    expect(r.chatId).toBeNull();
+    expect(r.logSkip).toBe(false);
+  });
+
+  it('CTX_STATUS_CHAT_ID without BOT_TOKEN cannot send', () => {
+    const r = resolveStatusRecipient({ CTX_STATUS_CHAT_ID: '999' });
+    expect(r.chatId).toBeNull();
+  });
+});

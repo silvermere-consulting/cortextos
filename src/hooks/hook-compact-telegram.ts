@@ -63,24 +63,39 @@ async function main(): Promise<void> {
   // and survives even when no Telegram is configured.
   logCompactionEvent(agentName, process.env.CTX_ORG ?? '');
 
-  if (!env.botToken || !env.chatId) return;
+  // EXPLICIT RECIPIENT ONLY (2026-07-21): this is a STATUS notice, not part
+  // of a conversation — it goes to CTX_STATUS_CHAT_ID (a chat someone chose
+  // for ops noise), never to the conversational CHAT_ID. For a single-agent
+  // org the conversational chat is a person who never asked for restart/
+  // compaction pings. Unset = silent skip (the compaction event above is the
+  // durable record). Interactive hooks (ask/permission/planmode) correctly
+  // keep CHAT_ID — a prompt belongs in the conversation; a ping does not.
+  const statusChatId = process.env.CTX_STATUS_CHAT_ID;
+  if (!env.botToken || !statusChatId) return;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5000);
 
   try {
     const url = `https://api.telegram.org/bot${env.botToken}/sendMessage`;
-    await fetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: env.chatId,
+        chat_id: statusChatId,
         text: `[${agentName}] Context compacting... resuming shortly`,
       }),
       signal: controller.signal,
     });
-  } catch {
+    // Delivery verdict from Telegram's body, logged — a bare fire-and-forget
+    // cannot tell delivered from refused, ever (the curl-exit-0 class).
+    const body = await res.text();
+    if (!/"ok"\s*:\s*true/.test(body)) {
+      console.error(`[hook-compact] telegram refused: ${body.slice(0, 120)}`);
+    }
+  } catch (err) {
     // Never fail — compaction must not be blocked
+    console.error(`[hook-compact] telegram send failed: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     clearTimeout(timer);
   }
