@@ -101,17 +101,36 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
     envFile.CTX_FRAMEWORK_ROOT ||
     '';
 
-  const agentName =
-    overrides?.agentName ||
-    process.env.CTX_AGENT_NAME ||
-    envFile.CTX_AGENT_NAME ||
-    basename(process.cwd());
+  // Provenance travels with the value (2026-07-22): the fallbacks below mint
+  // PLAUSIBLE DEFAULTS for identity/scope fields, and three measured incidents
+  // in one day came from consumers treating a minted value as a fact (phantom
+  // 'cortext'/'cortextos'/'dashboard' identities with unread inboxes; empty org
+  // collapsing task-audit paths to instance root). The resolver never refuses —
+  // read-only callers from any cwd stay working — but write/address chokepoints
+  // read *Source and refuse 'minted-cwd'/'absent' (see refuseMintedIdentity).
+  let agentNameSource: CtxEnv['agentNameSource'];
+  let agentName: string;
+  if (overrides?.agentName) {
+    agentName = overrides.agentName; agentNameSource = 'override';
+  } else if (process.env.CTX_AGENT_NAME) {
+    agentName = process.env.CTX_AGENT_NAME; agentNameSource = 'env';
+  } else if (envFile.CTX_AGENT_NAME) {
+    agentName = envFile.CTX_AGENT_NAME; agentNameSource = 'cortextos-env';
+  } else {
+    agentName = basename(process.cwd()); agentNameSource = 'minted-cwd';
+  }
 
-  const org =
-    overrides?.org ||
-    process.env.CTX_ORG ||
-    envFile.CTX_ORG ||
-    '';
+  let orgSource: CtxEnv['orgSource'];
+  let org: string;
+  if (overrides?.org) {
+    org = overrides.org; orgSource = 'override';
+  } else if (process.env.CTX_ORG) {
+    org = process.env.CTX_ORG; orgSource = 'env';
+  } else if (envFile.CTX_ORG) {
+    org = envFile.CTX_ORG; orgSource = 'cortextos-env';
+  } else {
+    org = ''; orgSource = 'absent';
+  }
 
   const projectRoot =
     overrides?.projectRoot ||
@@ -179,7 +198,47 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
   return {
     instanceId, ctxRoot, frameworkRoot, agentName, agentDir, org, projectRoot,
     timezone, orchestrator, userTimezone, userTimezoneUntil, dayModeStart, dayModeEnd,
+    agentNameSource, orgSource,
   };
+}
+
+/**
+ * The write-chokepoint guard for minted identity/scope (design doc:
+ * workspace/resolveenv-class-design-2026-07-22.md, chief-approved fork (b)).
+ *
+ * Call at the top of any CLI action that WRITES or ADDRESSES by identity
+ * (send-message, task ops, log-event, update-heartbeat). Returns null when the
+ * identity is real; returns the refusal text when it was minted — the caller
+ * prints it and exits nonzero WITHOUT performing the action. Refuse means the
+ * write does not happen; this must never degrade into a warning above an
+ * accepting write path.
+ *
+ * `needsOrg` additionally refuses an absent org for SCOPE-bearing writes —
+ * an empty org silently collapses org-scoped paths to the instance root
+ * (measured: the cross-org task-audit split). Read-only commands must NOT
+ * call this — `list-tasks` from any directory keeps working by design.
+ */
+export function refuseMintedIdentity(
+  env: CtxEnv,
+  action: string,
+  opts: { needsOrg?: boolean } = {},
+): string | null {
+  if (env.agentNameSource === 'minted-cwd') {
+    return (
+      `REFUSED: ${action} writes under the identity '${env.agentName}', which was NOT configured — ` +
+      `it was minted from the current directory name (no CTX_AGENT_NAME set, no .cortextos-env here). ` +
+      `A minted identity writes records nothing will ever own: 126 messages accumulated in phantom ` +
+      `queues this way. Fix: run from an agent session, or set CTX_AGENT_NAME (and CTX_ORG) explicitly.`
+    );
+  }
+  if (opts.needsOrg && (!env.org || env.orgSource === 'absent')) {
+    return (
+      `REFUSED: ${action} is org-scoped and no org is configured (CTX_ORG unset, no .cortextos-env here). ` +
+      `With an empty org, org-scoped paths silently collapse to the instance root — records land where ` +
+      `no org-scoped reader looks. Fix: set CTX_ORG explicitly or run from an agent session.`
+    );
+  }
+  return null;
 }
 
 /**

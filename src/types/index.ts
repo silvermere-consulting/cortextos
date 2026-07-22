@@ -614,6 +614,17 @@ export interface CtxEnv {
   /** Day-mode window "HH:MM" bounds (org context.json day_mode_start / day_mode_end). */
   dayModeStart?: string;
   dayModeEnd?: string;
+  /** Where agentName came from (2026-07-22 identity-provenance class fix).
+   *  'env' / 'override' = explicitly configured; 'cortextos-env' = the cwd
+   *  .cortextos-env file agent dirs deliberately carry (legitimate);
+   *  'minted-cwd' = basename(process.cwd()) fallback — a PLAUSIBLE DEFAULT,
+   *  not an identity. Write/address chokepoints refuse 'minted-cwd'; the
+   *  resolver itself never refuses (read-only callers stay permissive). */
+  agentNameSource?: 'override' | 'env' | 'cortextos-env' | 'minted-cwd';
+  /** Where org came from. 'absent' = resolved to '' — scope-bearing writes
+   *  must refuse it rather than let paths silently collapse to instance root
+   *  (the cross-org audit-split mechanism). */
+  orgSource?: 'override' | 'env' | 'cortextos-env' | 'absent';
 }
 
 // Bus Path Types

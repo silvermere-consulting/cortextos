@@ -32,7 +32,7 @@ import { checkDeps, formatDepsTable } from '../bus/check-deps.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, syncOAuthFromCredentials, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
-import { resolveEnv } from '../utils/env.js';
+import { resolveEnv, refuseMintedIdentity } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { logOutboundMessage, cacheLastSent } from '../telegram/logging.js';
@@ -117,6 +117,7 @@ busCommand
     }
 
     const env = resolveEnv();
+    { const r = refuseMintedIdentity(env, 'send-message'); if (r) { console.error(r); process.exit(1); } }
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
     // Fail-closed recipient validation (2026-07-22). The previous behaviour —
@@ -179,6 +180,7 @@ busCommand
   .option('--requestor <telegram_user_id>', 'Telegram user_id of the person who requested this task')
   .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string; requestor?: string }) => {
     const env = resolveEnv();
+    { const r = refuseMintedIdentity(env, 'create-task', { needsOrg: true }); if (r) { console.error(r); process.exit(1); } }
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
     const taskId = createTask(paths, env.agentName, env.org, title, {
@@ -214,6 +216,7 @@ busCommand
       process.exit(1);
     }
     const env = resolveEnv();
+    { const r = refuseMintedIdentity(env, 'update-task', { needsOrg: true }); if (r) { console.error(r); process.exit(1); } }
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
     // Guard: block review/completion when deliverables are required but missing.
@@ -327,6 +330,7 @@ busCommand
     // Accept result as either positional arg or --result flag (P1 fix #8)
     const effectiveResult = opts.result ?? resultArg;
     const env = resolveEnv();
+    { const r = refuseMintedIdentity(env, 'complete-task', { needsOrg: true }); if (r) { console.error(r); process.exit(1); } }
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
     // Guard: block completion when deliverables are required but missing
@@ -446,6 +450,7 @@ busCommand
       process.exit(1);
     }
     const env = resolveEnv();
+    { const r = refuseMintedIdentity(env, 'log-event', { needsOrg: true }); if (r) { console.error(r); process.exit(1); } }
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     logEvent(paths, env.agentName, env.org, category as EventCategory, event, severity as EventSeverity, opts.meta);
     console.log(`Logged ${category}/${event} (${severity})`);
@@ -459,6 +464,7 @@ busCommand
   .option('--interval <i>', 'Loop interval from cron config')
   .action((status: string, opts: { task?: string; timezone?: string; interval?: string }) => {
     const env = resolveEnv();
+    { const r = refuseMintedIdentity(env, 'update-heartbeat'); if (r) { console.error(r); process.exit(1); } }
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
     // Read display name from IDENTITY.md so agents self-report their user-facing name
