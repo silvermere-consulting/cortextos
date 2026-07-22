@@ -1901,6 +1901,25 @@ def cmd_reset(args):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    # RETIRED-DEFAULT GUARD (2026-07-22, narrow by design — missing-DEFAULT-dir only).
+    # ~/.mmrag was a complete parallel decoy store nothing legitimate used; it cost
+    # two wrong reads in one night, both of which SUCCEEDED with plausible values.
+    # After its retirement, a bare invocation (no MMRAG_DIR env) must REFUSE with
+    # the live path named — NOT silently recreate an empty store: measured before
+    # this guard, `collections` against an absent default dir returned exit 0
+    # "No collections found" and recreated the dir. An empty decoy is silent-wrong
+    # with a fresher haircut. Explicit-env callers are untouched; a broad
+    # try/except would swallow real errors and is deliberately not this.
+    if "MMRAG_DIR" not in os.environ and not MMRAG_DIR.exists():
+        sys.stderr.write(
+            "REFUSED: the default store ~/.mmrag is RETIRED (2026-07-22) and this "
+            "invocation set no MMRAG_DIR.\n"
+            "Live stores resolve per-org via the bus env: use `cortextos bus kb-query|kb-ingest ...`,\n"
+            "or set MMRAG_DIR explicitly, e.g.\n"
+            "  MMRAG_DIR=~/.cortextos/default/orgs/<org>/knowledge-base "
+            "knowledge-base/venv/bin/python3 knowledge-base/scripts/mmrag.py ...\n"
+        )
+        sys.exit(2)
     parser = argparse.ArgumentParser(
         description="Multimodal RAG Knowledge Base CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
