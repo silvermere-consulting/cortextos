@@ -136,3 +136,98 @@ describe('evaluateAllSlopes + env thresholds', () => {
     expect(t.min_samples).toBe(DEFAULT_SLOPE_THRESHOLDS.min_samples);
   });
 });
+
+// ── collectSessionKeys anchor (2026-07-22 fix) ────────────────────────────────
+// The INHERITED-tag misattribution: "oldest tagged process" anchored an 18h
+// series to the dashboard's npm wrapper, which survives agent restarts. The
+// daemon now stamps state/<agent>/session.pid; the sampler prefers the stamp
+// WHEN STILL TRUE (pid alive + tagged), else falls back to the heuristic.
+// Acceptance is BOTH DIRECTIONS (analyst): agent restart -> key MUST change;
+// infra-only restart -> key MUST NOT change.
+
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync as wf } from 'fs';
+import { join as j } from 'path';
+import { tmpdir } from 'os';
+import { collectSessionKeys } from '../../../src/bus/memory-slope.js';
+
+function fakeProc(root: string, pid: number, agent: string | null, starttime: number): void {
+  const d = j(root, String(pid));
+  mkdirSync(d, { recursive: true });
+  wf(j(d, 'environ'), agent ? `HOME=/x\0CTX_AGENT_NAME=${agent}\0PATH=/bin` : 'HOME=/x\0PATH=/bin');
+  wf(j(d, 'stat'), `${pid} (some proc) S 1 ${pid} ${pid} 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 ${starttime} 1000 100 18446744073709551615`);
+}
+
+describe('collectSessionKeys — daemon stamp vs inherited-tag heuristic', () => {
+  function setup() {
+    const proc = mkdtempSync(j(tmpdir(), 'fakeproc-'));
+    const ctx = mkdtempSync(j(tmpdir(), 'fakectx-'));
+    // wrapper: OLD tagged process (the dashboard npm wrapper shape)
+    fakeProc(proc, 100, 'engineer', 1000);
+    // session: YOUNGER tagged process (the real claude session)
+    fakeProc(proc, 200, 'engineer', 5000);
+    return { proc, ctx, cleanup: () => { rmSync(proc, { recursive: true, force: true }); rmSync(ctx, { recursive: true, force: true }); } };
+  }
+  const stamp = (ctx: string, agent: string, pid: number) => {
+    mkdirSync(j(ctx, 'state', agent), { recursive: true });
+    wf(j(ctx, 'state', agent, 'session.pid'), `${pid}\n`);
+  };
+
+  it('WITHOUT a stamp, the heuristic anchors to the OLDEST tagged process — the measured defect, kept as documented fallback', () => {
+    const { proc, ctx, cleanup } = setup();
+    try {
+      expect(collectSessionKeys(proc, ctx).get('engineer')).toBe('100:1000');
+    } finally { cleanup(); }
+  });
+
+  it('a live, correctly-tagged stamp WINS over the older wrapper', () => {
+    const { proc, ctx, cleanup } = setup();
+    try {
+      stamp(ctx, 'engineer', 200);
+      expect(collectSessionKeys(proc, ctx).get('engineer')).toBe('200:5000');
+    } finally { cleanup(); }
+  });
+
+  it('KNOWN-NEGATIVE (the 07:44Z natural experiment, unit form): infra-only restart must NOT move the anchor', () => {
+    const { proc, ctx, cleanup } = setup();
+    try {
+      stamp(ctx, 'engineer', 200);
+      const before = collectSessionKeys(proc, ctx).get('engineer');
+      // dashboard wrapper restarts: old pid gone, new wrapper pid appears
+      rmSync(j(proc, '100'), { recursive: true, force: true });
+      fakeProc(proc, 300, 'engineer', 9000);
+      const after = collectSessionKeys(proc, ctx).get('engineer');
+      expect(after).toBe(before); // series would NOT reset
+    } finally { cleanup(); }
+  });
+
+  it('KNOWN-POSITIVE: agent restart (stamped pid replaced) MUST move the anchor', () => {
+    const { proc, ctx, cleanup } = setup();
+    try {
+      stamp(ctx, 'engineer', 200);
+      const before = collectSessionKeys(proc, ctx).get('engineer');
+      rmSync(j(proc, '200'), { recursive: true, force: true });
+      fakeProc(proc, 400, 'engineer', 12000);
+      stamp(ctx, 'engineer', 400); // daemon re-stamps on the new spawn
+      const after = collectSessionKeys(proc, ctx).get('engineer');
+      expect(after).not.toBe(before);
+      expect(after).toBe('400:12000');
+    } finally { cleanup(); }
+  });
+
+  it('a STALE stamp (dead pid) falls back to the heuristic rather than being trusted', () => {
+    const { proc, ctx, cleanup } = setup();
+    try {
+      stamp(ctx, 'engineer', 999); // no such pid
+      expect(collectSessionKeys(proc, ctx).get('engineer')).toBe('100:1000');
+    } finally { cleanup(); }
+  });
+
+  it('a MISMATCHED stamp (pid alive but tagged as another agent) falls back — trust is verified per read', () => {
+    const { proc, ctx, cleanup } = setup();
+    try {
+      fakeProc(proc, 500, 'chief', 7000);
+      stamp(ctx, 'engineer', 500); // points at chief's process
+      expect(collectSessionKeys(proc, ctx).get('engineer')).toBe('100:1000');
+    } finally { cleanup(); }
+  });
+});

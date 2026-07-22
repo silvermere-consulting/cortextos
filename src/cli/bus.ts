@@ -1110,7 +1110,7 @@ busCommand
       return;
     }
     const t = slopeThresholdsFromEnv();
-    const history = appendMemoryHistory(env.ctxRoot, memory, collectSessionKeys('/proc'), t);
+    const history = appendMemoryHistory(env.ctxRoot, memory, collectSessionKeys('/proc', env.ctxRoot), t);
     const verdicts = evaluateAllSlopes(history, memory, t);
     const { emitted, suppressed } = emitMemoryAnomalies(env, memory, verdicts);
     console.log(JSON.stringify({

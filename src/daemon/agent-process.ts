@@ -191,6 +191,24 @@ export class AgentProcess {
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
 
+      // Session-root stamp (2026-07-22): the DAEMON is the layer that owns
+      // "which pid is this agent's session", so it writes the fact down.
+      // The memory sampler previously guessed the session root as the OLDEST
+      // process carrying CTX_AGENT_NAME — and the tag is INHERITED by spawned
+      // infra (dashboard/npm/chrome), so the guess anchored an 18h series to a
+      // wrapper that survives agent restarts and misattributed 836MB. Stale
+      // stamps are harmless by design: readers must verify the pid is alive
+      // and still tagged before trusting it, and fall back to the old
+      // heuristic otherwise.
+      try {
+        const pid = this.pty.getPid();
+        if (pid) {
+          const stateDir = join(this.env.ctxRoot, 'state', this.name);
+          ensureDir(stateDir);
+          writeFileSync(join(stateDir, 'session.pid'), `${pid}\n`, 'utf-8');
+        }
+      } catch { /* best-effort — sampler falls back to the heuristic */ }
+
       // Issue #392: codex-app-server does not reliably execute the inline
       // "Send a Telegram message saying you are back online" instruction the
       // way claude-code does, so fire the back-online ping directly from the

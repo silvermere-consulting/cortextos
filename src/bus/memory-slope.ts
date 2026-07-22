@@ -187,11 +187,16 @@ export function applySlopeToAnomalies(
  * /proc/<pid>/stat field 22 counted AFTER the closing paren of comm — comm may
  * contain spaces or parens, so split on the LAST ')' first. '' when unknown.
  */
-export function collectSessionKeys(procDir = '/proc'): Map<string, string> {
+export function collectSessionKeys(procDir = '/proc', ctxRoot?: string): Map<string, string> {
   const oldest = new Map<string, { pid: number; start: number }>();
   let pids: string[] = [];
   try { pids = readdirSync(procDir).filter(n => /^\d+$/.test(n)); } catch { return new Map(); }
+  const selfPid = String(process.pid);
   for (const pid of pids) {
+    // Probe-in-its-own-result-set: the sampler is a node child inheriting
+    // CTX_AGENT_NAME, so without this it anchors/counts itself. Exclude by
+    // construction, not by remembering (2026-07-22).
+    if (pid === selfPid) continue;
     let agent: string | null = null;
     try {
       const environ = readFileSync(join(procDir, pid, 'environ'), 'utf-8');
@@ -200,20 +205,65 @@ export function collectSessionKeys(procDir = '/proc'): Map<string, string> {
       }
     } catch { continue; }
     if (!agent) continue;
-    let start: number | null = null;
-    try {
-      const stat = readFileSync(join(procDir, pid, 'stat'), 'utf-8');
-      const afterComm = stat.slice(stat.lastIndexOf(')') + 2);
-      const fields = afterComm.split(' ');
-      // afterComm starts at field 3 (state); starttime is field 22 -> index 19.
-      const v = Number(fields[19]);
-      if (Number.isFinite(v)) start = v;
-    } catch { continue; }
+    const start = readStarttime(procDir, pid);
     if (start == null) continue;
     const cur = oldest.get(agent);
     if (!cur || start < cur.start) oldest.set(agent, { pid: Number(pid), start });
   }
-  return new Map([...oldest.entries()].map(([a, v]) => [a, `${v.pid}:${v.start}`]));
+  const keys = new Map([...oldest.entries()].map(([a, v]) => [a, `${v.pid}:${v.start}`]));
+
+  // Prefer the DAEMON-STAMPED session root (state/<agent>/session.pid) over the
+  // oldest-tagged heuristic. The tag is INHERITED by spawned infra (dashboard,
+  // npm wrappers, browsers), so "oldest tagged process" anchored an 18-hour
+  // series to a wrapper that survives agent restarts — the 2026-07-22
+  // misattribution. The daemon is the layer that owns "which pid is the
+  // session", so its stamp wins WHEN IT IS STILL TRUE: pid alive AND still
+  // tagged with this agent. A stale or mismatched stamp falls back to the
+  // heuristic — trust is verified per read, never assumed from the file.
+  // Tagging itself is deliberately untouched: the dashboard keeps its
+  // inherited tag, which is what keeps the known-negative fixture
+  // (dashboard-only restart -> series must NOT reset) constructible.
+  if (ctxRoot) {
+    for (const agent of new Set([...keys.keys(), ...listStampedAgents(ctxRoot)])) {
+      const stampPath = join(ctxRoot, 'state', agent, 'session.pid');
+      if (!existsSync(stampPath)) continue;
+      let pid: string;
+      try { pid = readFileSync(stampPath, 'utf-8').trim(); } catch { continue; }
+      if (!/^\d+$/.test(pid) || pid === selfPid) continue;
+      let tagged = false;
+      try {
+        const environ = readFileSync(join(procDir, pid, 'environ'), 'utf-8');
+        tagged = environ.split('\0').some(kv => kv === `CTX_AGENT_NAME=${agent}`);
+      } catch { continue; } // pid gone -> stale stamp -> heuristic stands
+      if (!tagged) continue;
+      const start = readStarttime(procDir, pid);
+      if (start == null) continue;
+      keys.set(agent, `${pid}:${start}`);
+    }
+  }
+  return keys;
+}
+
+/** starttime is /proc/<pid>/stat field 22 counted AFTER the closing paren of
+ * comm — comm may contain spaces or parens, so split on the LAST ')' first. */
+function readStarttime(procDir: string, pid: string): number | null {
+  try {
+    const stat = readFileSync(join(procDir, pid, 'stat'), 'utf-8');
+    const afterComm = stat.slice(stat.lastIndexOf(')') + 2);
+    const fields = afterComm.split(' ');
+    // afterComm starts at field 3 (state); starttime is field 22 -> index 19.
+    const v = Number(fields[19]);
+    return Number.isFinite(v) ? v : null;
+  } catch { return null; }
+}
+
+/** Agents with a session.pid stamp — covers an agent whose only live tagged
+ * process IS the stamped one (it may be absent from the heuristic map when
+ * unreadable) and never throws. */
+function listStampedAgents(ctxRoot: string): string[] {
+  try {
+    return readdirSync(join(ctxRoot, 'state')).filter(a => existsSync(join(ctxRoot, 'state', a, 'session.pid')));
+  } catch { return []; }
 }
 
 export function historyPath(ctxRoot: string): string {

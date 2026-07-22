@@ -203,7 +203,12 @@ export function collectAgentMemory(procDir = '/proc'): MemorySnapshot {
     pids = readdirSync(procDir).filter(n => /^\d+$/.test(n));
   } catch { /* no proc */ }
 
+  const selfPid = String(process.pid);
   for (const pid of pids) {
+    // Probe-in-its-own-result-set (2026-07-22): the sampler is a node child
+    // inheriting CTX_AGENT_NAME, so every agent total included the measurement
+    // that produced it. Exclude by construction, not by remembering.
+    if (pid === selfPid) continue;
     let agent: string | null = null;
     try {
       agent = parseAgentFromEnviron(readFileSync(join(procDir, pid, 'environ'), 'utf-8'));
