@@ -60,6 +60,60 @@ DEFAULT_PREVIEW_CHARS = 300
 EMBEDDING_PRICE_PER_M = 0.20
 FLASH_INPUT_PRICE_PER_M = 0.15
 FLASH_OUTPUT_PRICE_PER_M = 0.60
+# Claude Vision (Haiku 4.5) — the deterministic NONTEXT_BACKEND image-description path
+# (describe_image_claude). Overridable if the vision model changes.
+VISION_INPUT_PRICE_PER_M = float(os.environ.get("VISION_INPUT_PRICE_PER_M", "1.00"))
+VISION_OUTPUT_PRICE_PER_M = float(os.environ.get("VISION_OUTPUT_PRICE_PER_M", "5.00"))
+
+# model_tier taxonomy — Foundry usage-metering meta-spec §1a: WHAT COMPUTE RAN.
+# Deliberately DISJOINT from plan_tier (free|subscriber|enhanced = what the tenant bought), so a
+# server-side downgrade stays auditable instead of collapsing into one conflated field. Do not
+# reintroduce "enhanced" here; it belongs to plan_tier alone.
+MODEL_TIER_FAST = "fast"                    # Haiku-class / Gemini Flash — cheap cloud
+MODEL_TIER_BALANCED = "balanced"            # Sonnet-class
+MODEL_TIER_FRONTIER = "frontier"            # Opus-class
+MODEL_TIER_DETERMINISTIC = "deterministic"  # Kreuzberg / markitdown / tesseract — no model, $0
+MODEL_TIER_LOCAL = "local"                  # nomic ONNX on-box — $0
+MODEL_TIER_UNKNOWN = "unknown"              # never silently guess a tier for an unrecognised model
+
+# plan_tier = WHAT THE TENANT BOUGHT. This module is a producer of usage records, not an
+# entitlement resolver: KB ingest is internal fleet work with no tenant behind it, so it stamps the
+# `internal` sentinel rather than inventing a plan. A null would be ambiguous (absent vs
+# not-applicable); `internal` says which. Real plan values are resolved at the Foundry-API layer,
+# where a tenant actually exists — that is also where the downgrade audit becomes exercisable.
+PLAN_TIER_INTERNAL = "internal"
+PLAN_TIERS = frozenset({"free", "subscriber", "enhanced", PLAN_TIER_INTERNAL})
+MODEL_TIERS = frozenset({
+    MODEL_TIER_FAST, MODEL_TIER_BALANCED, MODEL_TIER_FRONTIER,
+    MODEL_TIER_DETERMINISTIC, MODEL_TIER_LOCAL,
+})
+# Meta-spec §6 AC9, enforced at import: the two axes must never share a string.
+assert not (MODEL_TIERS & PLAN_TIERS), "model_tier and plan_tier enums must stay disjoint"
+
+
+def model_tier_for(model):
+    """Map a concrete model/engine id to its model_tier (metering meta-spec §1a).
+
+    Returns MODEL_TIER_UNKNOWN rather than guessing: an unrecognised model in the ledger is a
+    visible gap, whereas a wrong tier is a silent mis-billing.
+    """
+    m = (model or "").lower()
+    if not m:
+        return MODEL_TIER_UNKNOWN
+    if "opus" in m:
+        return MODEL_TIER_FRONTIER
+    if "sonnet" in m:
+        return MODEL_TIER_BALANCED
+    if "haiku" in m or "flash" in m:
+        return MODEL_TIER_FAST
+    if any(e in m for e in ("kreuzberg", "markitdown", "tesseract")):
+        return MODEL_TIER_DETERMINISTIC
+    if "nomic" in m or m.endswith("-local"):
+        return MODEL_TIER_LOCAL
+    if "embedding" in m:           # gemini-embedding-* — cheap cloud embed
+        return MODEL_TIER_FAST
+    return MODEL_TIER_UNKNOWN
+
 
 # Retry classifier for the Gemini generate_content call inside ingest_pdf.
 # Module-level so a fault-injection test client can reference the same set.
@@ -82,12 +136,55 @@ class UsageTracker:
             "generation_input_tokens": 0,
             "generation_output_tokens": 0,
             "generation_calls": 0,
+            "vision_input_tokens": 0,
+            "vision_output_tokens": 0,
+            "vision_calls": 0,
+            # Explicit model + model_tier per engine (metering meta-spec §1: every record carries
+            # {model, model_tier}). Previously the model was only IMPLICIT in which price constant
+            # was applied — so the ledger could not answer "what ran?", only "what did it cost?".
+            # None until the corresponding engine is actually used in this session.
+            "embedding_model": None,
+            "embedding_model_tier": None,
+            "generation_model": None,
+            "generation_model_tier": None,
+            "vision_model": None,
+            "vision_model_tier": None,
+            # Metering meta-spec §1: every record carries BOTH axes. KB ingest is internal fleet
+            # work — no tenant, no plan — so the pair is stamped {actor: internal, plan_tier:
+            # internal} rather than left absent. Stamping it here (where it is trivially known)
+            # keeps the record schema uniform across internal + external producers, so AC9
+            # disjointness is exercisable against REAL records instead of only the enum literals.
+            "actor": "internal",
+            "plan_tier": PLAN_TIER_INTERNAL,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "operation": operation,
         }
 
-    def track_embedding(self, content):
+    def _stamp(self, kind, model):
+        """Record which model/engine served `kind` ('embedding'|'generation'|'vision').
+
+        First writer wins per session; a differing later model is surfaced (not overwritten) so a
+        mixed-model session is visible rather than silently attributed to one of them.
+        """
+        if not model:
+            return
+        key = f"{kind}_model"
+        current = self.session.get(key)
+        if current and current != model:
+            if model not in current.split("+"):
+                self.session[key] = f"{current}+{model}"
+                self.session[f"{kind}_model_tier"] = "mixed"
+            return
+        self.session[key] = model
+        self.session[f"{kind}_model_tier"] = model_tier_for(model)
+
+    def track_embedding(self, content, model=None):
         self.session["embedding_calls"] += 1
+        # nomic ONNX runs on-box ($0, tier=local); otherwise the Gemini embedding model.
+        self._stamp("embedding", model or (
+            "nomic-embed-text-v1.5-local" if EMBEDDING_BACKEND == "local"
+            else "gemini-embedding-2-preview"
+        ))
         if isinstance(content, str):
             self.session["embedding_tokens"] += int(len(content.split()) * 1.3)
         elif isinstance(content, list):
@@ -100,12 +197,28 @@ class UsageTracker:
                     except Exception:
                         self.session["embedding_tokens"] += 256
 
-    def track_generation(self, response):
+    def track_generation(self, response, model=None):
         self.session["generation_calls"] += 1
         um = getattr(response, "usage_metadata", None)
         if um:
             self.session["generation_input_tokens"] += getattr(um, "prompt_token_count", 0) or 0
             self.session["generation_output_tokens"] += getattr(um, "candidates_token_count", 0) or 0
+        # Prefer the model the response reports; fall back to the configured default.
+        self._stamp("generation", model or getattr(response, "model_version", None)
+                    or "gemini-2.5-flash")
+
+    def track_vision(self, input_tokens, output_tokens, model=None):
+        """Claude Vision (Haiku) image-description usage — priced separately from
+        Gemini generation. Called from the deterministic ingest_image path.
+
+        `model` comes from the Anthropic response (describe_image_claude returns it in its usage
+        dict), NOT from the request constant — so the ledger records what the API actually served,
+        which is the only version that can be reconciled against a provider invoice.
+        """
+        self.session["vision_calls"] += 1
+        self.session["vision_input_tokens"] += int(input_tokens or 0)
+        self.session["vision_output_tokens"] += int(output_tokens or 0)
+        self._stamp("vision", model)
 
     def cost(self):
         # Local embedder (nomic ONNX) runs on CPU = free; only Gemini embedding bills.
@@ -117,11 +230,17 @@ class UsageTracker:
             emb = (self.session["embedding_tokens"] / 1_000_000) * EMBEDDING_PRICE_PER_M
         gen_in = (self.session["generation_input_tokens"] / 1_000_000) * FLASH_INPUT_PRICE_PER_M
         gen_out = (self.session["generation_output_tokens"] / 1_000_000) * FLASH_OUTPUT_PRICE_PER_M
+        # Claude Vision (Haiku) always bills — it is a real API call regardless of
+        # EMBEDDING_BACKEND (which only governs the embedding step).
+        vis_in = (self.session["vision_input_tokens"] / 1_000_000) * VISION_INPUT_PRICE_PER_M
+        vis_out = (self.session["vision_output_tokens"] / 1_000_000) * VISION_OUTPUT_PRICE_PER_M
         return {
             "embedding": round(emb, 6),
             "generation_input": round(gen_in, 6),
             "generation_output": round(gen_out, 6),
-            "total": round(emb + gen_in + gen_out, 6),
+            "vision_input": round(vis_in, 6),
+            "vision_output": round(vis_out, 6),
+            "total": round(emb + gen_in + gen_out + vis_in + vis_out, 6),
         }
 
     def persist(self):
@@ -142,7 +261,8 @@ class UsageTracker:
         c = data.get("cumulative", {})
         for key in ["embedding_tokens", "embedding_calls",
                      "generation_input_tokens", "generation_output_tokens",
-                     "generation_calls"]:
+                     "generation_calls",
+                     "vision_input_tokens", "vision_output_tokens", "vision_calls"]:
             c[key] = c.get(key, 0) + self.session[key]
 
         c["total_cost"] = round(sum(
@@ -155,10 +275,14 @@ class UsageTracker:
 
     def summary_line(self):
         c = self.cost()
+        vis = ""
+        if self.session["vision_calls"]:
+            vis = (f", {self.session['vision_input_tokens']:,} vision-in, "
+                   f"{self.session['vision_output_tokens']:,} vision-out")
         return (f"  Tokens: {self.session['embedding_tokens']:,} embedding, "
                 f"{self.session['generation_input_tokens']:,} gen-input, "
-                f"{self.session['generation_output_tokens']:,} gen-output | "
-                f"Cost: ${c['total']:.4f}")
+                f"{self.session['generation_output_tokens']:,} gen-output"
+                f"{vis} | Cost: ${c['total']:.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +347,44 @@ def get_genai_client(api_key):
         return _load_factory(factory_path)(api_key)
     from google import genai
     return genai.Client(api_key=api_key)
+
+
+class _LazyGenaiClient:
+    """Defers Gemini client construction (and the API-key requirement) until a Gemini path is
+    ACTUALLY taken.
+
+    Why this exists (2026-07-11): `cmd_ingest`/`cmd_query` built the client eagerly, so
+    `get_api_key()` ran on EVERY invocation and `sys.exit(1)`s without a key — even under
+    EMBEDDING_BACKEND=local + NONTEXT_BACKEND=deterministic, where **no Gemini call is made at
+    all**. Measured: a fully deterministic image ingest with no key anywhere died on
+    "ERROR: No Gemini API key".
+
+    So Gemini was retired for the WORK while remaining load-bearing as a DEPENDENCY: the KB was one
+    revoked key away from total ingest+query failure, and the key was sitting in plaintext in
+    ~/.mmrag/config.json precisely because nothing could run without it. Removing that key safely
+    requires this first.
+
+    Behaviour is unchanged for the gemini backends: the first attribute access builds the real
+    client exactly as before (same factory hook, same error if the key is missing) — it just happens
+    at point-of-use instead of at startup. A deterministic/local run never touches it, so it never
+    needs a key.
+    """
+
+    __slots__ = ("_config", "_client")
+
+    def __init__(self, config):
+        self._config = config
+        self._client = None
+
+    def _resolve(self):
+        if self._client is None:
+            # get_api_key() still sys.exit(1)s with the same message if a Gemini path is genuinely
+            # taken without a key — the failure is preserved, just moved to where it's real.
+            self._client = get_genai_client(get_api_key(self._config))
+        return self._client
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
 
 
 def _retry_generate_content(client, *, model, contents, backoffs=(5, 15, 45)):
@@ -292,11 +454,32 @@ def _retry_embed_content(client, *, model, contents, output_dimensionality, task
     raise last_err if last_err else RuntimeError("retry loop completed without response or error")
 
 
-# EMBEDDING_BACKEND switch — 'gemini' (default) | 'local'
-# Local path uses scripts/local_embedder.py (nomic-embed-text-v1.5 ONNX, 768-dim,
-# Gemini-compatible). Set env var EMBEDDING_BACKEND=local to route through it.
-# Same output shape (List[float] of 768 floats) so call sites are unchanged.
-EMBEDDING_BACKEND = os.environ.get("EMBEDDING_BACKEND", "gemini").lower()
+# EMBEDDING_BACKEND switch — 'local' (DEFAULT) | 'gemini' (legacy, being removed)
+# Local path uses scripts/local_embedder.py (nomic-embed-text-v1.5 ONNX, 768-dim, on-box, $0).
+#
+# DEFAULT FLIPPED TO 'local' 2026-07-11 (analyst finding). It used to default to 'gemini', with
+# 'local' set only by the kb-ingest WRAPPER on each call — so **any embed path that did not go
+# through the wrapper silently reverted to a direct Gemini call with a per-service key**. The safe
+# path must be the DEFAULT, not a thing the caller has to remember. A flag whose safe value depends
+# on every caller opting in is not a safety control; it is a trap with good intentions.
+#
+# Same class as NONTEXT_BACKEND below, and the same reasoning as the ai-gateway rule: the secure
+# route is the one you get by doing nothing.
+EMBEDDING_BACKEND = os.environ.get("EMBEDDING_BACKEND", "local").lower()
+
+# NONTEXT_BACKEND switch — 'deterministic' (DEFAULT) | 'gemini' (legacy, being removed)
+# Controls how PDFs and images are turned INTO text before embedding (orthogonal to
+# EMBEDDING_BACKEND, which controls how that text is embedded).
+#   'deterministic' → PDFs via Kreuzberg text-layer extraction (scripts/file-convert.py);
+#                     images via Claude Vision (Haiku) **through the ai-gateway**. No Gemini.
+#   'gemini'        → LEGACY: Gemini Flash extracts PDFs and describes images (multimodal embed).
+#                     Retired for the fleet; scheduled for removal (task_1783753475613).
+#
+# DEFAULT FLIPPED TO 'deterministic' 2026-07-11. Previously 'gemini' with the live value set only
+# in secrets.env — so the on-disk default disagreed with what the fleet actually runs, and any
+# invocation that missed the env var quietly took the retired path. Make the running configuration
+# the default; an env var should express a DEVIATION, not carry the only safe setting.
+NONTEXT_BACKEND = os.environ.get("NONTEXT_BACKEND", "deterministic").lower()
 
 
 def _local_embed_text(text: str, task_type: str = "RETRIEVAL_DOCUMENT"):
@@ -321,6 +504,13 @@ def embed_content(client, config, content, task_type="RETRIEVAL_DOCUMENT"):
         # Local path is text-only. If a list-of-Parts is passed (multimodal),
         # we can't handle it; fall through to gemini for that one call.
         if isinstance(content, str):
+            # Track BEFORE the early return. This path used to return without ever reaching the
+            # tracker below, so under EMBEDDING_BACKEND=local (the live fleet setting) a
+            # single-content embed was structurally uncountable — embedding_calls was always 0.
+            # $0 cost is not the same as unmetered: the ledger must still be able to say nomic ran.
+            # (embed_contents_batch already tracked its local path; only this one had drifted.)
+            if _tracker:
+                _tracker.track_embedding(content)
             return _local_embed_text(content, task_type=task_type)
         # Non-string path → caller wants multimodal; gemini is the only option
         # for that today, so route through even if EMBEDDING_BACKEND=local.
@@ -817,8 +1007,261 @@ def ingest_text_file(client, config, collection, file_path):
     return len(pending)
 
 
+def _pdf_has_embedded_images(file_path):
+    """Does this PDF contain embedded images? (poppler `pdfimages -list`)
+
+    This is the DISCRIMINATOR between the two reasons a PDF yields no text, which look
+    identical from the outside and demand opposite responses:
+      - a SCANNED page  -> no text layer, HAS images  -> OCR it.
+      - a genuinely blank/broken PDF -> no text, NO images -> OCR would return nothing too.
+
+    Returns True/False, or None if we cannot tell (poppler missing). None means UNKNOWN,
+    and the caller must FAIL TOWARD EXTRACTION — trying OCR on a blank PDF costs nothing
+    and returns nothing, whereas skipping a scan silently discards a customer's passport.
+    """
+    import subprocess
+    try:
+        proc = subprocess.run(["pdfimages", "-list", str(file_path)],
+                              capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            return None
+        # header is 2 lines; any further line is an image
+        rows = [l for l in proc.stdout.splitlines()[2:] if l.strip()]
+        return len(rows) > 0
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def extract_pdf_text_deterministic(file_path):
+    """Deterministic PDF text extraction via Kreuzberg (scripts/file-convert.py).
+
+    ⚠️ 2026-07-11 — THE OCR FALL-THROUGH. Before this, a PDF with no text layer was simply
+    SKIPPED, and the skip message itself said "likely a scanned PDF needing the tesseract
+    OCR slice". The code named its own fix and did not take it: `--ocr` existed, worked, and
+    was never passed by the ingest path. A SCANNED DOCUMENT WAS SILENTLY DISCARDED — zero
+    chunks, no error, no cost, no record. The document just vanished.
+
+    That is the worst failure a KYC product can have, because IT LOOKS LIKE IT WORKED: a
+    customer uploads their passport, sees no error, and nothing was ingested. Strictly worse
+    than a crash — a crash gets fixed.
+
+    Now: empty text layer -> if the PDF carries embedded images (or we cannot tell), re-run
+    the SAME proven converter with --ocr (tesseract, local, $0, no model call, no network).
+    Never a silent zero.
+    """
+    import subprocess
+    script = Path(__file__).with_name("file-convert.py")
+
+    def _run(force_ocr):
+        cmd = [sys.executable, str(script), str(file_path), "--format", "markdown"]
+        if force_ocr:
+            cmd.append("--ocr")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0:
+                print(f"    file-convert failed (rc={proc.returncode}{' --ocr' if force_ocr else ''}): "
+                      f"{proc.stderr.strip()[:200]}", file=sys.stderr, flush=True)
+                return ""
+            return proc.stdout
+        except Exception as e:
+            print(f"    deterministic PDF extract error{' (--ocr)' if force_ocr else ''}: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            return ""
+
+    text = _run(force_ocr=False)
+    if text.strip():
+        return text
+
+    # ── No text layer. Scanned page, or genuinely empty? ────────────────────────
+    has_images = _pdf_has_embedded_images(file_path)
+    if has_images is False:
+        # Truly nothing to read. Say so OUT LOUD — a returned "" used to become a silent skip.
+        print(f"    no text layer AND no embedded images: {Path(file_path).name} — nothing to extract "
+              f"(not a scan; OCR would return nothing either)", file=sys.stderr, flush=True)
+        return ""
+
+    why = "has embedded images" if has_images else "cannot determine (poppler unavailable) — failing TOWARD extraction"
+    print(f"    no text layer, {why} -> OCR fall-through (tesseract, local, $0): {Path(file_path).name}",
+          flush=True)
+    text = _run(force_ocr=True)
+    if text.strip():
+        print(f"    OCR recovered {len(text.strip())} chars from a scanned PDF that would previously "
+              f"have been SILENTLY DISCARDED", flush=True)
+    else:
+        print(f"    ⚠️ OCR ALSO RETURNED NOTHING for {Path(file_path).name} — this document is being "
+              f"dropped, and you are being TOLD, rather than it vanishing quietly", file=sys.stderr, flush=True)
+    return text
+
+
+class GatewayUnavailable(RuntimeError):
+    """The ai-gateway could not be reached or refused the call.
+
+    Raised — never swallowed — so a gateway outage FAILS CLOSED and LOUD. The alternative (returning
+    '' and letting ingest_image print "SKIP (no description produced)") would be a silent drop: the
+    ingest reports success, the image is never indexed, and nobody finds out. A silent skip is the
+    failure mode this whole rewire exists to eliminate, so it must not be reintroduced as the
+    rewire's own error path.
+    """
+
+
+# ai-gateway — the ONLY route to a model. Standing fleet architecture rule (Steve, 2026-07-11):
+# every model call goes through the gateway (central key, per-app AED budget with a hard 429, JSONL
+# audit). NEVER api.anthropic.com directly; NEVER a per-service Anthropic key — a direct call is
+# uncappable and unaudited, which is exactly what this path used to be.
+AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:7115/v1/messages")
+# KB ingest has its OWN principal, not the invoking agent's: image spend is attributed to the KB
+# service, not to whichever agent happened to trigger the ingest (chief/analyst/writer all call
+# kb-ingest). Keeps the gateway's per-app budget meaningful. Grant: ai-gateway:call, nothing else.
+AI_GATEWAY_CALLER_ID = os.environ.get("AI_GATEWAY_CALLER_ID", "kb-ingest")
+
+
+def _mint_gateway_token(ttl_seconds=60):
+    """Mint a short-lived RBAC token via the foundry rbac lib — the SAME issuer `bus foundry` uses.
+
+    Shelling out to node is deliberate: re-implementing the token signing in Python would be a
+    SECOND implementation of the auth contract, free to drift from the one the gateway validates
+    against. One issuer, one contract. The token is per-call, 60s, never persisted.
+    """
+    import subprocess
+    framework_root = os.environ.get("CTX_FRAMEWORK_ROOT", "/home/cortext/cortextos")
+    org = os.environ.get("CTX_ORG", "silvermere-tech")
+    rbac_lib = os.path.join(framework_root, "orgs", org, "projects", "foundry", "lib", "rbac")
+    if not os.environ.get("FOUNDRY_TOKEN_SECRET"):
+        raise GatewayUnavailable(
+            "FOUNDRY_TOKEN_SECRET not in env — cannot mint an ai-gateway token. "
+            "(It lives in orgs/<org>/secrets.env and is spread into the KB env by the bus.)")
+    script = (
+        "const rbac=require(process.argv[1]);"
+        "process.stdout.write(rbac.issueAgentToken({caller_id:process.argv[2],"
+        "tenant_id:process.argv[3],ttl_seconds:parseInt(process.argv[4],10)}));"
+    )
+    try:
+        proc = subprocess.run(
+            ["node", "-e", script, rbac_lib, AI_GATEWAY_CALLER_ID, org, str(ttl_seconds)],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception as e:
+        raise GatewayUnavailable(f"could not mint gateway token: {type(e).__name__}: {e}")
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise GatewayUnavailable(
+            f"token issuance failed (rc={proc.returncode}): {(proc.stderr or '').strip()[:200]}")
+    return proc.stdout.strip()
+
+
+def describe_image_claude(file_path):
+    """Describe an image via Claude Vision (Haiku) **through the ai-gateway**.
+
+    Returns (description_text, usage). `usage` is read from the GATEWAY'S RETURNED RESPONSE (the
+    gateway proxies Anthropic's response verbatim, usage block included) — NOT from a count this
+    module makes itself. That distinction is the whole point: the gateway's budget/audit and this
+    ledger then read ONE measurement, so they cannot disagree. A locally-derived count would be a
+    second accounting path, which is precisely what the metering meta-spec forbids.
+
+    Raises GatewayUnavailable if the gateway is unreachable or refuses. There is deliberately NO
+    fallback to a direct Anthropic key: a fallback would silently restore the uncapped, unaudited
+    path this rewire removed, and it would do so exactly when the cap was least able to stop it.
+    """
+    import base64
+    import json as _json
+    import urllib.request
+    import urllib.error
+    mime = mimetypes.guess_type(str(file_path))[0] or "image/png"
+    try:
+        with open(file_path, "rb") as f:
+            b64 = base64.standard_b64encode(f.read()).decode("utf-8")
+    except Exception as e:
+        print(f"    image read error: {e}", file=sys.stderr, flush=True)
+        return "", {}
+    model = os.environ.get("CLAUDE_VISION_MODEL", "claude-haiku-4-5")
+    body = {
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+                {"type": "text", "text": (
+                    "Describe this image thoroughly for search and retrieval. Include: any "
+                    "visible text (transcribe it verbatim), what the image depicts, key "
+                    "objects, people, charts, diagrams or tables, and the overall topic. Be "
+                    "factual and specific; do not speculate beyond what is visible."
+                )},
+            ],
+        }],
+    }
+    for attempt, backoff in enumerate((0, 5, 15), start=1):
+        if backoff:
+            time.sleep(backoff)
+        # Fresh 60s token per attempt — a retry after a backoff must not present a token minted
+        # before the previous attempt's wait (it could have expired mid-retry).
+        token = _mint_gateway_token()
+        req = urllib.request.Request(
+            AI_GATEWAY_URL,
+            data=_json.dumps(body).encode("utf-8"),
+            headers={
+                "content-type": "application/json",
+                "authorization": f"Bearer {token}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+            # The gateway returns Anthropic's response VERBATIM, usage block included. Reading the
+            # counts from THIS response (rather than counting locally) is what keeps the ledger and
+            # the gateway's budget/audit reading ONE measurement — no second accounting path.
+            u = data.get("usage", {}) or {}
+            # Prefer the model id the API RESOLVED (`data["model"]` — the dated
+            # `claude-haiku-4-5-20251001`) over the alias we requested (`claude-haiku-4-5`). The
+            # served id is the only one reconcilable against a provider invoice; the alias silently
+            # re-points when Anthropic rolls a version, which would leave the ledger asserting a
+            # model that never ran.
+            usage = {"input_tokens": u.get("input_tokens", 0), "output_tokens": u.get("output_tokens", 0),
+                     "model": data.get("model") or model}
+            parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+            return "\n".join(p for p in parts if p).strip(), usage
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:200]
+            # 429 from the gateway is the BUDGET CAP, not an Anthropic rate-limit. Retrying it is
+            # pointless (the cap will not lift in 15s) and semantically wrong — the correct response
+            # to "you are over budget" is to stop, loudly.
+            if e.code == 429 and "budget" in detail.lower():
+                raise GatewayUnavailable(f"ai-gateway budget cap hit (429): {detail}")
+            if e.code in (401, 403):
+                raise GatewayUnavailable(
+                    f"ai-gateway refused the call (HTTP {e.code}): {detail} — "
+                    f"caller_id={AI_GATEWAY_CALLER_ID} likely lacks ai-gateway:call")
+            if e.code in (429, 500, 502, 503, 529) and attempt < 3:
+                print(f"    ai-gateway transient HTTP {e.code}; retrying", file=sys.stderr, flush=True)
+                continue
+            raise GatewayUnavailable(f"ai-gateway HTTP {e.code}: {detail}")
+        except GatewayUnavailable:
+            raise                       # already a hard, loud failure — do not retry-swallow it
+        except urllib.error.URLError as e:
+            # Gateway process down / connection refused. FAIL CLOSED. The old code fell back to a
+            # direct Anthropic key here; that fallback is exactly what made this path uncappable, so
+            # it is gone. A KB image ingest now fails loudly rather than quietly buying an
+            # unbudgeted, unaudited call.
+            if attempt < 3:
+                print(f"    ai-gateway unreachable ({e.reason}); retrying", file=sys.stderr, flush=True)
+                continue
+            raise GatewayUnavailable(
+                f"ai-gateway unreachable at {AI_GATEWAY_URL}: {e.reason}. "
+                f"FAILING CLOSED — no direct-key fallback by design (uncapped + unaudited).")
+        except Exception as e:
+            if attempt < 3:
+                print(f"    ai-gateway transient error ({type(e).__name__}); retrying", file=sys.stderr, flush=True)
+                continue
+            raise GatewayUnavailable(f"ai-gateway call failed: {type(e).__name__}: {e}")
+    raise GatewayUnavailable("ai-gateway call failed after all retries")
+
+
 def ingest_image(client, config, collection, file_path):
-    """Ingest an image: Gemini Flash describes it, then embed description + raw image together."""
+    """Ingest an image. NONTEXT_BACKEND='gemini' (default): Gemini Flash describes it,
+    then embed description + raw image together. NONTEXT_BACKEND='deterministic':
+    Claude Vision (Haiku) describes it, then embed the description as text (no Gemini)."""
     file_path = Path(file_path)
     doc_id = file_id(file_path)
 
@@ -829,15 +1272,29 @@ def ingest_image(client, config, collection, file_path):
         print(f"  SKIP (exists, unchanged): {file_path}")
         return 0
 
-    print(f"  Generating description for {file_path.name}...")
-    description, media_bytes, mime = describe_media(client, config, file_path, "image")
-
-    # Option B: embed text description + raw image together
-    try:
-        embedding = embed_multimodal(client, config, description, media_bytes, mime)
-    except Exception:
-        # Fallback to text-only embedding if multimodal fails (e.g., file too large)
+    if NONTEXT_BACKEND == "deterministic":
+        print(f"  Describing image via Claude Vision: {file_path.name}...")
+        description, vusage = describe_image_claude(file_path)
+        if not description.strip():
+            print(f"  SKIP (no description produced): {file_path}")
+            return 0
+        # Record the real Haiku vision cost (was a $0 blind-spot) — priced separately
+        # from Gemini generation; feeds the usage/metering ledger.
+        if _tracker and vusage:
+            _tracker.track_vision(vusage.get("input_tokens", 0), vusage.get("output_tokens", 0),
+                                  model=vusage.get("model"))
+        # Text-only embed through the normal path (local nomic when EMBEDDING_BACKEND=local).
         embedding = embed_content(client, config, description)
+        mime = mimetypes.guess_type(str(file_path))[0] or "image/png"
+    else:
+        print(f"  Generating description for {file_path.name}...")
+        description, media_bytes, mime = describe_media(client, config, file_path, "image")
+        # Option B: embed text description + raw image together
+        try:
+            embedding = embed_multimodal(client, config, description, media_bytes, mime)
+        except Exception:
+            # Fallback to text-only embedding if multimodal fails (e.g., file too large)
+            embedding = embed_content(client, config, description)
 
     collection.upsert(
         ids=[doc_id],
@@ -1100,32 +1557,42 @@ def ingest_pdf(client, config, collection, file_path):
     # We'll ask Gemini to process the whole thing and get structured output
     # For PDFs > 6 pages, we chunk by asking for specific page ranges
 
-    print(f"  Analyzing PDF: {file_path.name}...")
+    if NONTEXT_BACKEND == "deterministic":
+        print(f"  Extracting PDF (deterministic/Kreuzberg): {file_path.name}...")
+        text = extract_pdf_text_deterministic(file_path)
+        if not text.strip():
+            # OCR has ALREADY been attempted inside the extractor by this point (empty text
+            # layer -> tesseract fall-through). Reaching here means BOTH passes found nothing.
+            # This is now a LOUD, honest drop rather than the silent one that discarded scans.
+            print(f"  DROPPED (no text layer AND OCR recovered nothing): {file_path}", file=sys.stderr)
+            return 0
+    else:
+        print(f"  Analyzing PDF: {file_path.name}...")
 
-    # Gemini Flash returns 503 UNAVAILABLE during high-demand windows. Without
-    # retries, a single 503 kills the ingest. _retry_generate_content wraps the
-    # call with bounded retries on transient SDK conditions (HTTP 429/500/503,
-    # status UNAVAILABLE/RESOURCE_EXHAUSTED) and fails fast on everything else.
-    extraction_prompt = (
-        "Extract ALL content from this PDF. For each page, include:\n"
-        "1. Page number\n"
-        "2. All text content (headings, body, lists, footnotes)\n"
-        "3. Description of any images, charts, diagrams, or tables\n"
-        "4. Key concepts and topics on that page\n"
-        "Separate each page's content with '=== PAGE N ===' markers.\n"
-        "Be thorough - this will be used for search and retrieval."
-    )
-    response = _retry_generate_content(
-        client,
-        model=config.get("gemini_model", "gemini-2.5-flash"),
-        contents=[
-            types.Part.from_bytes(data=data, mime_type="application/pdf"),
-            extraction_prompt,
-        ],
-    )
-    if _tracker:
-        _tracker.track_generation(response)
-    text = response.text
+        # Gemini Flash returns 503 UNAVAILABLE during high-demand windows. Without
+        # retries, a single 503 kills the ingest. _retry_generate_content wraps the
+        # call with bounded retries on transient SDK conditions (HTTP 429/500/503,
+        # status UNAVAILABLE/RESOURCE_EXHAUSTED) and fails fast on everything else.
+        extraction_prompt = (
+            "Extract ALL content from this PDF. For each page, include:\n"
+            "1. Page number\n"
+            "2. All text content (headings, body, lists, footnotes)\n"
+            "3. Description of any images, charts, diagrams, or tables\n"
+            "4. Key concepts and topics on that page\n"
+            "Separate each page's content with '=== PAGE N ===' markers.\n"
+            "Be thorough - this will be used for search and retrieval."
+        )
+        response = _retry_generate_content(
+            client,
+            model=config.get("gemini_model", "gemini-2.5-flash"),
+            contents=[
+                types.Part.from_bytes(data=data, mime_type="application/pdf"),
+                extraction_prompt,
+            ],
+        )
+        if _tracker:
+            _tracker.track_generation(response)
+        text = response.text
 
     # Split by page markers if present, otherwise chunk normally
     pages = []
@@ -1401,7 +1868,10 @@ def cmd_ingest(args):
     _tracker = UsageTracker("ingest")
 
     config = load_config()
-    client = get_genai_client(get_api_key(config))
+    # Lazy: the key is required only if a Gemini path is actually taken (see _LazyGenaiClient).
+    # Under EMBEDDING_BACKEND=local + NONTEXT_BACKEND=deterministic no Gemini call happens,
+    # so no key is needed — which is what makes retiring the key possible at all.
+    client = _LazyGenaiClient(config)
     collection_name = args.collection or config.get("default_collection", "default")
     collection = get_chroma_collection(collection_name)
 
@@ -1491,7 +1961,10 @@ def cmd_query(args):
     _tracker = UsageTracker("query")
 
     config = load_config()
-    client = get_genai_client(get_api_key(config))
+    # Lazy: the key is required only if a Gemini path is actually taken (see _LazyGenaiClient).
+    # Under EMBEDDING_BACKEND=local + NONTEXT_BACKEND=deterministic no Gemini call happens,
+    # so no key is needed — which is what makes retiring the key possible at all.
+    client = _LazyGenaiClient(config)
     collection_name = args.collection or config.get("default_collection", "default")
     collection = get_chroma_collection(collection_name)
 
@@ -1678,18 +2151,21 @@ def cmd_usage(args):
     # sessions persisted $0 embedding), NOT recomputed from cumulative tokens at the
     # Gemini rate — cumulative tokens mix billed (gemini) + free (local) eras.
     # Fall back to a Gemini-rate token estimate only for legacy sessions with no cost dict.
-    emb_cost = gen_in_cost = gen_out_cost = 0.0
+    emb_cost = gen_in_cost = gen_out_cost = vis_cost = 0.0
     for s in sessions:
         sc = s.get("cost")
         if sc:
             emb_cost += sc.get("embedding", 0)
             gen_in_cost += sc.get("generation_input", 0)
             gen_out_cost += sc.get("generation_output", 0)
+            vis_cost += sc.get("vision_input", 0) + sc.get("vision_output", 0)
         else:
             emb_cost += (s.get("embedding_tokens", 0) / 1_000_000) * EMBEDDING_PRICE_PER_M
             gen_in_cost += (s.get("generation_input_tokens", 0) / 1_000_000) * FLASH_INPUT_PRICE_PER_M
             gen_out_cost += (s.get("generation_output_tokens", 0) / 1_000_000) * FLASH_OUTPUT_PRICE_PER_M
-    total = emb_cost + gen_in_cost + gen_out_cost
+            vis_cost += (s.get("vision_input_tokens", 0) / 1_000_000) * VISION_INPUT_PRICE_PER_M
+            vis_cost += (s.get("vision_output_tokens", 0) / 1_000_000) * VISION_OUTPUT_PRICE_PER_M
+    total = emb_cost + gen_in_cost + gen_out_cost + vis_cost
 
     print("mmrag Usage Summary")
     print("=" * 40)
