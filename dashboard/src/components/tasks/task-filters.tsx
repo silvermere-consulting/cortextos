@@ -1,6 +1,7 @@
 'use client';
 
 import { FilterBar } from '@/components/shared';
+import { ownerLabel } from '@/lib/owners';
 import type { FilterConfig } from '@/components/shared';
 
 interface TaskFiltersProps {
@@ -44,7 +45,7 @@ export function TaskFilters({
       onChange: (v) => onChange('agent', v),
       options: [
         { value: 'all', label: 'All Agents' },
-        ...agents.map((a) => ({ value: a, label: a })),
+        ...agents.map((a) => ({ value: a, label: ownerLabel(a) })),
       ],
     },
     {

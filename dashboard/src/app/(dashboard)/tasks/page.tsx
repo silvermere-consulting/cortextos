@@ -9,6 +9,7 @@ import { TaskListTable } from '@/components/tasks/task-list-table';
 import { TaskDetailSheet } from '@/components/tasks/task-detail-sheet';
 import { CreateTaskDialog } from '@/components/tasks/create-task-dialog';
 import { TaskFilters } from '@/components/tasks/task-filters';
+import { canonicalOwner } from '@/lib/owners';
 import type { Task, TaskStatus } from '@/lib/types';
 
 type ViewMode = 'kanban' | 'list';
@@ -35,7 +36,7 @@ export default function TasksPage() {
 
   // Derive unique values for filter dropdowns
   const allTasks = tasks;
-  const agents = [...new Set(allTasks.map((t) => t.assignee).filter(Boolean) as string[])];
+  const agents = [...new Set(allTasks.map((t) => canonicalOwner(t.assignee)).filter(Boolean))];
   const projects = [...new Set(allTasks.map((t) => t.project).filter(Boolean) as string[])];
   const orgs = [...new Set(allTasks.map((t) => t.org))];
 

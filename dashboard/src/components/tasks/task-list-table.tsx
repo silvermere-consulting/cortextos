@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/table';
 import { PriorityBadge, StatusBadge, OrgBadge, TimeAgo } from '@/components/shared';
 import { IconArrowsSort, IconSortAscending, IconSortDescending } from '@tabler/icons-react';
+import { ownerLabel } from '@/lib/owners';
 import type { Task } from '@/lib/types';
 
 const REQUESTOR_NAMES: Record<string, string> = {
@@ -48,7 +49,7 @@ export function TaskListTable({ tasks, onTaskClick }: TaskListTableProps) {
           cmp = PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority];
           break;
         case 'assignee':
-          cmp = (a.assignee ?? '').localeCompare(b.assignee ?? '');
+          cmp = ownerLabel(a.assignee).localeCompare(ownerLabel(b.assignee));
           break;
         case 'org':
           cmp = a.org.localeCompare(b.org);
@@ -134,7 +135,7 @@ export function TaskListTable({ tasks, onTaskClick }: TaskListTableProps) {
                 <PriorityBadge priority={task.priority} />
               </TableCell>
               <TableCell className="text-muted-foreground">
-                {task.assignee ?? '-'}
+                {task.assignee ? ownerLabel(task.assignee) : '-'}
               </TableCell>
               <TableCell>
                 <OrgBadge org={task.org} />

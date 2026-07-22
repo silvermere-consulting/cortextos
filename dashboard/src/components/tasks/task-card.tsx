@@ -2,6 +2,7 @@
 
 import { Card } from '@/components/ui/card';
 import { PriorityBadge, OrgBadge, TimeAgo } from '@/components/shared';
+import { ownerLabel } from '@/lib/owners';
 import type { Task } from '@/lib/types';
 
 interface TaskCardProps {
@@ -25,7 +26,7 @@ export function TaskCard({ task, onClick }: TaskCardProps) {
         </div>
         <div className="flex items-center justify-between text-xs text-muted-foreground">
           {task.assignee ? (
-            <span className="truncate max-w-[120px]">{task.assignee}</span>
+            <span className="truncate max-w-[120px]">{ownerLabel(task.assignee)}</span>
           ) : (
             <span className="italic">Unassigned</span>
           )}

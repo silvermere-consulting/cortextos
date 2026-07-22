@@ -29,6 +29,7 @@ import {
 } from '@/components/shared';
 import { IconPencil, IconFile, IconPhoto, IconFileText, IconCode } from '@tabler/icons-react';
 import { DeliverablePreview } from '@/components/tasks/deliverable-preview';
+import { ownerLabel } from '@/lib/owners';
 import type { Task, TaskOutput, TaskStatus, TaskPriority } from '@/lib/types';
 
 export interface TaskDetailSheetProps {
@@ -250,7 +251,7 @@ export function TaskDetailSheet({
                   className="mt-1 h-7 text-sm"
                 />
               ) : (
-                <p className="font-medium">{task.assignee ?? 'Unassigned'}</p>
+                <p className="font-medium">{task.assignee ? ownerLabel(task.assignee) : 'Unassigned'}</p>
               )}
             </div>
             <div>

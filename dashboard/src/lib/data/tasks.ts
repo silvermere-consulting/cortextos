@@ -2,6 +2,7 @@
 // Reads from SQLite (synced from JSON task files on disk).
 
 import { db } from '@/lib/db';
+import { HUMAN_ALIAS_LIST } from '@/lib/owners';
 import type { Task, TaskFilters } from '@/lib/types';
 
 /**
@@ -18,9 +19,14 @@ export function getTasks(filters?: TaskFilters): Task[] {
   }
   if (filters?.agent) {
     // 'human' is a virtual filter: returns tasks assigned to any non-agent human
-    // (agents create human tasks with assigned_to 'user', 'human', etc.)
+    // (agents create human tasks under 'steven', 'human', 'user', etc.). Match
+    // the full alias set case-insensitively so the owner filter isn't split.
     if (filters.agent === 'human') {
-      conditions.push("(assignee IN ('human', 'user') OR title LIKE '[HUMAN]%' OR project = 'human-tasks')");
+      const placeholders = HUMAN_ALIAS_LIST.map(() => '?').join(', ');
+      conditions.push(
+        `(LOWER(assignee) IN (${placeholders}) OR title LIKE '[HUMAN]%' OR project = 'human-tasks')`
+      );
+      params.push(...HUMAN_ALIAS_LIST);
     } else {
       conditions.push('assignee = ?');
       params.push(filters.agent);
