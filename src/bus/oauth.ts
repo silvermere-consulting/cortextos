@@ -229,11 +229,17 @@ export async function checkUsageApi(
     }
   }
 
+  // 30s timeout on every fetch in this file (2026-07-22): Node fetch has no
+  // default timeout, so an intermittent network stall hung check-usage-api past
+  // fuel-gauge's 60s subprocess kill — 23 of ~115 overnight runs — and the
+  // resulting DEGRADED alerts read as an API outage that never existed. A stall
+  // must become a fast, NAMED failure, not an unbounded hang.
   let response = await fetch('https://api.anthropic.com/api/oauth/usage', {
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'anthropic-beta': 'oauth-2025-04-20',
     },
+    signal: AbortSignal.timeout(30_000),
   });
 
   // Auto-heal: on 401, try syncing from Claude Code credentials and retry once
@@ -250,6 +256,7 @@ export async function checkUsageApi(
               Authorization: `Bearer ${accessToken}`,
               'anthropic-beta': 'oauth-2025-04-20',
             },
+            signal: AbortSignal.timeout(30_000),
           });
         }
       }
@@ -338,6 +345,7 @@ export async function refreshOAuthToken(
       grant_type: 'refresh_token',
       refresh_token: account.refresh_token,
     }),
+    signal: AbortSignal.timeout(30_000),
   });
 
   if (!response.ok) {
