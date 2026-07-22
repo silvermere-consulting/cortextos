@@ -74,7 +74,10 @@ function handleFileChange(
     }
   }
 
-  // Emit SSE event
+  // Emit SSE event. CONTRACT: this is a CHANGE SIGNAL, not a data feed —
+  // data carries only {filePath, changeType} (kept for debugging/targeted
+  // refetch). Consumers must refetch the authoritative source on signal
+  // (see hooks/use-sse-refetch.ts); never render display rows from this payload.
   const sseEvent: SSEEvent = {
     type: categorizeFilePath(filePath),
     data: { filePath, changeType },

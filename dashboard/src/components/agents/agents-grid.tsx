@@ -1,14 +1,13 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { AgentCard, type AgentCardData } from './agent-card';
 import { AddAgentCard } from './add-agent-card';
 import { CreateAgentDialog } from './create-agent-dialog';
 import { HealthDot } from '@/components/shared/health-dot';
 import { IconUsers } from '@tabler/icons-react';
-import { useSSE } from '@/hooks/use-sse';
-import type { HealthStatus, SSEEvent } from '@/lib/types';
+import { useSSERefetch } from '@/hooks/use-sse-refetch';
 
 interface AgentsGridProps {
   initialAgents: AgentCardData[];
@@ -16,29 +15,19 @@ interface AgentsGridProps {
 
 export function AgentsGrid({ initialAgents }: AgentsGridProps) {
   const router = useRouter();
-  const [agents, setAgents] = useState<AgentCardData[]>(initialAgents);
   const [createOpen, setCreateOpen] = useState(false);
 
-  const handleSSEEvent = useCallback((event: SSEEvent) => {
-    if (event.type !== 'heartbeat') return;
-    const agentName = event.data?.agent as string | undefined;
-    if (!agentName) return;
+  // Render the server-derived agents directly. The old code copied the prop
+  // into state once and patched it from SSE payload fields the producer never
+  // writes (data.agent/health/current_task) — so live health updates were
+  // silently dead. The authority for agent/health state is the server page
+  // (heartbeats via getHealthStatus), so a heartbeat signal triggers a server
+  // re-render; the fresh prop flows straight through.
+  const agents = initialAgents;
 
-    setAgents((prev) =>
-      prev.map((a) => {
-        if (a.systemName !== agentName && a.name !== agentName) return a;
-        const health = (event.data?.health as HealthStatus) ?? a.health;
-        const currentTask =
-          (event.data?.current_task as string) ?? a.currentTask;
-        return { ...a, health, currentTask };
-      }),
-    );
-  }, []);
-
-  useSSE({
-    filter: (e) => e.type === 'heartbeat',
-    onEvent: handleSSEEvent,
-    bufferSize: 10,
+  useSSERefetch({
+    types: ['heartbeat'],
+    onRefetch: () => router.refresh(),
   });
 
   return (
