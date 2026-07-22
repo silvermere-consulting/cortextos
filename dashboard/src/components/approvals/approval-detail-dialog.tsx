@@ -16,13 +16,19 @@ import { Separator } from '@/components/ui/separator';
 import { CategoryBadge, OrgBadge, TimeAgo } from '@/components/shared';
 import { Badge } from '@/components/ui/badge';
 import { FoundryApprovalSummary } from './foundry-approval-summary';
+import { classifyResponse } from '@/lib/secret-shape';
 import type { Approval } from '@/lib/types';
 
 interface ApprovalDetailDialogProps {
   approval: Approval | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onResolve?: (id: string, decision: 'approved' | 'rejected', note?: string) => void;
+  onResolve?: (
+    id: string,
+    decision: 'approved' | 'rejected',
+    note?: string,
+    response?: string,
+  ) => void;
 }
 
 export function ApprovalDetailDialog({
@@ -32,18 +38,29 @@ export function ApprovalDetailDialog({
   onResolve,
 }: ApprovalDetailDialogProps) {
   const [note, setNote] = useState('');
+  const [response, setResponse] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
   if (!approval) return null;
 
   const isPending = approval.status === 'pending';
+  // Client-side warning is UX only — the API route enforces the same
+  // classifier server-side and refuses secret-shaped responses.
+  const responseWarning =
+    response.trim() && classifyResponse(response).secretShaped;
 
   async function handleResolve(decision: 'approved' | 'rejected') {
     if (!approval || !onResolve) return;
     setSubmitting(true);
     try {
-      await onResolve(approval.id, decision, note.trim() || undefined);
+      await onResolve(
+        approval.id,
+        decision,
+        note.trim() || undefined,
+        response.trim() || undefined,
+      );
       setNote('');
+      setResponse('');
       onOpenChange(false);
     } finally {
       setSubmitting(false);
@@ -129,10 +146,28 @@ export function ApprovalDetailDialog({
             </>
           )}
 
-          {/* Note input for pending */}
+          {/* Response + note inputs for pending */}
           {isPending && (
             <>
               <Separator />
+              <div className="grid gap-2">
+                <Label htmlFor="approval-response">
+                  Response / artefact (optional)
+                </Label>
+                <Textarea
+                  id="approval-response"
+                  placeholder="Paste a one-time share link (preferred — it self-destructs on read)…"
+                  value={response}
+                  onChange={(e) => setResponse(e.target.value)}
+                  maxLength={1000}
+                />
+                {responseWarning && (
+                  <p className="text-sm text-destructive">
+                    This looks like a raw secret — it will be refused. Paste a
+                    one-time share link instead.
+                  </p>
+                )}
+              </div>
               <div className="grid gap-2">
                 <Label htmlFor="approval-note">Note (optional)</Label>
                 <Textarea

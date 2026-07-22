@@ -5,6 +5,7 @@ import path from 'path';
 import { getTaskById } from '@/lib/data/tasks';
 import { getFrameworkRoot, getCTXRoot } from '@/lib/config';
 import { syncAll } from '@/lib/sync';
+import { classifyResponse, SECRET_REFUSAL_MESSAGE } from '@/lib/secret-shape';
 
 export const dynamic = 'force-dynamic';
 
@@ -239,6 +240,22 @@ export async function PATCH(
       { error: `Invalid status. Must be one of: ${VALID_STATUSES.join(', ')}` },
       { status: 400 },
     );
+  }
+
+  // SERVER-SIDE secret-shape guard (same exposure as approvals responses: a
+  // completion result lands in task JSON readable by every agent). Checked
+  // BEFORE the task lookup so it is probeable with a fake id. Fail-closed in
+  // phase A: raw secrets refused, one-time links pass.
+  for (const field of [outputSummary, note]) {
+    if (field && typeof field === 'string') {
+      const verdict = classifyResponse(field);
+      if (verdict.secretShaped) {
+        return Response.json(
+          { error: SECRET_REFUSAL_MESSAGE, reason: verdict.reason },
+          { status: 400 },
+        );
+      }
+    }
   }
 
   // blockedBy is forwarded as a positional arg to update-task.sh. It should

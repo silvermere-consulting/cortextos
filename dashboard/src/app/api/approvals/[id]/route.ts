@@ -4,6 +4,7 @@ import path from 'path';
 import { getApprovalById } from '@/lib/data/approvals';
 import { getFrameworkRoot, getCTXRoot } from '@/lib/config';
 import { syncAll } from '@/lib/sync';
+import { classifyResponse, SECRET_REFUSAL_MESSAGE } from '@/lib/secret-shape';
 
 export const dynamic = 'force-dynamic';
 
@@ -66,9 +67,10 @@ export async function PATCH(
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const { decision, note } = body as {
+  const { decision, note, response } = body as {
     decision?: string;
     note?: string;
+    response?: string;
   };
 
   if (!decision || !VALID_DECISIONS.includes(decision)) {
@@ -85,10 +87,34 @@ export async function PATCH(
     );
   }
 
-  // Security: Strip null bytes and control characters from note.
+  if (response && typeof response === 'string' && response.length > 1000) {
+    return Response.json(
+      { error: 'Response must be 1000 characters or fewer' },
+      { status: 400 },
+    );
+  }
+
+  // SERVER-SIDE secret-shape guard, deliberately BEFORE the approval lookup:
+  // the refusal costs no work and is probeable with a fake id (no fixture, no
+  // side effects). Client-side warnings are UX; this is the mechanism.
+  if (response && typeof response === 'string') {
+    const verdict = classifyResponse(response);
+    if (verdict.secretShaped) {
+      return Response.json(
+        { error: SECRET_REFUSAL_MESSAGE, reason: verdict.reason },
+        { status: 400 },
+      );
+    }
+  }
+
+  // Security: Strip null bytes and control characters from note/response.
   const sanitizedNote = note
     ? String(note).replace(/[\x00-\x1F\x7F]/g, '').slice(0, 500)
     : undefined;
+  const sanitizedResponse =
+    response && typeof response === 'string'
+      ? String(response).replace(/[\x00-\x1F\x7F]/g, '').slice(0, 500)
+      : undefined;
 
   // Look up the approval's org to pass CTX_ORG to bus script
   const approval = getApprovalById(id);
@@ -106,8 +132,15 @@ export async function PATCH(
     CTX_ORG: approval.org || '',
   };
 
+  // Phase A: the response rides the existing note pipeline (resolution_note)
+  // with a structured prefix — zero framework change. A dedicated storage
+  // field arrives with the phase-B framework unit at the next daemon window.
+  const combinedNote = sanitizedResponse
+    ? `RESPONSE: ${sanitizedResponse}${sanitizedNote ? `\n${sanitizedNote}` : ''}`
+    : sanitizedNote;
+
   const args: string[] = [id, decision];
-  if (sanitizedNote) args.push(sanitizedNote);
+  if (combinedNote) args.push(combinedNote);
 
   try {
     const result = spawnSync(

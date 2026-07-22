@@ -368,10 +368,10 @@ export function TaskDetailSheet({
               {/* Note input + status buttons */}
               <div className="space-y-3">
                 <div className="grid gap-2">
-                  <Label htmlFor="task-note">Add note (optional)</Label>
+                  <Label htmlFor="task-note">Note / result (optional)</Label>
                   <Textarea
                     id="task-note"
-                    placeholder="Note for status change..."
+                    placeholder="Note for status change — on Complete this is stored as the result. For secrets, paste a one-time share link, never the raw value."
                     value={note}
                     onChange={(e) => setNote(e.target.value)}
                     maxLength={2000}

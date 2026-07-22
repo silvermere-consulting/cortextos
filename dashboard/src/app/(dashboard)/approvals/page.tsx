@@ -8,6 +8,7 @@ import { ApprovalDetailDialog } from '@/components/approvals/approval-detail-dia
 import { ApprovalHistoryList } from '@/components/approvals/approval-history-list';
 import { IconUser, IconCheck, IconClock } from '@tabler/icons-react';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { Card, CardContent } from '@/components/ui/card';
 import { PriorityBadge, TimeAgo } from '@/components/shared';
 import type { Approval, Task } from '@/lib/types';
@@ -22,6 +23,10 @@ export default function ApprovalsPage() {
 
   const [selectedApproval, setSelectedApproval] = useState<Approval | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+
+  // Per-task response drafts for the [HUMAN] task cards (return-and-close in
+  // one action: the value rides complete-task --result, which already exists).
+  const [taskResponses, setTaskResponses] = useState<Record<string, string>>({});
 
   // History filters
   const [historyFilters, setHistoryFilters] = useState({
@@ -72,16 +77,26 @@ export default function ApprovalsPage() {
     setDialogOpen(true);
   }
 
-  async function handleResolve(id: string, decision: 'approved' | 'rejected', note?: string) {
+  async function handleResolve(
+    id: string,
+    decision: 'approved' | 'rejected',
+    note?: string,
+    response?: string,
+  ) {
     try {
       const res = await fetch(`/api/approvals/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ decision, note }),
+        body: JSON.stringify({ decision, note, response }),
       });
 
       if (res.ok) {
         fetchApprovals();
+      } else {
+        // Surface the server's refusal (e.g. secret-shaped response) instead
+        // of silently reloading — the message names the fix.
+        const data = await res.json().catch(() => null);
+        if (data?.error) window.alert(data.error);
       }
     } catch {
       // Silently fail
@@ -164,17 +179,35 @@ export default function ApprovalsPage() {
                         <IconClock size={12} />
                         <TimeAgo date={task.created_at} />
                       </div>
+                      <Input
+                        className="mt-1 h-8 text-xs"
+                        placeholder="Response — one-time share link preferred (optional)"
+                        value={taskResponses[task.id] ?? ''}
+                        maxLength={1000}
+                        onChange={(e) =>
+                          setTaskResponses((prev) => ({
+                            ...prev,
+                            [task.id]: e.target.value,
+                          }))
+                        }
+                      />
                     </div>
                     <Button
                       size="sm"
                       variant="outline"
                       className="ml-3 shrink-0"
                       onClick={async () => {
-                        await fetch(`/api/tasks/${task.id}`, {
+                        const outputSummary =
+                          taskResponses[task.id]?.trim() || undefined;
+                        const res = await fetch(`/api/tasks/${task.id}`, {
                           method: 'PATCH',
                           headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ status: 'completed' }),
+                          body: JSON.stringify({ status: 'completed', outputSummary }),
                         });
+                        if (!res.ok) {
+                          const data = await res.json().catch(() => null);
+                          if (data?.error) window.alert(data.error);
+                        }
                         fetchApprovals();
                       }}
                     >
