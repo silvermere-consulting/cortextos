@@ -1,4 +1,5 @@
 import { join } from 'path';
+import { execFileSync } from 'child_process';
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
@@ -211,6 +212,33 @@ export class AgentPTY {
 
     this.rawPty = this.pty;
     this._alive = true;
+
+    // Per-session memory cap (2026-07-22, post four-supervisor-death day):
+    // RLIMIT_AS on the freshly spawned session via prlimit. The runaway class
+    // allocated ~100MB/s unbounded to 6-8GB and took the whole box; against an
+    // unbounded allocator, headroom mitigations are worth zero — only a bound
+    // changes the outcome. RLIMIT_AS (not a V8 heap cap: Buffer/native/mmap
+    // allocations live OUTSIDE the V8 heap, and the observed climb has exactly
+    // that signature) converts "kernel picks a victim, supervisor dies, fleet
+    // cycles" into "the offender fails its own allocation, dies alone,
+    // attributably, and the daemon respawns it" — the same terminal state the
+    // estate already recovers from. prlimit-after-spawn: no shell-wrapper
+    // quoting hazards, same-uid lowering is permitted, and a millisecond race
+    // is irrelevant against a 20-second climb. Inherited by the session's own
+    // children. CTX_SESSION_MEM_CAP_MB overrides; 0 disables.
+    if (process.platform !== 'win32' && this.pty.pid) {
+      const capMb = parseInt(process.env.CTX_SESSION_MEM_CAP_MB ?? '3072', 10);
+      if (capMb > 0) {
+        const capBytes = capMb * 1024 * 1024;
+        try {
+          execFileSync('prlimit', ['--pid', String(this.pty.pid), `--as=${capBytes}`], { stdio: 'pipe' });
+          process.stderr.write(`[agent-pty/${this.env.agentName}] memory cap: RLIMIT_AS=${capMb}MB on pid ${this.pty.pid}\n`);
+        } catch (err) {
+          // Refuse to fail silently — an uncapped session must be loud.
+          process.stderr.write(`[agent-pty/${this.env.agentName}] memory cap FAILED on pid ${this.pty.pid}: ${(err as Error).message} — SESSION IS UNCAPPED\n`);
+        }
+      }
+    }
 
     // Track whether we've already accepted the bypass-permissions prompt so we
     // don't send the key sequence multiple times.
