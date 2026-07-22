@@ -6,6 +6,7 @@ import Credentials from 'next-auth/providers/credentials';
 import bcrypt from 'bcryptjs';
 import { db } from './db';
 import { checkRateLimit, resetRateLimit } from './rate-limit';
+import { warnOnAdminCredentialDivergence } from './auth-divergence';
 import type { User } from './types';
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
@@ -125,6 +126,15 @@ export async function seedAdminUser(): Promise<void> {
   // Do NOT validate ADMIN_PASSWORD here — existing deployments may not have it set,
   // and we don't need it when there is nothing to seed or sync.
   if (row.count > 0 && process.env.SYNC_ADMIN_PASSWORD !== 'true') {
+    // DIVERGENCE DETECTOR (2026-07-22): a stored value and a live value with
+    // nothing comparing them. The disk ADMIN_PASSWORD and the users-table hash
+    // diverged silently (seed only runs on an EMPTY table), and the operator
+    // discovered it twice in one morning as failed logins — during a deploy
+    // verification, covered only by someone holding AUTH_SECRET. Detect LOUDLY,
+    // never overwrite: the divergence may be a deliberate password change nobody
+    // recorded, and auto-sync would clobber an intentional value to restore a
+    // stale one — the same class failing in the opposite direction.
+    await warnOnAdminCredentialDivergence();
     return;
   }
 
