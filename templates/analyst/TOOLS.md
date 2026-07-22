@@ -29,10 +29,10 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 | `create-task "<title>" --desc "<desc>"` | Create a task (visible on dashboard) |
 | `update-task <id> <status>` | Update status: pending / in_progress / blocked / completed |
 | `complete-task <id> --result "<what>"` | Mark done with result |
-| `list-tasks [--status S] [--agent A] [--all-orgs]` | List / filter tasks |
-| `check-stale-tasks [--all-orgs]` | Find tasks stale >2h in_progress or >24h pending |
+| `list-tasks [--status S]` | List / filter tasks  ⚠️ **NO `--all-orgs`** — real on `list-approvals` only; cross-pollinated between siblings. Verified by running it 2026-07-20. |
+| `check-stale-tasks` | Find tasks stale >2h in_progress or >24h pending  ⚠️ **NO `--all-orgs`** — real on `list-approvals` only; cross-pollinated between siblings. Verified by running it 2026-07-20. |
 | `check-human-tasks` | Check for stale human-assigned tasks |
-| `archive-tasks [--dry-run] [--all-orgs]` | Archive completed tasks >7d |
+| `archive-tasks` | Archive completed tasks >7d  ⚠️ **NO `--all-orgs`** — real on `list-approvals` only; cross-pollinated between siblings. Verified by running it 2026-07-20. |
 
 ### Messages — full docs: `.claude/skills/comms/SKILL.md`
 | Command | What it does |
@@ -69,7 +69,7 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 |---|---|
 | `list-crons <agent>` | List scheduled crons + next-fire times |
 | `add-cron <agent> <name> <interval-or-cron-expr> "<prompt>"` | Add a recurring cron |
-| `update-cron <agent> <name> --schedule <expr>` | Change schedule/prompt |
+| `update-cron <agent> <name> --interval <i>` | Change schedule/prompt. **The flag is `--interval`** (alias `--cron-expr`); also `--prompt`, `--enabled`, `--desc`. ⚠️ **`--schedule` DOES NOT EXIST** — the CLI answers `error: unknown option '--schedule'`. *Measured from `update-cron --help` 2026-07-20.* It aborted a watchdog test inside a live deploy window because the harness author copied this row. **The 2026-07-14 `add-cron` correction was applied per-tree and never reached these templates, so every agent created between those dates was born with the phantom — fix the TEMPLATE, not just the tree you are standing in.** |
 | `remove-cron <agent> <name>` | Remove a cron |
 | `get-cron-log <agent>` | Show actual fire history |
 | `test-cron-fire <agent> <name>` | Fire immediately to verify wiring |
@@ -79,7 +79,7 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 |---|---|
 | `create-approval "<title>" <category> "[context]"` | Request human approval |
 | `update-approval <id> <approved\|rejected> "[note]"` | Resolve an approval |
-| `list-approvals [--status S] [--all-orgs]` | List approvals |
+| `list-approvals` | List approvals  ⚠️ **NO `--status`, NO `--all-orgs`** — `--status` is real on `list-tasks` only. Verified by running it 2026-07-20. |
 
 ### Knowledge Base — full docs: `.claude/skills/knowledge-base/SKILL.md`
 | Command | What it does |

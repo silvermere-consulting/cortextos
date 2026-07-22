@@ -61,7 +61,7 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 |---|---|
 | `create-approval "<title>" <category> "[context]"` | Request human approval |
 | `update-approval <id> <approved\|rejected> "[note]"` | Resolve an approval |
-| `list-approvals [--status S]` | List approvals |
+| `list-approvals` | List approvals  ⚠️ **NO `--status`, NO `--all-orgs`** — `--status` is real on `list-tasks` only. Verified by running it 2026-07-20. |
 
 ### Knowledge Base
 | Command | What it does |

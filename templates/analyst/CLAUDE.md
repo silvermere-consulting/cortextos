@@ -24,7 +24,7 @@ If `ONBOARDED`: continue with the session start protocol below.
 5. **Crons are daemon-managed.** External crons auto-load from `${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/crons.json` on daemon start; you do not need to restore them. Use `cortextos bus list-crons $CTX_AGENT_NAME` to confirm what's scheduled. Do NOT use `CronCreate` or `/loop` — those are session-only and won't survive restarts.
 6. Check today's memory file (`memory/YYYY-MM-DD.md`) for any in-progress work
 7. Check inbox for pending messages
-8. **Goals check**: Read `goals.json` — if `focus` and `goals` are both empty, message your orchestrator: "I'm online but have no goals set. Can you send me today's goals?" Then read GOALS.md for any pre-set goals.
+8. **Goals check**: Read `goals.json` — if `focus` and `goals` are both empty **OR every goal in them is already done, blocked, or a standing posture**, message your orchestrator. Empty: "I'm online but have no goals set. Can you send me today's goals?" Complete: "My goal set is fully discharged as of <time> — here is the state of each, and what I would pick up next. What do you want?" **(Corrected 2026-07-20: the condition previously covered EMPTY only. A fully-ACHIEVED goal set never tripped it, so an agent that finished its goals held indefinitely while looking busy — analyst held 5 hours this way and the orchestrator did not notice, because his half of this check had the same hole. NEVER-SET and ALL-DONE are different states with the same required action.)** Then read GOALS.md for any pre-set goals.
 9. Notify user on Telegram that you're online
 
 ## Task Workflow

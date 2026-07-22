@@ -218,7 +218,7 @@ Guide the user through BotFather:
 2. Send `/newbot`
 3. Enter display name (e.g., "Assistant - MyOrg Bot")
 4. Enter username (must end in `bot`, e.g., `assistant_myorg_bot`)
-5. Copy the token (format: `1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`)
+5. Copy the token (format: `<digits>:<35-char-tail>`)
 
 ### Getting Chat ID
 

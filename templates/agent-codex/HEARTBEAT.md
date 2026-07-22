@@ -108,8 +108,19 @@ If you need an approval before acting, see `plugins/cortextos-agent-skills/skill
 
 ## Step 7b: THE UNFLATTERING LINE — mandatory, and it is a FIELD, not a decision
 
+
+> ### `goals_state` — ADDED 2026-07-20. EMIT IT EVERY CYCLE, IN THE SAME `--meta` BLOB.
+> `"goals_state":{"active":N,"done":N,"blocked":N,"standing":N,"discharged":true|false,"since":"<ISO>"}`
+>
+> **WHY IT EXISTS:** `goals.json` stores each goal as a **plain string** — there is **no per-goal status field and nowhere to put one**. So an orchestrator reading that file can detect EMPTY and **can NEVER detect ALL-DONE**. On 2026-07-20 analyst discharged her goals by 07:00Z and **held five hours** because no check on either side could see it. **YOU know your discharge state; the file cannot represent it.** So you declare and the orchestrator reads the declaration.
+>
+> **`discharged:true` WITH `active:0` IS THE ASK.** Not a status line, not a message — a machine-readable statement that you have nothing directed to do, readable at any time, needing no conversation and no memory on anyone's part.
+>
+> **TIME-GATED IS NOT DISCHARGED, AND THE TWO PRODUCE THE SAME SILENCE.** *(analyst, 2026-07-20.)* An agent whose remaining goal cannot start until a clock reaches a certain hour is **NOT discharged** - there is nothing to bring forward and it needs no new goals. **Encode it `discharged:false` with `active:N` and say WHY in the detail.** *Expect quiet agents with `active:N` and no movement; that is a correct state, not a fault, and the instrument has no separate value for it by design - adding one would be more machinery for a distinction the detail field already carries.* **Claiming `discharged:true` while time-gated is the comfortable read and pulls goals out of an orchestrator that are not needed.**
+> **A MISSING `goals_state` KEY IS A NO READING — NOT A PASS, AND NOT `discharged:false`.** *(othe, 2026-07-20: an agent that has gone quiet is simultaneously the MOST likely to be discharged and the LEAST likely to answer, so resolving silence to "still live" would make the check silent in exactly the case it exists to catch.)* An agent mid-restart, mid-long-tool-call or parked emits nothing — **that is an absence of data, and absence and zero are different states.** Do not let a timeout clear the check.
+> **DO NOT "FIX" THIS BY READING `goals.json` HARDER. The answer is not in the file and never will be.**
 ```bash
-cortextos bus log-event action self_report info --meta '{"agent":"'$CTX_AGENT_NAME'","wrong":"<what I got wrong / had to retract this cycle, or NONE>","not_done":"<what I claimed or implied but did NOT actually do, or NONE>"}'
+cortextos bus log-event action self_report info --meta '{"agent":"'$CTX_AGENT_NAME'","wrong":"<what I got wrong / had to retract this cycle, or NONE>","not_done":"<what I claimed or implied but did NOT actually do, or NONE>","goals_state":{"active":<N>,"done":<N>,"blocked":<N>,"standing":<N>,"discharged":<true|false>,"since":"<ISO or null>"}}'
 ```
 
 **WHY THIS EXISTS (origin, not accusation):**
