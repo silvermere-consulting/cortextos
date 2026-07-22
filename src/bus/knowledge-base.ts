@@ -266,6 +266,15 @@ export function queryKnowledgeBase(
     lastCollection = col;
   }
 
+  // Merge-rank across collections. Without this, per-collection result blocks
+  // concatenate in collection order, so a 0.7-scoring hit from a later
+  // collection ranks below 0.5s from an earlier one and can fall outside the
+  // caller's display window entirely — content present, scoring well, never
+  // surfaced (observed 2026-07-22: result [6] at 0.603 listed below [1] at
+  // 0.590; the likely mechanism behind "MEMORY.md chunks indexed but not
+  // retrievable").
+  allResults.sort((a, b) => b.score - a.score);
+
   // Report the zero, never merely return it. If every collection we consulted
   // errored, "0 results" says nothing about the knowledge base and everything
   // about the query failing — the caller must be able to tell those apart.
