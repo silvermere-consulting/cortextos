@@ -21,12 +21,6 @@ type LogFn = (msg: string) => void;
  */
 export class AgentProcess {
   readonly name: string;
-  /** Org this agent belongs to — needed by callers (e.g. FastChecker's idle
-   *  stamp) that exec bus commands ON BEHALF OF this agent and must carry an
-   *  explicit identity, or resolveEnv mints one from the daemon's cwd. */
-  get org(): string {
-    return this.env.org;
-  }
   private env: CtxEnv;
   private config: AgentConfig;
   private pty: AgentPTY | CodexAppServerPTY | null = null;
