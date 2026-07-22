@@ -299,4 +299,53 @@ describe('CredentialRefresher ladder', () => {
     expect(await h.refresher.tick()).toBe('no-credentials');
     expect(h.pages).toHaveLength(0);
   });
+
+  // 2026-07-22 refusal-loop regression guard. The cooldown must latch on the
+  // ATTEMPT, not on delivery — a REFUSED page (requireExplicit without env) is
+  // not delivered, and gating the cooldown on delivery made this branch page
+  // every tick forever, silent only because the env was unset. FAILS on the
+  // pre-fix `if (delivered)` code, which is the point.
+  it('exchange fails and the page is REFUSED → cooldown STILL latches (no per-tick loop) + event emitted', async () => {
+    writeStores(OLD_FAMILY);
+    const events: Array<{ event: string; meta: Record<string, unknown> }> = [];
+    let nowMs = OLD_FAMILY.expires_at - 20 * MIN; // healthy-ish lead, page-once branch
+    let pageAttempts = 0;
+    // re-wrap page to count attempts (the ctor above set page:()=>false; rebuild
+    // with a counter for the discriminating assertion)
+    const refresher2 = new CredentialRefresher({
+      ctxRoot, homeDir: home, now: () => nowMs, log: () => {},
+      page: () => { pageAttempts++; return false; }, // REFUSED
+      emitEvent: (event, meta) => events.push({ event, meta }),
+      probe: async () => ({ verdict: 'VALID', detail: 'test' }),
+      exchange: async () => { throw new Error('token exchange failed (400): Invalid request format'); },
+    });
+    void refresher2;
+    await refresher2.tick();
+    await refresher2.tick(); // still inside the 1h cooldown
+    // THE DISCRIMINATOR: pre-fix `if (delivered)` never latches a REFUSED page,
+    // so the second tick pages again → 2. Post-fix latches on ATTEMPT → 1.
+    expect(pageAttempts).toBe(1);
+    // The event is NOT cooldown-gated (a failure is always recorded), so it
+    // fires on both ticks — the queryable surface survives even when paging is
+    // suppressed by cooldown. This is the whole point: an event cannot be refused.
+    expect(events).toHaveLength(2);
+    expect(events[0].event).toBe('credential_refresh_failed');
+    expect(events[0].meta.error).toContain('Invalid request format'); // exception text on a queryable surface
+  });
+
+  it('exchange fails, page REFUSED, SECOND tick past cooldown → the branch is re-enterable (cooldown is a bound, not a latch-forever)', async () => {
+    writeStores(OLD_FAMILY);
+    let attempts = 0;
+    let nowMs = OLD_FAMILY.expires_at - 20 * MIN;
+    const refresher = new CredentialRefresher({
+      ctxRoot, homeDir: home, now: () => nowMs, log: () => {},
+      page: () => { attempts++; return false; },
+      probe: async () => ({ verdict: 'VALID', detail: 'test' }),
+      exchange: async () => { throw new Error('503'); },
+    });
+    await refresher.tick();               // pages (attempt 1), latches cooldown
+    nowMs += 61 * MIN;                     // past EXCHANGE_FAIL_PAGE_COOLDOWN_MS
+    await refresher.tick();               // cooldown expired -> pages again (attempt 2)
+    expect(attempts).toBe(2);             // re-enterable after the hour, not silenced forever
+  });
 });

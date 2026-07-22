@@ -380,6 +380,22 @@ class Daemon {
       ctxRoot: this.ctxRoot,
       page: (message) => pageOperator(frameworkRoot, message, 'Credential refresh', { requireExplicit: true }),
       log: (msg) => console.log(`[cred-refresh] ${msg}`),
+      // A page can be refused (requireExplicit) and then the failure exists
+      // only on a phone (2026-07-22 gap). An event cannot be refused — emit one
+      // per org's orchestrator stream, the surfaces that actually get read.
+      emitEvent: (event, meta) => {
+        try {
+          const am = this.agentManager;
+          if (!am) return;
+          const seenOrgs = new Set<string>();
+          for (const agent of am.getAgentNames()) {
+            const org = am.getAgentOrg(agent);
+            if (!org || seenOrgs.has(org)) continue;
+            seenOrgs.add(org);
+            logObserverEvent(resolvePaths(agent, instanceId, org), agent, org, 'error', event, 'error', meta);
+          }
+        } catch { /* observational only — never disrupt the refresher */ }
+      },
     });
     const credTimer = setInterval(() => {
       credRefresher.tick().catch((err) =>

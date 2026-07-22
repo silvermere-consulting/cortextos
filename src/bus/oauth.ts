@@ -344,6 +344,11 @@ export async function refreshOAuthToken(
     body: JSON.stringify({
       grant_type: 'refresh_token',
       refresh_token: account.refresh_token,
+      // Claude Code's public OAuth client_id — REQUIRED or the endpoint returns
+      // 400 "Invalid request format". Its omission made server-side refresh
+      // impossible (2026-07-20 outage cause). Must match credential-refresh.ts
+      // OAUTH_CLIENT_ID.
+      client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
     }),
     signal: AbortSignal.timeout(30_000),
   });

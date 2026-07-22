@@ -51,6 +51,14 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 
+// Claude Code's public OAuth client_id. The token endpoint returns 400
+// "Invalid request format" without it — the omission that made server-side
+// refresh impossible and caused the 2026-07-20 8h outage (proven 2026-07-22 by
+// a garbage-token format test: {grant,refresh} → invalid_request_error;
+// {grant,refresh,client_id} → invalid_grant, i.e. format accepted). Same
+// constant is required in bus/oauth.ts refreshOAuthToken — keep them in sync.
+export const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+
 // --- tunables (ms) ---
 export const REFRESH_LEAD_MS = 30 * 60_000;        // start refreshing at T-30
 export const WARN_LEAD_MS = 15 * 60_000;           // first CANNOT_TELL page at T-15
@@ -116,7 +124,8 @@ export async function exchangeRefreshToken(
   const res = await fetchImpl('https://console.anthropic.com/v1/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: OAUTH_CLIENT_ID }),
+    signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) throw new Error(`token exchange failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
   const t = await res.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
@@ -271,6 +280,10 @@ export interface CredentialRefresherOptions {
   /** F3 pager (requireExplicit at the wiring). Returns confirmed delivery. */
   page: (message: string) => boolean;
   log?: (msg: string) => void;
+  /** Emit a queryable bus event on the failure branches. A page can be refused
+   *  (requireExplicit); an event cannot — this is the surface the refusal-only
+   *  path lacked. Optional so tests need not wire it. */
+  emitEvent?: (event: string, meta: Record<string, unknown>) => void;
   now?: () => number;
 }
 
@@ -294,6 +307,7 @@ export class CredentialRefresher {
   private readonly exchange: ExchangeFn;
   private readonly page: (message: string) => boolean;
   private readonly log: (msg: string) => void;
+  private readonly emitEvent?: (event: string, meta: Record<string, unknown>) => void;
   private readonly now: () => number;
 
   private lastExchangeFailPageAt = 0;
@@ -308,6 +322,7 @@ export class CredentialRefresher {
     this.exchange = opts.exchange ?? ((r) => exchangeRefreshToken(r));
     this.page = opts.page;
     this.log = opts.log ?? ((m) => console.log(`[cred-refresh] ${m}`));
+    this.emitEvent = opts.emitEvent;
     this.now = opts.now ?? (() => Date.now());
   }
 
@@ -366,21 +381,39 @@ export class CredentialRefresher {
 
     // 3. Exchange into a temp family. (Includes the already-expired case —
     //    booted into a dead credential, i.e. last night's state.)
+    // Log INTENT before the network call: a hang or crash between here and the
+    // catch is otherwise invisible (2026-07-22 — the failure was diagnosable
+    // only via a page that got refused; nothing on any queryable surface).
+    this.log(`exchange: lead ${Math.round(lead / 60000)}m ≤ T-30, calling token endpoint`);
     let temp: TokenFamily;
     try {
       temp = await this.exchange(family.refresh_token);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // The exception text goes in the LOG on every branch — a page can be
+      // refused (requireExplicit) and then the text survives only on a phone.
+      this.log(`exchange FAILED (lead ${Math.round(lead / 60000)}m): ${msg.slice(0, 200)}`);
+      // An EVENT cannot be refused the way a page can — this is the queryable
+      // record the refusal-only path lacked (the 2026-07-22 instrumentation gap).
+      this.emitEvent?.('credential_refresh_failed', {
+        lead_min: Math.round(lead / 60000),
+        expires_at: new Date(family.expires_at).toISOString(),
+        error: msg.slice(0, 200),
+      });
       if (lead <= 0) {
         // Dead credential and no replacement: page immediately, no cooldown.
         this.page(`🚨 CREDENTIAL DEAD: the fleet's Claude token expired at ${new Date(family.expires_at).toISOString()} ` +
           `and the refresh exchange FAILED (${msg.slice(0, 160)}). Every agent is (or will shortly be) logged out — ` +
           'this is the 2026-07-20 outage state. Interactive /login needed NOW.');
-        this.log('exchange failed on a dead credential — paged immediately');
       } else if (now - this.lastExchangeFailPageAt >= EXCHANGE_FAIL_PAGE_COOLDOWN_MS) {
-        const delivered = this.page(`⚠️ Credential refresh: token exchange FAILED (${msg.slice(0, 160)}). ` +
+        this.page(`⚠️ Credential refresh: token exchange FAILED (${msg.slice(0, 160)}). ` +
           `Old token still valid until ${new Date(family.expires_at).toISOString()} — nothing destroyed. Will keep retrying.`);
-        if (delivered) this.lastExchangeFailPageAt = now;
+        // Latch on ATTEMPT, not delivery: a refused page is not delivered, and
+        // gating the cooldown on delivery made this branch page EVERY tick
+        // forever under requireExplicit-without-env (2026-07-22 refusal loop —
+        // silent only because the env was unset). The cooldown must bound the
+        // WORK, not the successful notification.
+        this.lastExchangeFailPageAt = now;
       }
       return 'kept-old-exchange-failed';
     }
