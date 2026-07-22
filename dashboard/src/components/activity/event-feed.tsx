@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useState } from 'react';
 import {
   IconMessage,
   IconCheckbox,
@@ -11,8 +11,8 @@ import {
 } from '@tabler/icons-react';
 import { formatDistanceToNow } from 'date-fns';
 import { AgentAvatar } from '@/components/shared/agent-avatar';
-import { useSSE } from '@/hooks/use-sse';
-import type { Event, SSEEvent, EventType } from '@/lib/types';
+import { useSSERefetch } from '@/hooks/use-sse-refetch';
+import type { Event, EventType } from '@/lib/types';
 
 // -- Icon mapping --
 
@@ -60,54 +60,25 @@ interface EventFeedProps {
 export function EventFeed({ initialEvents, filters }: EventFeedProps) {
   const [allEvents, setAllEvents] = useState<Event[]>(initialEvents);
 
-  // SSE for live updates
-  const { events: sseEvents, isConnected } = useSSE({
-    bufferSize: 100,
-    filter: useCallback(
-      (sse: SSEEvent) => {
-        // Apply type filter if any types are selected
-        if (filters.types.length > 0) {
-          const sseType = sse.type as EventType;
-          if (!filters.types.includes(sseType)) return false;
+  // SSE is a signal, not data: the stream payload carries only
+  // {filePath, changeType} — no agent/severity/message. Rows built from it
+  // rendered live criticals as 'info' and made the agent filter drop every
+  // live row. On signal, refetch the same SQL path the server render uses.
+  const { isConnected } = useSSERefetch({
+    types: ['event'],
+    onRefetch: async () => {
+      try {
+        const res = await fetch('/api/events?limit=200');
+        if (!res.ok) {
+          console.warn('[event-feed] events refetch failed:', res.status);
+          return; // keep the last authoritative list; never synthesize rows
         }
-        // Apply agent filter
-        if (filters.agent && (sse.data?.agent as string) !== filters.agent) {
-          return false;
-        }
-        return true;
-      },
-      [filters.types, filters.agent],
-    ),
+        setAllEvents((await res.json()) as Event[]);
+      } catch (err) {
+        console.warn('[event-feed] events refetch failed:', err);
+      }
+    },
   });
-
-  // Merge SSE events into the list
-  useEffect(() => {
-    if (sseEvents.length === 0) return;
-
-    const newEvents: Event[] = sseEvents.map((sse, i) => ({
-      id: `sse-${sse.timestamp}-${i}`,
-      timestamp: sse.timestamp,
-      agent: (sse.data?.agent as string) ?? '',
-      org: (sse.data?.org as string) ?? '',
-      type: (sse.type as EventType) ?? 'action',
-      category: (sse.data?.category as string) ?? '',
-      severity: ((sse.data?.severity as string) ?? 'info') as Event['severity'],
-      data: sse.data,
-      message: (sse.data?.message as string) ?? sse.type ?? 'Event',
-    }));
-
-    setAllEvents((prev) => {
-      const merged = [...newEvents, ...prev];
-      const seen = new Set<string>();
-      return merged
-        .filter((e) => {
-          if (seen.has(e.id)) return false;
-          seen.add(e.id);
-          return true;
-        })
-        .slice(0, 200);
-    });
-  }, [sseEvents]);
 
   // Apply client-side filters to display
   const displayEvents = allEvents.filter((e) => {

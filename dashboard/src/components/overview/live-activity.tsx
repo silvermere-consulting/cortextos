@@ -13,8 +13,8 @@ import {
 } from '@tabler/icons-react';
 import { formatDistanceToNow } from 'date-fns';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { useSSE } from '@/hooks/use-sse';
-import type { Event, SSEEvent } from '@/lib/types';
+import { useSSERefetch } from '@/hooks/use-sse-refetch';
+import type { Event } from '@/lib/types';
 
 interface LiveActivityProps {
   initialEvents: Event[];
@@ -44,16 +44,6 @@ interface DisplayEvent {
   message: string;
 }
 
-function sseToDisplayEvent(sse: SSEEvent, index: number): DisplayEvent {
-  return {
-    id: `sse-${sse.timestamp}-${index}`,
-    timestamp: sse.timestamp,
-    type: sse.type ?? 'event',
-    agent: (sse.data?.agent as string) ?? '',
-    message: (sse.data?.message as string) ?? sse.type ?? 'Event',
-  };
-}
-
 function eventToDisplayEvent(event: Event): DisplayEvent {
   return {
     id: event.id,
@@ -67,36 +57,29 @@ function eventToDisplayEvent(event: Event): DisplayEvent {
 export function LiveActivity({ initialEvents }: LiveActivityProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [paused, setPaused] = useState(false);
-  const [liveEvents, setLiveEvents] = useState<DisplayEvent[]>([]);
+  const [events, setEvents] = useState<Event[]>(initialEvents);
 
-  const { events: sseEvents, isConnected } = useSSE({
-    bufferSize: 20,
+  // SSE is a signal, not data: the stream payload carries only
+  // {filePath, changeType}, so display rows must come from the events API
+  // (same SQL path as the server render — real agent/message/severity).
+  const { isConnected } = useSSERefetch({
+    types: ['event'],
+    onRefetch: async () => {
+      try {
+        const res = await fetch('/api/events?limit=20');
+        if (!res.ok) {
+          console.warn('[live-activity] events refetch failed:', res.status);
+          return; // keep the last authoritative list; never synthesize rows
+        }
+        setEvents((await res.json()) as Event[]);
+      } catch (err) {
+        console.warn('[live-activity] events refetch failed:', err);
+      }
+    },
   });
 
-  // Convert SSE events to display events
-  useEffect(() => {
-    if (sseEvents.length > 0) {
-      const newDisplayEvents = sseEvents.map(sseToDisplayEvent);
-      setLiveEvents(newDisplayEvents);
-    }
-  }, [sseEvents]);
-
-  // Combine initial + live, dedupe by id, limit to 20
-  const allEvents = [
-    ...liveEvents,
-    ...initialEvents.map(eventToDisplayEvent),
-  ];
-  // Dedupe
-  const seen = new Set<string>();
-  const dedupedEvents = allEvents.filter((e) => {
-    if (seen.has(e.id)) return false;
-    seen.add(e.id);
-    return true;
-  });
-  // Sort newest first, then take 20
-  const displayEvents = dedupedEvents
-    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-    .slice(0, 20);
+  // API returns newest-first already; cap at 20 for display.
+  const displayEvents = events.slice(0, 20).map(eventToDisplayEvent);
 
   // Auto-scroll when new events arrive
   useEffect(() => {

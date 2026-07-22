@@ -29,22 +29,42 @@ if (process.env.NODE_ENV !== 'production') {
 // Watch path builder
 // ---------------------------------------------------------------------------
 
+// chokidar v4 removed glob support (this repo has carried ^5 since its initial
+// commit), so a glob here is watched as a LITERAL path that never exists and
+// the watcher detects nothing — silently. Measured on the live box 2026-07-22:
+// zero "[watcher] change:" lines across every pm2 out log since 2026-06-30.
+// Watch real DIRECTORIES (chokidar recurses) and filter to the interesting
+// files in isInterestingFile() at event time instead.
 function getWatchPaths(): string[] {
   const paths: string[] = [];
   const orgs = getOrgs();
 
   for (const org of orgs) {
     const orgBase = path.join(CTX_ROOT, 'orgs', org);
-    paths.push(path.join(orgBase, 'tasks', '**', '*.json'));
-    paths.push(path.join(orgBase, 'approvals', '**', '*.json'));
-    paths.push(path.join(orgBase, 'analytics', 'events', '**', '*.jsonl'));
+    paths.push(path.join(orgBase, 'tasks'));
+    paths.push(path.join(orgBase, 'approvals'));
+    paths.push(path.join(orgBase, 'analytics', 'events'));
   }
 
   // Flat paths (not org-scoped)
-  paths.push(path.join(CTX_ROOT, 'state', '*', 'heartbeat.json'));
-  paths.push(path.join(CTX_ROOT, 'inbox', '**', '*.json'));
+  paths.push(path.join(CTX_ROOT, 'state'));
+  paths.push(path.join(CTX_ROOT, 'inbox'));
 
   return paths;
+}
+
+// The extension/name filter the globs used to express, applied per event.
+// state/ is watched as a whole directory but only heartbeat.json files in it
+// are signals — everything else under state/ (crons.json, session files,
+// oauth) is high-churn noise that must not reach syncFile or the SSE stream.
+function isInterestingFile(filePath: string): boolean {
+  if (filePath.includes(`${path.sep}state${path.sep}`)) {
+    return path.basename(filePath) === 'heartbeat.json';
+  }
+  if (filePath.includes(`${path.sep}analytics${path.sep}events${path.sep}`)) {
+    return filePath.endsWith('.jsonl');
+  }
+  return filePath.endsWith('.json');
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +94,10 @@ function handleFileChange(
     }
   }
 
-  // Emit SSE event
+  // Emit SSE event. CONTRACT: this is a CHANGE SIGNAL, not a data feed —
+  // data carries only {filePath, changeType} (kept for debugging/targeted
+  // refetch). Consumers must refetch the authoritative source on signal
+  // (see hooks/use-sse-refetch.ts); never render display rows from this payload.
   const sseEvent: SSEEvent = {
     type: categorizeFilePath(filePath),
     data: { filePath, changeType },
@@ -106,9 +129,9 @@ function createWatcher(): FSWatcher {
     },
   });
 
-  watcher.on('add', (fp) => handleFileChange(fp, 'add'));
-  watcher.on('change', (fp) => handleFileChange(fp, 'change'));
-  watcher.on('unlink', (fp) => handleFileChange(fp, 'remove'));
+  watcher.on('add', (fp) => { if (isInterestingFile(fp)) handleFileChange(fp, 'add'); });
+  watcher.on('change', (fp) => { if (isInterestingFile(fp)) handleFileChange(fp, 'change'); });
+  watcher.on('unlink', (fp) => { if (isInterestingFile(fp)) handleFileChange(fp, 'remove'); });
   watcher.on('error', (error) => console.error('[watcher] Error:', error));
 
   console.log(
