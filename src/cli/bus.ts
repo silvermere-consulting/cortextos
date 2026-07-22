@@ -3,6 +3,7 @@ import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
+import { checkRecipient, buildRefusal, priorityBodyMismatch } from '../bus/recipient-check.js';
 import { validateAgentName } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile, parseTaskStatus } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
@@ -85,7 +86,8 @@ busCommand
   .option('--reply-to <id>', 'Reply to message ID')
   .option('--stdin', 'Read message text from stdin — apostrophes, quotes, backticks and newlines are all safe (use a heredoc with a quoted delimiter)')
   .option('--text-file <path>', 'Read message text from a file (same quoting safety as --stdin)')
-  .action((to: string, priority: string, text: string | undefined, replyToArg: string | undefined, opts: { replyTo?: string; stdin?: boolean; textFile?: string }) => {
+  .option('--force-queue', 'Queue even if the recipient is not a known agent (deliberate future-agent addressing only)')
+  .action((to: string, priority: string, text: string | undefined, replyToArg: string | undefined, opts: { replyTo?: string; stdin?: boolean; textFile?: string; forceQueue?: boolean }) => {
     // When the text comes from --stdin/--text-file, a lone third positional
     // is the reply-to id, not the text: `send-message chief normal <id> --stdin`.
     if ((opts.stdin || opts.textFile) && text !== undefined && replyToArg === undefined) {
@@ -117,26 +119,23 @@ busCommand
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
-    // Warn if target agent doesn't exist (check project dir)
-    const { existsSync } = require('fs');
-    const { join } = require('path');
+    // Fail-closed recipient validation (2026-07-22). The previous behaviour —
+    // warn "may never be read" and QUEUE ANYWAY — put 87 messages into queues
+    // no consumer has ever read, over 69 days, with two real deadlines expiring
+    // inside. A send that cannot fail looks identical to a send that worked.
+    // REFUSE MEANS THE MESSAGE DOES NOT QUEUE (review criterion: this must
+    // never degrade back into a sterner warning above an accepting queue).
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
-    const orgsDir = join(projectRoot, 'orgs');
-    let agentExists = false;
-    if (existsSync(orgsDir)) {
-      const { readdirSync } = require('fs');
-      try {
-        for (const org of readdirSync(orgsDir)) {
-          if (existsSync(join(orgsDir, org, 'agents', to))) {
-            agentExists = true;
-            break;
-          }
-        }
-      } catch { /* skip */ }
+    const recipientCheck = checkRecipient(projectRoot, to);
+    if (!recipientCheck.exists && !opts.forceQueue) {
+      console.error(buildRefusal(to, recipientCheck));
+      process.exit(1);
     }
-    if (!agentExists) {
-      console.error(`Warning: agent '${to}' not found in project. Message will be queued but may never be read.`);
+    if (!recipientCheck.exists && opts.forceQueue) {
+      console.error(`--force-queue: queueing for unknown recipient '${to}' — nothing consumes this inbox until an agent by that name exists.`);
     }
+    const mismatch = priorityBodyMismatch(priority, messageText);
+    if (mismatch) console.error(mismatch);
 
     const msgId = sendMessage(paths, env.agentName, to, priority as Priority, messageText, effectiveReplyTo);
     try {
