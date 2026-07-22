@@ -17,8 +17,11 @@ export default function StrategyPage() {
   const [dailyFocus, setDailyFocus] = useState<string | undefined>(undefined);
   const [dailyFocusSetAt, setDailyFocusSetAt] = useState<string | undefined>(undefined);
 
-  // Resolve the effective org (use first org if "all" is selected)
-  const effectiveOrg = currentOrg === 'all' ? orgs[0] ?? '' : currentOrg;
+  // Goals and bottlenecks are per-org and this page WRITES them (GoalsList,
+  // BottleneckSection). "all" is not a writable target, so never collapse it to
+  // orgs[0] — that silently misfiled Steve's goals onto the first org. Resolve
+  // "all" to no target and prompt for a specific org instead.
+  const effectiveOrg = currentOrg === 'all' ? '' : currentOrg;
 
   const loadData = useCallback(async () => {
     if (!effectiveOrg) {
@@ -48,12 +51,14 @@ export default function StrategyPage() {
   }, [loadData]);
 
   if (!effectiveOrg) {
+    const message =
+      currentOrg === 'all' && orgs.length > 0
+        ? 'Select a specific organization from the org switcher to view and edit its strategy. Goals and bottlenecks are set per-org.'
+        : 'No organizations found. Create an org to get started.';
     return (
       <div className="space-y-6">
         <h1 className="text-2xl font-semibold">Strategy</h1>
-        <p className="text-muted-foreground">
-          No organizations found. Create an org to get started.
-        </p>
+        <p className="text-muted-foreground">{message}</p>
       </div>
     );
   }
