@@ -88,7 +88,7 @@ export interface UnresolvableHandle {
  * night, carrying no health signal. Everything else (credential shapes, etc.)
  * on a screened file is incident-class and lands in blocked_text.
  */
-const POLICY_BLOCK_REASONS = new Set(['binary_or_temp', 'data_dump']);
+const POLICY_BLOCK_REASONS = new Set(['binary_or_temp', 'data_dump', 'env_format']);
 
 /** blocked[] entries are "<path>:<reason>"; keep only incident-class ones. */
 export function classifyBlockedText(blocked: string[]): string[] {
@@ -338,6 +338,38 @@ export function hasCredential(content: string): boolean {
 }
 
 /**
+ * Is this content an env-format file — dominantly bare `NAME=value` lines?
+ *
+ * Why a CLASS gate exists at all (task_1784622395738, fix #1): auto-commit's
+ * commit happens inside the call, so this screen is the only pre-commit gate —
+ * the documented post-stage review is structurally post-commit. On a
+ * NAME=value-shaped file the credential arms' zero is double-meaning: "no
+ * secrets" and "no shapes I know" print the same 0 (2026-07-21: the matcher
+ * returned 0 on three daemon env snapshots, correctly only because they
+ * carried value LENGTHS, not values — a snapshot WITH values returns the same
+ * 0). A file class that exists to carry secrets cannot be cleared by failing
+ * to match; the sole gate refuses the class. Over-block is visible in
+ * blocked[]; under-block is silent — so the tie breaks closed.
+ *
+ * Shape: `^IDENT=` with no spaces (the .env convention) — `export FOO=…` and
+ * `key = value` INI style deliberately do not match. Ratio over non-blank,
+ * non-# lines, with a 4-matching-line floor so prose carrying a small inline
+ * example stays committable (stated limitation, asserted in
+ * tests/unit/bus/env-format-gate.test.ts so it cannot drift silently; the
+ * credential arms still screen every line of sub-floor files).
+ */
+export function isEnvFormatFile(content: string): boolean {
+  const lines = content
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l.length > 0 && !l.startsWith('#'));
+  if (lines.length === 0) return false;
+
+  const envLines = lines.filter(l => /^[A-Za-z_][A-Za-z0-9_]*=/.test(l));
+  return envLines.length >= 4 && envLines.length / lines.length >= 0.8;
+}
+
+/**
  * Can this file's bytes be screened at all?
  *
  * Classify by DECODABILITY, never by extension. An extension blocklist is a
@@ -545,17 +577,27 @@ export function autoCommit(projectDir: string, dryRun: boolean = false, agentPat
 
     // Screen EVERY file's content — scripts included. Classify by decodability,
     // and never let an unreadable file through wearing a clean bill of health.
+    // Rules mirror screenFile(); tests/unit/bus/env-format-gate.test.ts and
+    // autocommit-path-parity.test.ts hold the two paths together — a comment
+    // could not (2026-07-10).
     if (existsSync(fullPath)) {
       try {
         const stat = statSync(fullPath);
-        if (stat.isFile() && stat.size < MAX_FILE_SIZE) {
+        // `size <= MAX`, not `<`: the over-cap case blocked above, and the
+        // EXACTLY-at-cap case used to pass both gates unscreened.
+        if (stat.isFile() && stat.size <= MAX_FILE_SIZE) {
           const buf = readFileSync(fullPath);
           if (isUnscreenableBinary(buf)) {
             blocked.push(`${file}:unscreenable_binary`);
             continue;
           }
-          if (hasCredential(buf.toString('utf-8'))) {
+          const text = buf.toString('utf-8');
+          if (hasCredential(text)) {
             blocked.push(`${file}:credential_pattern_detected`);
+            continue;
+          }
+          if (isEnvFormatFile(text)) {
+            blocked.push(`${file}:env_format`);
             continue;
           }
         }
@@ -620,11 +662,14 @@ export function screenFile(fullPath: string, relPath: string): string | null {
     const stat = statSync(fullPath);
     if (!stat.isFile()) return null;
     if (stat.size > MAX_FILE_SIZE) return 'over_10MB';
-    if (stat.size < MAX_FILE_SIZE) {
-      const buf = readFileSync(fullPath);
-      if (isUnscreenableBinary(buf)) return 'unscreenable_binary';
-      if (hasCredential(buf.toString('utf-8'))) return 'credential_pattern_detected';
-    }
+    // No size condition here: `size < MAX` left a file of EXACTLY the cap
+    // passing both gates unscreened (the boundary fail-open). Not over the
+    // cap ⇒ content gets read, always.
+    const buf = readFileSync(fullPath);
+    if (isUnscreenableBinary(buf)) return 'unscreenable_binary';
+    const text = buf.toString('utf-8');
+    if (hasCredential(text)) return 'credential_pattern_detected';
+    if (isEnvFormatFile(text)) return 'env_format';
   } catch {
     // A file we cannot read is a file we cannot screen. Refusing to stage it is
     // the only honest answer; "fall through and allow" reported a check it never ran.
