@@ -267,8 +267,13 @@ export async function PATCH(
     }
   }
 
-  // Look up task's org to pass CTX_ORG to bus script
+  // Look up task's org to pass CTX_ORG to bus script. A missing id is a 404,
+  // not a 500 — mirror the approvals route. Placed AFTER the secret-shape guard
+  // above so a fake id still exercises the guard (probeable with no fixture).
   const task = getTaskById(id);
+  if (!task) {
+    return Response.json({ error: 'Task not found' }, { status: 404 });
+  }
 
   const frameworkRoot = getFrameworkRoot();
   const env = {
