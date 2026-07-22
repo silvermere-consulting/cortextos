@@ -42,7 +42,26 @@ export function FilterBar({ filters, onClearAll, className }: FilterBarProps) {
           onValueChange={(value) => filter.onChange(value ?? '')}
         >
           <SelectTrigger size="sm">
-            <SelectValue placeholder={filter.label} />
+            {/* Base UI renders the raw value string while the popup is closed
+                (items unmounted), so value≠label filters showed "all"/"urgent"
+                with no field context. Format via the value function and keep the
+                field label visible so each filter stays self-describing. */}
+            <SelectValue placeholder={filter.label}>
+              {(value: string) => {
+                if (value === '' || value === 'all') {
+                  return (
+                    <span className="text-muted-foreground">{filter.label}</span>
+                  );
+                }
+                const opt = filter.options.find((o) => o.value === value);
+                return (
+                  <span>
+                    <span className="text-muted-foreground">{filter.label}: </span>
+                    {opt ? opt.label : value}
+                  </span>
+                );
+              }}
+            </SelectValue>
           </SelectTrigger>
           <SelectContent>
             {filter.options.map((option) => (
