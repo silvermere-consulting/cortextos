@@ -122,6 +122,11 @@ export class AgentPTY {
       CRM_TEMPLATE_ROOT: this.env.frameworkRoot,
     };
 
+    // Pin discipline (Track A): fleet sessions must never self-update the Claude binary.
+    // A silent in-place upgrade was the demonstrated trigger of the 07-22 OOM restart-loop,
+    // so the autoupdater is killed for every daemon-spawned session.
+    ptyEnv['DISABLE_AUTOUPDATER'] = '1';
+
     // Source org-level shared secrets (orgs/{org}/secrets.env).
     // These are shared across all agents in the org: OPENAI_KEY, APIFY_TOKEN, GEMINI_API_KEY, etc.
     // Agent .env is loaded after and overrides org values — agent-specific keys win.
@@ -198,8 +203,20 @@ export class AgentPTY {
     // env is passed natively via node-pty options; no bash export commands required.
     // On Windows, npm global installs create .cmd wrappers, not .exe binaries.
     // node-pty's CreateProcess requires the exact wrapper name to resolve correctly.
-    const claudeArgs = this.buildClaudeArgs(mode, prompt);
-    const claudeCmd = this.getBinaryName();
+    let claudeArgs = this.buildClaudeArgs(mode, prompt);
+    let claudeCmd = this.getBinaryName();
+
+    // Track B (dormant by default): per-session address-space cap.
+    // CTX_SESSION_MEM_CAP_MB=0 (default) => uncapped, exact original spawn path.
+    // >0 => wrap in `prlimit --as=<bytes> -- <claude> <args>` so a runaway session fails
+    // its OWN allocation (contained, attributable) instead of tipping the box into global OOM
+    // and cascading a full-fleet restart. Linux only; value must come from measured VmPeak.
+    const capMb = Number(process.env.CTX_SESSION_MEM_CAP_MB || 0);
+    if (capMb > 0 && platform() !== 'win32') {
+      const bytes = capMb * 1024 * 1024;
+      claudeArgs = ['--as=' + String(bytes), '--', claudeCmd, ...claudeArgs];
+      claudeCmd = 'prlimit';
+    }
 
     this.pty = this.spawnFn!(claudeCmd, claudeArgs, {
       name: 'xterm-256color',
@@ -285,6 +302,11 @@ export class AgentPTY {
    * Protected so HermesPTY can override to return 'hermes'.
    */
   protected getBinaryName(): string {
+    // Pin discipline (Track A): an explicit absolute path in the daemon env
+    // (CTX_CLAUDE_BIN=/usr/bin/claude) overrides PATH resolution, so a user-writable
+    // shadow install can never surface as the version agents run. Default unchanged.
+    const pin = process.env.CTX_CLAUDE_BIN;
+    if (pin) return pin;
     if (platform() !== 'win32') return 'claude';
     // The Claude Code Windows installer historically shipped a `claude.cmd`
     // shim alongside `claude.exe`. Newer installers (e.g. when claude lives
