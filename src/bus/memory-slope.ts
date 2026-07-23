@@ -25,6 +25,13 @@ export interface MemorySample {
   rss_mb: number;
   /** "<pid>:<starttime-ticks>" of the agent's oldest live process; '' if unknown. */
   session_key: string;
+  /**
+   * OBSERVE-ONLY (2026-07-23): PSS (MB) of the session-root pid at sample time —
+   * the recalibration signal logged beside rss_mb (the tree-sum). Optional and
+   * best-effort; NOTHING evaluates it (evaluateSlope reads only rss_mb), so it
+   * rides through the history round-trip as pure instrumentation.
+   */
+  session_pss_mb?: number;
 }
 
 export interface SlopeThresholds {
@@ -296,11 +303,16 @@ export function appendHistory(
   sessionKeys: Map<string, string>,
   t: SlopeThresholds = DEFAULT_SLOPE_THRESHOLDS,
   now: Date = new Date(),
+  sessionPss?: Map<string, number>,
 ): MemorySample[] {
   const ts = now.toISOString();
-  const fresh: MemorySample[] = snap.agents.map(a => ({
-    ts, agent: a.agent, rss_mb: a.rss_mb, session_key: sessionKeys.get(a.agent) ?? '',
-  }));
+  const fresh: MemorySample[] = snap.agents.map(a => {
+    const pss = sessionPss?.get(a.agent);
+    return {
+      ts, agent: a.agent, rss_mb: a.rss_mb, session_key: sessionKeys.get(a.agent) ?? '',
+      ...(pss != null ? { session_pss_mb: pss } : {}),
+    };
+  });
   const cutoff = new Date(now.getTime() - t.retention_days * 86_400_000).toISOString();
   const all = [...readHistory(ctxRoot), ...fresh].filter(s => s.ts >= cutoff);
   ensureDir(join(ctxRoot, 'analytics'));

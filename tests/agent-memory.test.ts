@@ -4,11 +4,13 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   parseVmRssKb,
+  parsePssKb,
   parseMeminfoKb,
   parseAgentFromEnviron,
   memoryThresholdsFromEnv,
   evaluateMemoryAnomalies,
   collectAgentMemory,
+  collectSessionPss,
   DEFAULT_MEMORY_THRESHOLDS,
   type MemorySnapshot,
 } from '../src/bus/agent-memory.js';
@@ -17,6 +19,11 @@ describe('agent-memory — pure parsers', () => {
   it('parseVmRssKb extracts VmRSS, null when absent', () => {
     expect(parseVmRssKb('VmPeak:\t 700000 kB\nVmRSS:\t  550280 kB\nVmData: 1 kB')).toBe(550280);
     expect(parseVmRssKb('Name:\tclaude\nState:\tS')).toBeNull();
+  });
+
+  it('parsePssKb extracts Pss from smaps_rollup, null when absent', () => {
+    expect(parsePssKb('Rss:\t 600000 kB\nPss:\t  412345 kB\nShared_Clean: 1 kB')).toBe(412345);
+    expect(parsePssKb('Rss:\t 600000 kB\nShared_Clean: 1 kB')).toBeNull();
   });
 
   it('parseMeminfoKb extracts a key, null when absent', () => {
@@ -128,5 +135,46 @@ describe('agent-memory — collectAgentMemory (fake /proc)', () => {
   it('returns zeroed snapshot when procDir is absent (non-Linux / no proc)', () => {
     const snap = collectAgentMemory('/no/such/proc/path');
     expect(snap).toEqual({ agents: [], mem_total_mb: 0, mem_available_mb: 0, available_pct: 0 });
+  });
+});
+
+describe('agent-memory — collectSessionPss (fake /proc)', () => {
+  let dir: string;
+  afterEach(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+  const mkpid = (pid: string, opts: { pss?: number; rssKb?: number }) => {
+    const p = join(dir, pid); mkdirSync(p);
+    if (opts.pss != null) writeFileSync(join(p, 'smaps_rollup'), `Rss:\t 900000 kB\nPss:\t ${opts.pss} kB\n`);
+    if (opts.rssKb != null) writeFileSync(join(p, 'status'), `Name:\tclaude\nVmRSS:\t ${opts.rssKb} kB\n`);
+  };
+
+  it('measures the session pid PSS, not a tree-sum', () => {
+    dir = mkdtempSync(join(tmpdir(), 'proc-'));
+    mkpid('100', { pss: 409600, rssKb: 800000 }); // session anchor: PSS 400MB
+    // A heavy TRANSIENT child would inflate a tree-sum but is never the anchor;
+    // collectSessionPss only reads the anchor pid, so it can't be pulled in.
+    mkpid('101', { pss: 999999, rssKb: 999999 });
+    const out = collectSessionPss(new Map([['chief', '100:12345']]), dir);
+    expect(out.get('chief')).toBe(Math.round(409600 / 1024)); // 400, from the anchor only
+  });
+
+  it('falls back to VmRSS for the SAME anchor pid when smaps_rollup is unreadable', () => {
+    dir = mkdtempSync(join(tmpdir(), 'proc-'));
+    mkpid('200', { rssKb: 512000 }); // no smaps_rollup → VmRSS fallback (500MB)
+    const out = collectSessionPss(new Map([['analyst', '200:777']]), dir);
+    expect(out.get('analyst')).toBe(Math.round(512000 / 1024));
+  });
+
+  it('omits agents with an empty session_key or a gone pid', () => {
+    dir = mkdtempSync(join(tmpdir(), 'proc-'));
+    mkpid('300', { pss: 102400 });
+    const out = collectSessionPss(new Map([
+      ['has-pid', '300:1'],
+      ['no-key', ''],       // unresolved anchor → omitted
+      ['gone', '999999:2'], // pid does not exist → omitted
+    ]), dir);
+    expect(out.get('has-pid')).toBe(Math.round(102400 / 1024));
+    expect(out.has('no-key')).toBe(false);
+    expect(out.has('gone')).toBe(false);
   });
 });

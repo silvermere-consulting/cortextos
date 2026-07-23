@@ -13,7 +13,7 @@ import { selfRestart, hardRestart, autoCommit, autoCommitAgentRepo, checkGoalSta
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands, evaluateDiskAnomaly } from '../bus/metrics.js';
-import { evaluateMemoryAnomalies, memoryThresholdsFromEnv, collectAgentMemory, type MemorySnapshot } from '../bus/agent-memory.js';
+import { evaluateMemoryAnomalies, memoryThresholdsFromEnv, collectAgentMemory, collectSessionPss, type MemorySnapshot } from '../bus/agent-memory.js';
 import {
   appendHistory as appendMemoryHistory, collectSessionKeys, evaluateAllSlopes,
   slopeThresholdsFromEnv, applySlopeToAnomalies, type SlopeVerdict, type MemorySlopeAnomaly,
@@ -1110,7 +1110,12 @@ busCommand
       return;
     }
     const t = slopeThresholdsFromEnv();
-    const history = appendMemoryHistory(env.ctxRoot, memory, collectSessionKeys('/proc', env.ctxRoot), t);
+    // OBSERVE-ONLY (2026-07-23): this is the frequent path that actually feeds
+    // the recalibration window (memory-history.jsonl). Log session-pid PSS beside
+    // the tree-sum; nothing evaluates it (evaluateAllSlopes reads only rss_mb).
+    const sessionKeys = collectSessionKeys('/proc', env.ctxRoot);
+    const sessionPss = collectSessionPss(sessionKeys, '/proc');
+    const history = appendMemoryHistory(env.ctxRoot, memory, sessionKeys, t, undefined, sessionPss);
     const verdicts = evaluateAllSlopes(history, memory, t);
     const { emitted, suppressed } = emitMemoryAnomalies(env, memory, verdicts);
     console.log(JSON.stringify({

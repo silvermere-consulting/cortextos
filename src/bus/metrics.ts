@@ -8,7 +8,7 @@ import { join, basename, dirname } from 'path';
 import { execSync } from 'child_process';
 import { ensureDir } from '../utils/atomic.js';
 import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
-import { collectAgentMemory, type MemorySnapshot } from './agent-memory.js';
+import { collectAgentMemory, collectSessionPss, type MemorySnapshot } from './agent-memory.js';
 import {
   appendHistory, collectSessionKeys, evaluateAllSlopes, slopeThresholdsFromEnv,
   type SlopeVerdict,
@@ -443,7 +443,17 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
   try {
     if (memory.agents.length) {
       const t = slopeThresholdsFromEnv();
-      const history = appendHistory(ctxRoot, memory, collectSessionKeys('/proc'), t);
+      const sessionKeys = collectSessionKeys('/proc');
+      // OBSERVE-ONLY (2026-07-23): session-pid PSS logged beside the tree-sum to
+      // accumulate a recalibration window. Attached to the live snapshot for
+      // visibility in latest.json and threaded into the history; NOTHING
+      // evaluates it yet (evaluateSlope/evaluateMemoryAnomalies read rss_mb).
+      const sessionPss = collectSessionPss(sessionKeys, '/proc');
+      for (const a of memory.agents) {
+        const pss = sessionPss.get(a.agent);
+        if (pss != null) a.session_pss_mb = pss;
+      }
+      const history = appendHistory(ctxRoot, memory, sessionKeys, t, undefined, sessionPss);
       memorySlope = evaluateAllSlopes(history, memory, t);
     }
   } catch { /* slope is additive; never fatal */ }

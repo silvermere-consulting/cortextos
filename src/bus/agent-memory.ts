@@ -31,6 +31,14 @@ export interface AgentMemory {
   rss_mb: number;
   /** Number of processes attributed to the agent (claude PTY child + node children). */
   procs: number;
+  /**
+   * OBSERVE-ONLY (2026-07-23): the session-root pid's own PSS in MB — the object
+   * a future per-agent ladder should measure (see collectSessionPss). Optional
+   * and populated best-effort by the metrics report; NOTHING evaluates it yet
+   * (evaluateMemoryAnomalies still fires on rss_mb). Pure instrumentation so the
+   * ladder can be recalibrated onto the session object before the swap.
+   */
+  session_pss_mb?: number;
 }
 
 export interface MemorySnapshot {
@@ -89,6 +97,12 @@ export function memoryThresholdsFromEnv(env: NodeJS.ProcessEnv = process.env): M
 /** Extract VmRSS in kB from the contents of /proc/<pid>/status. null if absent. */
 export function parseVmRssKb(statusText: string): number | null {
   const m = statusText.match(/^VmRSS:\s+(\d+)\s*kB/m);
+  return m ? Number(m[1]) : null;
+}
+
+/** Extract Pss in kB from the contents of /proc/<pid>/smaps_rollup. null if absent. */
+export function parsePssKb(smapsRollupText: string): number | null {
+  const m = smapsRollupText.match(/^Pss:\s+(\d+)\s*kB/m);
   return m ? Number(m[1]) : null;
 }
 
@@ -235,4 +249,45 @@ export function collectAgentMemory(procDir = '/proc'): MemorySnapshot {
     mem_available_mb: toMb(memAvailKb),
     available_pct: memTotalKb > 0 ? Math.round((memAvailKb / memTotalKb) * 100) : 0,
   };
+}
+
+/**
+ * OBSERVE-ONLY (2026-07-23): per-agent PSS of the *session-root* pid — the object
+ * the ladder SHOULD measure once recalibrated (see the design doc + AgentMemory
+ * .session_pss_mb). This reads the same session anchors the slope monitor already
+ * resolves (`collectSessionKeys`, keyed "<pid>:<starttime>") so the level and
+ * slope arms agree on the object by construction — no second pid-resolution copy.
+ *
+ * PSS (`Pss:` in smaps_rollup) divides shared pages by their sharers, so it is a
+ * true per-process footprint with no shared-page over-count. If smaps_rollup is
+ * unreadable (older kernel / perms) we fall back to VmRSS for the SAME anchor pid
+ * — session-scoped, just without shared-page division — and NEVER to a tree-sum
+ * (that would reintroduce the very defect this measures around).
+ *
+ * Best-effort and never throws: any unreadable/gone pid is simply skipped, so a
+ * PSS read can never break the metrics report. NOTHING evaluates the result yet;
+ * it is logged beside the tree-sum to accumulate a recalibration window.
+ */
+export function collectSessionPss(
+  sessionKeys: Map<string, string>,
+  procDir = '/proc',
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const [agent, key] of sessionKeys) {
+    if (!key) continue; // no resolvable session pid — omit (headroom ladder still runs)
+    const pid = key.split(':', 1)[0];
+    if (!pid || !/^\d+$/.test(pid)) continue;
+    let kb: number | null = null;
+    try {
+      kb = parsePssKb(readFileSync(join(procDir, pid, 'smaps_rollup'), 'utf-8'));
+    } catch { /* smaps_rollup unreadable — fall through to VmRSS on the same pid */ }
+    if (kb == null) {
+      try {
+        kb = parseVmRssKb(readFileSync(join(procDir, pid, 'status'), 'utf-8'));
+      } catch { continue; } // pid gone / unreadable — skip
+    }
+    if (kb == null) continue;
+    out.set(agent, Math.round(kb / 1024));
+  }
+  return out;
 }
