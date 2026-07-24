@@ -256,4 +256,50 @@ describe('Advanced Task Management', () => {
       expect(ids).toEqual(['task_020_020', 'task_021_021']);
     });
   });
+
+  describe('updateTask notes', () => {
+    function readTask(id: string): Task {
+      return JSON.parse(readFileSync(join(paths.taskDir, `${id}.json`), 'utf-8'));
+    }
+
+    it('persists a note onto task.notes, timestamp-prefixed', () => {
+      createBackdatedTask(paths, { id: 'task_030_030', status: 'pending' });
+      updateTask(paths, 'task_030_030', 'in_progress', 'started the work');
+
+      const task = readTask('task_030_030');
+      expect(task.notes).toBeDefined();
+      expect(task.notes).toContain('started the work');
+      // Prefixed with the same timestamp written to updated_at.
+      expect(task.notes).toBe(`[${task.updated_at}] started the work`);
+    });
+
+    it('appends successive notes newest-last, newline-separated', () => {
+      createBackdatedTask(paths, { id: 'task_031_031', status: 'pending' });
+      updateTask(paths, 'task_031_031', 'in_progress', 'first note');
+      updateTask(paths, 'task_031_031', 'blocked', 'second note');
+
+      const task = readTask('task_031_031');
+      const lines = (task.notes ?? '').split('\n');
+      expect(lines.length).toBe(2);
+      expect(lines[0]).toContain('first note');
+      expect(lines[1]).toContain('second note');
+    });
+
+    it('leaves notes absent when no note is supplied', () => {
+      createBackdatedTask(paths, { id: 'task_032_032', status: 'pending' });
+      updateTask(paths, 'task_032_032', 'in_progress');
+
+      const task = readTask('task_032_032');
+      expect(task.notes).toBeUndefined();
+    });
+
+    it('preserves an existing note when a later update omits one', () => {
+      createBackdatedTask(paths, { id: 'task_033_033', status: 'pending' });
+      updateTask(paths, 'task_033_033', 'in_progress', 'only note');
+      const afterFirst = readTask('task_033_033').notes;
+      updateTask(paths, 'task_033_033', 'completed');
+
+      expect(readTask('task_033_033').notes).toBe(afterFirst);
+    });
+  });
 });

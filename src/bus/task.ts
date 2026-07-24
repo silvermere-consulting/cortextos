@@ -296,6 +296,14 @@ export function updateTask(
     assignee = task.assigned_to;
     task.status = status;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    if (note) {
+      // Persist the note onto the task itself so it surfaces in the dashboard's
+      // read-only Notes panel (sync reads task.notes). The audit JSONL below keeps
+      // the structured per-transition history; task.notes is the running,
+      // timestamped, human-readable log — appended newest-last.
+      const line = `[${task.updated_at}] ${note}`;
+      task.notes = task.notes ? `${task.notes}\n${line}` : line;
+    }
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);

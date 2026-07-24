@@ -57,6 +57,12 @@ export interface Task {
   due_date: string | null;
   archived: boolean;
   result?: string;
+  /**
+   * Human-readable running notes, appended (timestamped) on each
+   * `update-task --note`. Surfaces in the dashboard's read-only Notes panel;
+   * the append-only audit JSONL keeps the structured per-transition history.
+   */
+  notes?: string;
   /** Linked deliverables (files saved via `cortextos bus save-output`). */
   outputs?: TaskOutput[];
   /**
