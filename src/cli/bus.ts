@@ -32,7 +32,7 @@ import { checkDeps, formatDepsTable } from '../bus/check-deps.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, syncOAuthFromCredentials, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
-import { resolveEnv, refuseMintedIdentity } from '../utils/env.js';
+import { resolveEnv, refuseMintedIdentity, readOrgContext } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { logOutboundMessage, cacheLastSent } from '../telegram/logging.js';
@@ -3052,6 +3052,53 @@ busCommand
       return;
     }
 
+    // Resolve the TARGET AGENT'S timezone the same way the daemon does, and
+    // interpret cron expressions in it.
+    //
+    // THE BUG THIS FIXES (2026-07-24): this call omitted the timezone argument,
+    // so `0 18 * * *` was interpreted in the CALLER'S ambient zone rather than
+    // the agent's. The instant was then rendered — truthfully — as UTC. The
+    // column was therefore honest about its FORMAT and wrong about its VALUE,
+    // which is the worst combination: it reads as authoritative. On a
+    // Singapore-hosted box listing Dubai-configured agents, every Next Fire
+    // appeared 4h off, and an analyst reading it raised a fleet-wide
+    // "every cron is scheduled 4 hours early" alarm that was never true — the
+    // DAEMON had the timezone right all along (agent-manager.ts passes it to
+    // CronScheduler); only this display did not. A lying instrument cost a
+    // decision cycle.
+    //
+    // Resolution chain matches the daemon exactly: per-agent config.json wins,
+    // else the org's context.json, else the explicit 'UTC' fail-safe — never
+    // the silent server TZ.
+    //
+    // The agent's OWN org is resolved by locating its config, not taken from
+    // the caller's env: `cortextos bus list-crons jones` run from a
+    // silvermere-tech agent must use family's context, not the caller's.
+    let cronTz = 'UTC';
+    let cronTzSource = 'fail-safe default';
+    try {
+      const orgsDir = join(env.projectRoot, 'orgs');
+      let agentCfgPath = '';
+      let agentOrg = '';
+      for (const o of existsSync(orgsDir) ? readdirSync(orgsDir) : []) {
+        const cand = join(orgsDir, o, 'agents', agent, 'config.json');
+        if (existsSync(cand)) { agentCfgPath = cand; agentOrg = o; break; }
+      }
+      if (agentCfgPath) {
+        const cfg = JSON.parse(readFileSync(agentCfgPath, 'utf-8')) as { timezone?: string };
+        if (cfg.timezone) {
+          cronTz = cfg.timezone;
+          cronTzSource = `${agent}/config.json`;
+        } else {
+          const octx = readOrgContext(env.frameworkRoot, agentOrg);
+          if (octx.timezone) {
+            cronTz = octx.timezone;
+            cronTzSource = `orgs/${agentOrg}/context.json`;
+          }
+        }
+      }
+    } catch { /* keep the UTC fail-safe — never fall through to server TZ */ }
+
     // Compute next_fire_at for each cron so the table is informative
     const now = Date.now();
     const rows = crons.map(c => {
@@ -3062,7 +3109,7 @@ busCommand
         const refMs = lastFire ? new Date(lastFire).getTime() : now;
         nextFire = fmtTs(new Date(refMs + dms).toISOString());
       } else {
-        const nf = nextFireFromCron(c.schedule, now);
+        const nf = nextFireFromCron(c.schedule, now, cronTz);
         if (!isNaN(nf)) nextFire = fmtTs(new Date(nf).toISOString());
       }
       const promptPreview = c.prompt.length > 60 ? c.prompt.slice(0, 57) + '...' : c.prompt;
@@ -3087,11 +3134,17 @@ busCommand
     const sep = '-'.repeat(nameW + schedW + enW + lastW + nextW + 63 + 5);
 
     console.log(`\nCrons for ${agent} (${rows.length})\n`);
-    console.log(`  ${pad('Name', nameW)}  ${pad('Schedule', schedW)}  ${pad('Enabled', enW)}  ${pad('Last Fire', lastW)}  ${pad('Next Fire', nextW)}  Prompt`);
+    console.log(`  ${pad('Name', nameW)}  ${pad('Schedule', schedW)}  ${pad('Enabled', enW)}  ${pad('Last Fire (UTC)', lastW)}  ${pad('Next Fire (UTC)', nextW)}  Prompt`);
     console.log(`  ${sep}`);
     for (const r of rows) {
       console.log(`  ${pad(r.name, nameW)}  ${pad(r.schedule, schedW)}  ${pad(r.enabled, enW)}  ${pad(r.last_fire, lastW)}  ${pad(r.next_fire, nextW)}  ${r.prompt}`);
     }
+    // State the interpreting zone explicitly. A timestamp column that says UTC
+    // is only half the story: the reader also needs to know which zone the cron
+    // EXPRESSION was read in, because that is what silently moved the value.
+    // Naming it means the next person comparing this table against a wall clock
+    // can see the conversion instead of inferring one.
+    console.log(`\n  Schedules interpreted in ${cronTz} (from ${cronTzSource}); times shown in UTC.`);
     console.log('');
   });
 
