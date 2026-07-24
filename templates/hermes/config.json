@@ -29,7 +29,7 @@
       "enabled": true
     }
   ],
-  "model": "{{model}}",
+  "model": "claude-sonnet-5",
   "ctx_warning_threshold": 60,
   "ctx_handoff_threshold": 70
 }

@@ -26,9 +26,13 @@ module.exports = {
         CTX_ORG: CTX_ORG,
         // Pin discipline (OOM Track A): agents spawn `claude` by this absolute
         // path (getBinaryName reads it from the daemon env), so PATH order can
-        // never surface the user-writable shadow install. /usr/bin/claude is a
-        // root-owned symlink to the known-good pinned version.
-        CTX_CLAUDE_BIN: process.env.CTX_CLAUDE_BIN || '/usr/bin/claude',
+        // never surface the user-writable shadow install.
+        // Deliberate roll 2026-07-24 (Steve go): pinned to a FROZEN 2.1.218 copy
+        // — a user-owned artifact nothing auto-updates (the npm shadow at
+        // ~/.npm-global IS auto-update-capable, so it is deliberately NOT the pin
+        // target). Grants opus-4-8 + sonnet-5 their 1M window (2.1.141 had no
+        // opus-4-8 registry entry -> 200k). Revert target if regressed: '/usr/bin/claude' (2.1.141).
+        CTX_CLAUDE_BIN: process.env.CTX_CLAUDE_BIN || path.join(os.homedir(), '.local', 'share', 'claude-code', '2.1.218', 'claude.exe'),
         // Debug-only: set to '1' to enable SIGUSR2 signal → controlled
         // uncaughtException for testing the crash-visibility path
         // (.daemon-crashed markers + crash-loop operator Telegram alert).

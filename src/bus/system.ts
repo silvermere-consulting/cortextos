@@ -710,7 +710,9 @@ const AGENT_REPO_PATHS = [
 
 /** Never let these into the snapshot repo, even via an explicit add. */
 const AGENT_REPO_EXCLUDE = [
-  '.env', '.cortextos-env', '*.log', 'local/', '.cache/',
+  // '.env*' (not just '.env') so credential-bearing variants like
+  // '.env.bak-<ts>' and '.env.save' can never ride a manual `git add -A`.
+  '.env*', '.cortextos-env', '*.log', 'local/', '.cache/',
   'telegram-images/', '__pycache__/', '.venv/', 'node_modules/',
 ];
 
