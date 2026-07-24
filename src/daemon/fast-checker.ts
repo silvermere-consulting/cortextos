@@ -121,7 +121,14 @@ export class FastChecker {
 
     this.heartbeatTimer = setInterval(() => {
       const ts = new Date().toISOString();
-      execFile(cortextosBin, ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`], { env: { ...process.env } }, (err) => {
+      // Explicit identity, or resolveEnv mints 'cortextos' from the daemon's
+      // cwd: every stamp then lands on a PHANTOM heartbeat (state/cortextos/)
+      // instead of the agent's — which is what happened for a month (5,823
+      // events, none freshening any real agent) until the minted-identity
+      // guard started refusing them outright (2026-07-22 10:33Z; the 12:07
+      // fleet-wide "watchdog error" burst was those refusals, not pressure).
+      const stampEnv = { ...process.env, CTX_AGENT_NAME: agentName, CTX_ORG: this.agent.org };
+      execFile(cortextosBin, ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`], { env: stampEnv }, (err) => {
         if (err) this.log(`Heartbeat watchdog error: ${err.message}`);
       });
     }, HEARTBEAT_INTERVAL_MS);

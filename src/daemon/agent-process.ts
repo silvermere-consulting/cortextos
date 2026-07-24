@@ -94,6 +94,11 @@ export class AgentProcess {
     this.log = log || ((msg) => console.log(`[${name}] ${msg}`));
   }
 
+  /** Owning org (from the resolved CtxEnv). Public accessor mirrors `name`. */
+  get org(): string {
+    return this.env.org;
+  }
+
   /**
    * Start the agent. Spawns Claude Code in a PTY.
    */

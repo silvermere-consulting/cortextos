@@ -10,7 +10,7 @@ import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
 import { resolvePaths } from '../utils/paths.js';
-import { resolveEnv, applyOrgContext } from '../utils/env.js';
+import { resolveEnv, applyOrgContext, readOrgContext } from '../utils/env.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
@@ -1181,13 +1181,17 @@ export class AgentManager {
       }
     };
 
-    // Read timezone from per-agent config.json (e.g. "Asia/Dubai").
-    // The daemon process does not inherit CTX_TIMEZONE — it is only set in
-    // agent PTY envs — so falling back to process.env.CTX_TIMEZONE here would
-    // silently use the server system TZ and fire crons at the wrong wall-clock
-    // time (4 h early on Singapore-hosted server with Dubai-configured agents).
+    // Timezone with a single source of truth: per-agent config.json wins if set,
+    // else the org's context.json (the central home), else UTC.
+    // The daemon process does NOT inherit CTX_TIMEZONE — it is only set in agent
+    // PTY envs — so falling back to process.env.CTX_TIMEZONE here would silently
+    // use the server system TZ and fire crons at the wrong wall-clock time (4 h
+    // early on a Singapore-hosted server with Dubai-configured agents). Falling
+    // back to the org context closes that last path; 'UTC' is the explicit,
+    // named fail-safe if the context is unreadable (never the silent server TZ).
     const agentTimezone = (entry.process['config'] as AgentConfig | undefined)?.timezone
-      ?? process.env.CTX_TIMEZONE;
+      ?? readOrgContext(this.frameworkRoot, entry.process.org).timezone
+      ?? 'UTC';
 
     const scheduler = new CronScheduler({
       agentName,
