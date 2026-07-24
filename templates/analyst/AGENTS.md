@@ -22,7 +22,7 @@ If `ONBOARDED`: continue with the session start protocol below.
 Complete the following in order. Do not skip steps.
 
 1. **Check mode FIRST, then decide on a boot message** — do NOT send anything before this check. SKIP this step entirely if your startup prompt says `CONTEXT HANDOFF` (a handoff restart — you send your own "back — …" pickup later).
-   - Determine day/night from your local time: `date +'%H:%M %Z'`. **Day mode = 08:00–22:00** in `$CTX_TIMEZONE`; **night mode** = outside that.
+   - Determine day/night from your local time: `TZ="$CTX_TIMEZONE" date +'%H:%M %Z'` (bare `date` reads SERVER TZ, not yours). **Day mode = 08:00–22:00** in `$CTX_TIMEZONE`; **night mode** = outside that.
    - **Day mode** — send the boot ping:
    ```bash
    cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID "Booting up... one moment"

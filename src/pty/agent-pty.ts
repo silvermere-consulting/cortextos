@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
+import { readOrgContext } from '../utils/env.js';
 
 // node-pty types
 interface IPty {
@@ -169,13 +170,35 @@ export class AgentPTY {
     if (ptyEnv['CHAT_ID']) {
       ptyEnv['CTX_TELEGRAM_CHAT_ID'] = ptyEnv['CHAT_ID'];
     }
-    // CTX_TIMEZONE: from config.json timezone field, falls back to system TZ
-    const configTimezone = this.config.timezone;
+    // CTX_TIMEZONE + TZ: per-agent config.json wins, else the org's context.json
+    // (the central home), else the daemon's own TZ.
+    //
+    // REGRESSION THIS FIXES (2026-07-24, BA found it, jones/othe as control):
+    // the old shape set TZ *only* inside the `if (configTimezone)` branch. The
+    // else-branch set CTX_TIMEZONE and silently left TZ UNSET. So when the
+    // `timezone` field was removed from six agent configs — a change whose
+    // commit message called it "behavior-preserving", verified against the cron
+    // FIRING path and generalised to behaviour — those six PTYs lost TZ while
+    // keeping CTX_TIMEZONE. Bare `date` in an agent shell then rendered in the
+    // SERVER zone (Singapore +08) rather than Dubai +04: a 4-hour error, in the
+    // direction that makes an agent believe it is night ~4h early and suppress
+    // user-facing output while the user is still working. jones and othe, which
+    // retained the field, were unaffected — which is what identified it.
+    //
+    // Two properties are deliberate now:
+    //  - TZ and CTX_TIMEZONE are set TOGETHER from one resolved value. They can
+    //    no longer disagree, which is the state that made this invisible: the
+    //    variable agents introspect said Dubai while the one `date` reads said
+    //    nothing.
+    //  - The org context is consulted BEFORE the daemon's ambient TZ, so a
+    //    correct clock never depends on what the daemon happened to inherit
+    //    from whoever last restarted it.
+    const configTimezone = this.config.timezone
+      ?? readOrgContext(this.env.frameworkRoot, this.env.org).timezone
+      ?? process.env.TZ;
     if (configTimezone) {
       ptyEnv['CTX_TIMEZONE'] = configTimezone;
-      ptyEnv['TZ'] = configTimezone; // also set TZ so date/time system calls use correct zone
-    } else if (process.env.TZ) {
-      ptyEnv['CTX_TIMEZONE'] = process.env.TZ;
+      ptyEnv['TZ'] = configTimezone; // date/time system calls use the correct zone
     }
     // CTX_USER_TIMEZONE(+_UNTIL): the HUMAN's clock, distinct from the agents' infra
     // clock above. Injected so in-session "is the user awake?" reasoning uses the same

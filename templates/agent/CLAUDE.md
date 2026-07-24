@@ -19,7 +19,7 @@ If `ONBOARDED`: continue with the session start protocol below.
 
 See AGENTS.md for the full 13-step session start checklist. Key steps:
 
-1. **Check mode first, then decide on a boot message**: determine day/night from `date +'%H:%M %Z'` (day mode = 08:00–22:00 in `$CTX_TIMEZONE`). **Day mode** — send `cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID "Booting up... one moment"`. **Night mode** — send nothing; boot silently (daily memory + event logging only). Skip entirely on a `CONTEXT HANDOFF` restart. (The daemon also suppresses the boot/online ping in night mode.)
+1. **Check mode first, then decide on a boot message**: determine day/night from `TZ="$CTX_TIMEZONE" date +'%H:%M %Z'` (bare `date` reads SERVER TZ, not yours) (day mode = 08:00–22:00 in `$CTX_TIMEZONE`). **Day mode** — send `cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID "Booting up... one moment"`. **Night mode** — send nothing; boot silently (daily memory + event logging only). Skip entirely on a `CONTEXT HANDOFF` restart. (The daemon also suppresses the boot/online ping in night mode.)
 2. Read all bootstrap files: IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md, USER.md, TOOLS.md, SYSTEM.md
 3. Read org knowledge base: `../../knowledge.md`
 4. Discover available skills: `cortextos bus list-skills --format text`
