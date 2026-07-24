@@ -280,21 +280,56 @@ export class AgentPTY {
     // old 2s/5s/8s schedule fired before the prompt rendered (first-use of a new
     // model adds latency). Retry schedule widened to cover ~60s; detection
     // updated to match any of {No, exit / Yes, I accept / Bypass Permissions}.
+    // Hardening 2026-07-24 (adapted from upstream a15baad, which we reached
+    // independently — this keeps our detector and adds their safety envelope):
+    //
+    //  - ONE-SHOT PER SCREEN. Previously this retry schedule had no guard at
+    //    all: every timer up to 50s re-evaluated and could re-send. Once the
+    //    session is live, a stray Down+Enter or bare CR is injected INTO THE
+    //    SESSION — the keystroke lands wherever the agent happens to be.
+    //  - STOP ON BOOTSTRAP. If the agent has bootstrapped, no acceptance screen
+    //    can still be up, so any write from here is by definition a stray
+    //    keystroke into a live session. Bail unconditionally.
+    //  - NO BARE 'Yes' MATCH. The old `cleaned.includes('Yes')` fallback is the
+    //    exact predicate upstream identifies as the original crash-loop bug:
+    //    the bypass screen's own "Yes, I accept" option matches it, so a bare
+    //    Enter selects the DEFAULT — "No, exit" — and the agent exits(1) and
+    //    crash-loops without ever onboarding. We were saved only by testing
+    //    detectsBypassPrompt FIRST; that is an ordering dependency, and it
+    //    breaks silently if Claude Code's wording shifts. Match the trust
+    //    screen on 'trust' alone.
+    //
+    // Relevant now: we run Claude Code 2.1.x as of the 2026-07-24 roll, and a
+    // hard-restart is a FRESH start that hits the bypass screen.
+    let trustAccepted = false;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    const clearRemaining = () => { for (const t of timers) clearTimeout(t); timers.length = 0; };
+
     const acceptPrompt = () => {
-      if (!this.pty) return;
+      if (!this.pty) return clearRemaining();
+      // A bootstrapped session cannot be showing an acceptance screen.
+      if (this.outputBuffer.isBootstrapped()) return clearRemaining();
+      if (bypassAccepted && trustAccepted) return clearRemaining();
+
       const recent = this.outputBuffer.getRecent();
       const cleaned = recent.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
-      if (detectsBypassPrompt(recent)) {
+      if (!bypassAccepted && detectsBypassPrompt(recent)) {
         // Bypass permissions prompt: "No, exit" is option 1 (default highlight).
         // Press Down to move to "Yes, I accept", then Enter to confirm.
+        bypassAccepted = true;
         this.pty.write('\x1b[B\r');
-      } else if (cleaned.includes('trust') || cleaned.includes('Yes')) {
+        // The hazardous injection is spent — do not let a later timer repeat it.
+        clearRemaining();
+      } else if (!trustAccepted && cleaned.includes('trust')) {
+        trustAccepted = true;
         this.pty.write('\r');
       }
     };
     for (const ms of [2000, 5000, 8000, 12000, 18000, 25000, 35000, 50000]) {
-      setTimeout(acceptPrompt, ms);
+      timers.push(setTimeout(acceptPrompt, ms));
     }
+    // Unconditional backstop: nothing from this block may fire afterwards.
+    timers.push(setTimeout(clearRemaining, 60000));
   }
 
   /**
