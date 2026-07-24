@@ -88,7 +88,30 @@ export interface UnresolvableHandle {
  * night, carrying no health signal. Everything else (credential shapes, etc.)
  * on a screened file is incident-class and lands in blocked_text.
  */
-const POLICY_BLOCK_REASONS = new Set(['binary_or_temp', 'data_dump', 'env_format']);
+const POLICY_BLOCK_REASONS = new Set([
+  'binary_or_temp',
+  'data_dump',
+  'env_format',
+  // 'unscreenable_binary' means the CONTENT SNIFFER determined the file is
+  // binary, so the credential screen cannot read it — structurally the same
+  // situation as a .png blocked by extension (binary_or_temp), which this set
+  // already treats as policy. It was landing in the incident class purely
+  // because the classification keys off the reason string rather than the
+  // question the reason answers ("is this redactable text?" — a binary never
+  // is). Extension-blocked and sniffer-blocked binaries are one class.
+  //
+  // Measured cost of having it loud (2026-07-24): business-analyst's
+  // auto-commit exits 1 EVERY night on 58 permanently-unscreenable PDFs in its
+  // workspace. Blocking is per-file so coverage was never affected — but a
+  // standing daily red on the exact instrument that carries config into git
+  // trains every reader to wave off that instrument's status. An alarm that
+  // fires every night for a condition that can never be fixed is not an alarm.
+  //
+  // The loud class stays loud for what it was built for: a SCREENED (i.e.
+  // readable text) file whose content matched a credential shape — redactable,
+  // actionable, genuinely incident-class.
+  'unscreenable_binary',
+]);
 
 /** blocked[] entries are "<path>:<reason>"; keep only incident-class ones. */
 export function classifyBlockedText(blocked: string[]): string[] {
