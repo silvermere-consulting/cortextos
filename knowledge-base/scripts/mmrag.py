@@ -2277,12 +2277,25 @@ def cmd_collections(args):
     if not collections:
         print("No collections found.")
         return
+    # Total-first + total-last: a truncated capture (pipe, exec buffer, screen)
+    # self-announces instead of reading as a complete list. 2026-07-22: an
+    # 8-of-26 read of this output caused a fleet-wide false alarm — the defect
+    # was the SILENCE of the truncation, wherever it happened.
+    print(f"Collections: {len(collections)} total")
     print(f"{'Collection':<30} {'Documents':<12}")
     print("-" * 44)
+    shown = 0
     for c in collections:
-        col = chroma.get_collection(c.name if hasattr(c, 'name') else c)
         name = c.name if hasattr(c, 'name') else c
-        print(f"{name:<30} {col.count():<12}")
+        try:
+            col = chroma.get_collection(name)
+            print(f"{name:<30} {col.count():<12}")
+        except Exception as e:  # one bad collection must not silently end the list
+            print(f"{name:<30} ERROR: {type(e).__name__}: {e}")
+        shown += 1
+    if shown != len(collections):
+        print(f"WARNING: listed {shown} of {len(collections)} collections")
+    print(f"({shown} of {len(collections)} collections listed)")
 
 
 def cmd_delete(args):
