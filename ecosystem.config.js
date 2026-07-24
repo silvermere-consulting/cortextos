@@ -24,6 +24,11 @@ module.exports = {
         CTX_FRAMEWORK_ROOT: FRAMEWORK_ROOT,
         CTX_PROJECT_ROOT: PROJECT_ROOT,
         CTX_ORG: CTX_ORG,
+        // Pin discipline (OOM Track A): agents spawn `claude` by this absolute
+        // path (getBinaryName reads it from the daemon env), so PATH order can
+        // never surface the user-writable shadow install. /usr/bin/claude is a
+        // root-owned symlink to the known-good pinned version.
+        CTX_CLAUDE_BIN: process.env.CTX_CLAUDE_BIN || '/usr/bin/claude',
         // Debug-only: set to '1' to enable SIGUSR2 signal → controlled
         // uncaughtException for testing the crash-visibility path
         // (.daemon-crashed markers + crash-loop operator Telegram alert).
