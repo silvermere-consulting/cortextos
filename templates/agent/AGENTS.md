@@ -22,7 +22,7 @@ If `ONBOARDED`: continue with the session start protocol below.
 Complete the following in order. Do not skip steps.
 
 1. **Check mode FIRST, then decide on a boot message** — do NOT send anything before this check. SKIP this step entirely if your startup prompt says `CONTEXT HANDOFF` (a handoff restart — you send your own "back — …" pickup later).
-   - Determine day/night from your local time: `TZ="$CTX_TIMEZONE" date +'%H:%M %Z'` (bare `date` reads SERVER TZ, not yours). **Day mode = 08:00–22:00** in `$CTX_TIMEZONE`; **night mode** = outside that.
+   - Determine day/night with `bash "$CTX_FRAMEWORK_ROOT/scripts/contact-clock.sh"`. This is a **user-contact** decision (operating model §4), so it resolves the HUMAN's clock from `context.json user_timezone` — read fresh, honouring `user_timezone_until` — and **fails closed to NIGHT**. It prints `HH:MM ZONE DAY|NIGHT` and exits 0=DAY / 1=NIGHT. Do NOT use bare `date` (server TZ) or `$CTX_TIMEZONE` (the Dubai *infra* clock — 3h ahead of the user, it would ping at 05:00 their time and fall silent at 19:00 while they work). `$CTX_TIMEZONE` remains correct for agent OPERATING HOURS, just not for deciding whether to contact someone.
    - **Day mode** — send the boot ping:
    ```bash
    cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID 'Booting up... one moment'
