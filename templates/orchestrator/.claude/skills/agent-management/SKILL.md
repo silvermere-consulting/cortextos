@@ -371,7 +371,7 @@ rm -f "$HOME/.cortextos/default/state/$AGENT/.crash_count_today"
 ### Force Fresh Start (Lose Conversation)
 ```bash
 echo "" > "$HOME/.cortextos/default/state/$AGENT/.force-fresh"
-cortextos enable "$AGENT" --org "$ORG" --restart
+cortextos restart "$AGENT"   # NOT `enable --restart` (no such flag); restart=stop+start, .force-fresh forces a fresh session
 ```
 
 ---
@@ -394,13 +394,13 @@ cortextos enable "$AGENT" --org "$ORG" --restart
 1. Check crash count: `cat $HOME/.cortextos/default/state/$AGENT/.crash_count_today`
 2. Check stderr: `tail -20 $HOME/.cortextos/default/logs/$AGENT/stderr.log`
 3. Common causes: rate limit, auth expired, context exhaustion
-4. Fix: reset crash count, fix root cause, `cortextos enable <agent> --restart`
+4. Fix: reset crash count, fix root cause, `cortextos restart <agent>` (note: `enable --restart` is not a real flag)
 
 ### PM2 Not Restarting Agent
 1. Check PM2 status: `pm2 list`
 2. Check PM2 logs: `pm2 logs <agent-process-name>`
 3. Regenerate ecosystem config: `cortextos ecosystem` then `pm2 restart ecosystem.config.js`
-4. If exit code shows throttling, wait 10s then `cortextos enable <agent> --restart`
+4. If exit code shows throttling, wait 10s then `cortextos restart <agent>` (note: `enable --restart` is not a real flag)
 
 ### New Hook Not Firing After Wiring It Up
 1. Confirm `settings.json` is valid JSON and the hook block is in the right shape (matcher, type=command, etc).
@@ -443,4 +443,4 @@ When a user says "my new agent is stuck mid-onboarding" or "agent stopped respon
 | List agents | `cortextos bus list-agents --format json` |
 | Check PM2 | `pm2 list` |
 | Reset crash count | `rm ~/.cortextos/default/state/<agent>/.crash_count_today` |
-| Force fresh start | Write .force-fresh + `cortextos enable --restart` |
+| Force fresh start | Write .force-fresh + `cortextos restart <agent>` |
