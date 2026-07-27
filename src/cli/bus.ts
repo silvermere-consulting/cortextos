@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { checkRecipient, buildRefusal, priorityBodyMismatch } from '../bus/recipient-check.js';
 import { validateAgentName } from '../utils/validate.js';
@@ -19,6 +19,7 @@ import {
   slopeThresholdsFromEnv, applySlopeToAnomalies, type SlopeVerdict, type MemorySlopeAnomaly,
 } from '../bus/memory-slope.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
+import { listPendingApprovalsUnified, type UnifiedPendingItem } from '../bus/pending-approvals.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
@@ -2738,6 +2739,89 @@ busCommand
       console.log(`Total: ${approvals.length} pending`);
     } else {
       console.log(JSON.stringify(approvals, null, 2));
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// list-pending-approvals-unified — SINGLE SOURCE for the approvals surface.
+//
+// Returns pending create-approval objects UNION tasks flagged needs_approval in
+// an unresolved state (pending / in_progress / blocked). The dashboard Approvals
+// API and the orchestrator's HEARTBEAT approvals sweep BOTH call this one verb,
+// so the two-store gap cannot re-open as two drifting readers: a `--needs-approval`
+// flag mints only a task boolean and never an approval object, so a view that reads
+// only the approvals store is structurally blind to flagged tasks (engineer
+// investigation 2026-07-27 — 8 Steve-gated GOTM-outreach tasks sat invisible while
+// the page affirmed "all caught up"). One verb replaces both readers.
+//
+// THREE-VALUED CONTRACT (chief, 2026-07-27): a consumer MUST be able to tell
+// "zero pending" from "could not read" — collapsing them rebuilds the exact bug
+// (a surface affirming completeness while blind) with a new mechanism. The
+// underlying listPendingApprovals/listTasks helpers SWALLOW fs errors to [] and
+// cannot tell missing-dir from unreadable-dir, so this command enforces the
+// distinction ABOVE them:
+//   - store ROOT (orgBase, the parent tasks/ and approvals/ resolve under) absent
+//     => the path/instance/org did not resolve => THROW = cannot-read (non-zero
+//     exit). Asserting RESOLVABILITY, never POPULATION — a row-count canary would
+//     be a false all-clear for a legitimately fresh org.
+//   - root present, a substore (tasks/ or approvals/pending/) never created
+//     => legitimately EMPTY (exit 0, []).
+//   - substore exists but unreadable (EACCES etc.) => THROW = cannot-read.
+// A consumer reading [] on exit 0 knows the stores were read and were empty; a
+// non-zero exit means cannot-read and MUST render as an explicit unavailable
+// state, never "all caught up".
+// ---------------------------------------------------------------------------
+
+busCommand
+  .command('list-pending-approvals-unified')
+  .description('Pending approvals UNION needs_approval-flagged unresolved tasks — single source for the approvals surface (dashboard + orchestrator sweep both call this)')
+  .option('--format <fmt>', 'Output format: json|text', 'json')
+  .option('--all-orgs', 'Scan all orgs under CTX_ROOT (matches dashboard view)', false)
+  .action((opts: { format?: string; allOrgs?: boolean }) => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { homedir } = require('os');
+    const env = resolveEnv();
+
+    let items: UnifiedPendingItem[] = [];
+    try {
+      if (opts.allOrgs) {
+        const ctxRoot = join(homedir(), '.cortextos', env.instanceId);
+        const orgsDir = join(ctxRoot, 'orgs');
+        const orgs: string[] = existsSync(orgsDir)
+          ? readdirSync(orgsDir, { withFileTypes: true })
+              .filter((d) => d.isDirectory())
+              .map((d) => d.name)
+          : [];
+        for (const org of orgs) {
+          const orgPaths = resolvePaths(env.agentName, env.instanceId, org);
+          items = items.concat(listPendingApprovalsUnified(orgPaths));
+        }
+      } else {
+        const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+        items = listPendingApprovalsUnified(paths);
+      }
+    } catch (err) {
+      // cannot-read: exit non-zero so no consumer can read this as "empty".
+      console.error(`list-pending-approvals-unified: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+
+    items.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+    if (opts.format === 'text') {
+      if (items.length === 0) {
+        console.log('No pending approvals or flagged tasks');
+        return;
+      }
+      for (const it of items) {
+        console.log(`[${it.id}] (${it.source}) ${it.title}`);
+        console.log(`  Status: ${it.status} | Agent: ${it.agent} | Org: ${it.org} | Category: ${it.category} | Created: ${it.created_at}`);
+      }
+      const nApprovals = items.filter((i) => i.source === 'approval').length;
+      const nTasks = items.filter((i) => i.source === 'flagged_task').length;
+      console.log(`\nTotal: ${items.length} awaiting approval (${nApprovals} approval objects + ${nTasks} flagged tasks)`);
+    } else {
+      console.log(JSON.stringify(items, null, 2));
     }
   });
 

@@ -80,6 +80,31 @@ export interface Task {
 export type ApprovalCategory = 'deployment' | 'cost' | 'access' | 'other';
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
+/**
+ * A row in the single-source approvals feed (GET /api/approvals/unified):
+ * a pending approval object OR a needs_approval-flagged unresolved task,
+ * normalised to one shape. Mirrors the bus `UnifiedPendingItem` the CLI verb
+ * returns. See src/bus/pending-approvals.ts for why both stores are unioned.
+ */
+export interface UnifiedPendingItem {
+  source: 'approval' | 'flagged_task';
+  id: string;
+  title: string;
+  status: string;
+  created_at: string;
+  org: string;
+  /** requesting_agent for approvals; assigned_to for flagged tasks. */
+  agent: string;
+  category: string;
+  description: string;
+}
+
+/** Three-valued result of the unified approvals fetch — items / none / cannot-read. */
+export type UnifiedApprovalsFeed =
+  | { status: 'loading' }
+  | { status: 'ok'; items: UnifiedPendingItem[] }
+  | { status: 'error'; reason: string };
+
 export interface Approval {
   id: string;
   title: string;
