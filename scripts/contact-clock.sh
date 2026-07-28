@@ -81,7 +81,12 @@ try {
 # function's job is to be noticed, not to be load-bearing. A clock that refuses
 # to tell the time because it could not send a message is worse than the drift.
 announce_flip_if_changed() {
-  local statedir="${CTX_ROOT:-$HOME/.cortextos/default}/state"
+  # State dir is env-overridable so a CONTROL TEST of this alarming arm can point at a SCRATCH
+  # dir and never consume/misfire the real one-shot (added 2026-07-28: chief's flip-simulation
+  # wrote Asia/Dubai into the live .contact-clock-zone and, unrestored, tomorrow's genuine flip
+  # would have found last==new and SILENTLY NOT FIRED — disarming the one-shot for the one day it
+  # matters, while testing the fix for that day). Route the STATE away from live, not just the send.
+  local statedir="${CONTACT_CLOCK_STATE_DIR:-${CTX_ROOT:-$HOME/.cortextos/default}/state}"
   local zonefile="$statedir/.contact-clock-zone"
   local lockdir="$statedir/.contact-clock-zone.lock"
   [ -d "$statedir" ] || return 0
