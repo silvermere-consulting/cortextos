@@ -168,10 +168,6 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 - Screen Recording + Accessibility permissions granted
 - `peekaboo learn` for full usage guide
 
-### gogcli (Google Workspace)
-- Binary: `gog` (v0.12.0 at `/opt/homebrew/bin/gog`)
-- Gmail, Calendar, Drive, Contacts, Tasks, Sheets, Docs
-- Accounts: configure your Google accounts in your agent's `.env` or org `secrets.env`
-- `gog gmail search "query" --max 10 -a you@gmail.com`
-- `gog calendar ls -a you@gmail.com --max 5`
-- Use `gog` instead of Gmail/Calendar MCP — more capable (send, archive, labels)
+### Google Workspace (Gmail / Calendar / Drive)
+- **`gogcli` / `gog` is NOT installed on this fleet** — an earlier version of this block advertised a `gog` binary that is absent on this Linux host; `gog` commands will fail, do not use them.
+- For Google Workspace, use the **Gmail / Google Calendar / Google Drive MCP tools** where they are connected for your agent. If they are not connected for you, Google Workspace access is unavailable for you — say so rather than reaching for `gog`.

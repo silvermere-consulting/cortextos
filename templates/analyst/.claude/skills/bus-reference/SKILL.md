@@ -159,7 +159,7 @@ Examples:
 cortextos bus log-event heartbeat agent_heartbeat info --meta '{"agent":"'$CTX_AGENT_NAME'"}'
 cortextos bus log-event task task_completed info --meta '{"task_id":"task_abc123","summary":"Deployed site"}'
 cortextos bus log-event error deploy_failed error --meta '{"repo":"website","error":"build timeout"}'
-cortextos bus log-event work research_complete info --meta '{"topic":"competitor analysis","findings":3}'
+cortextos bus log-event action research_complete info --meta '{"topic":"competitor analysis","findings":3}'
 ```
 
 ---
