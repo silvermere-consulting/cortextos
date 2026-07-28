@@ -102,17 +102,48 @@ async function fetchFresh(): Promise<QuotaSnapshot | null> {
     sevenDayUtilization?: number;
   };
 
-  const normalize = (v: number | undefined): number => {
-    if (v === undefined || v === null) return 0;
-    return v > 1 ? v / 100 : v;
+  // ── DO NOT INFER A UNIT FROM A VALUE. ────────────────────────────────────
+  // This used to read `v > 1 ? v / 100 : v` — guessing "is this a percent or a
+  // fraction?" from the magnitude. THAT IS UNSOUND BY CONSTRUCTION: the two
+  // ranges OVERLAP on [0,1]. `1.0` is both "1%" and "100%", and no threshold
+  // can separate them.
+  //
+  // It failed exactly where it hurt most — when usage is LOW, which is the
+  // normal state right after a window resets:
+  //     utilization 1.0 (=1% used)   -> read as 100% used -> "0% REMAINING"
+  //     utilization 0.8 (=0.8% used) -> read as  80% used -> "20% remaining"
+  // i.e. the gauge screamed EMPTY on a quota that was untouched. A gauge that
+  // panics at reset time is the same disease as one that flatters at exhaustion:
+  // it is a number with no ground truth. We retired one of those tonight.
+  //
+  // Every field below comes from the Anthropic usage API, which reports a
+  // PERCENTAGE (0–100): { five_hour: { utilization: 77.0 } }. So we convert by
+  // SOURCE, which we know, rather than by magnitude, which we are guessing.
+  // (Our own state/usage/api-latest.json stores a 0–1 FRACTION under the same
+  // field NAME. Same name, different unit, different producer — which is the
+  // trap that produced this bug. Do not read the two through one function.)
+  //
+  // Out of range => the shape is not what we think it is. REFUSE, do not guess:
+  // a wrong quota number is worse than a missing one, because a missing one
+  // gets investigated and a wrong one gets ACTED ON.
+  const PCT_FROM_API = (v: number | undefined): number | null => {
+    if (v === undefined || v === null || Number.isNaN(v)) return null;
+    if (v < 0 || v > 100) return null;
+    return v / 100;
   };
 
-  const fiveH = normalize(
+  const fiveH = PCT_FROM_API(
     data.five_hour?.utilization ?? data.five_hour_utilization ?? data.fiveHourUtilization,
   );
-  const sevenD = normalize(
+  const sevenD = PCT_FROM_API(
     data.seven_day?.utilization ?? data.seven_day_utilization ?? data.sevenDayUtilization,
   );
+
+  // A missing number, never a wrong one. If either reading is unusable we return
+  // null and the caller falls back to last-good / shows nothing — it does NOT
+  // silently render 100% remaining, which is what the old `?? 0` default did and
+  // is precisely the "stuck at 100%" bug the comment above describes.
+  if (fiveH === null || sevenD === null) return null;
 
   return {
     five_hour_remaining_pct: Math.round((1 - fiveH) * 100),
