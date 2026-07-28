@@ -55,6 +55,22 @@ export function getGoals(org: string): GoalsData {
 
 /**
  * Atomic write of goals.json for an org (write to tmp, then rename).
+ *
+ * PRESERVE-MERGE: reads the existing file and spreads it UNDER `data`, so keys
+ * that GoalsData does not model — `north_star` today, and any field added to
+ * goals.json in future — survive a dashboard write instead of being stripped.
+ * (Before this, the server-action path `getGoals -> mutate -> writeGoals`
+ * JSON.stringify'd only the four GoalsData fields, silently deleting north_star
+ * and never stamping updated_at — see othe's bug report 2026-07-28.) Also
+ * (re-)stamps `updated_at`, matching the CLI writer (src/cli/goals.ts) and the
+ * PATCH route (app/api/goals/route.ts) so all three writers leave the same shape.
+ *
+ * BOUND — ADDITIVE-ONLY: `{ ...existing, ...data }` can add or overwrite a key
+ * but CANNOT delete one. Any key ever written to goals.json becomes immortal via
+ * this path. Safe today: the dashboard has no delete-key operation on goals. If a
+ * future dashboard feature needs to REMOVE a top-level goals.json key, it must not
+ * rely on writeGoals — this merge would silently no-op the deletion (a silent
+ * no-op in place of the old silent strip: same class, opposite sign).
  */
 export function writeGoals(org: string, data: GoalsData): void {
   const filePath = getGoalsPath(org);
@@ -62,8 +78,28 @@ export function writeGoals(org: string, data: GoalsData): void {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
+
+  // Preserve keys not modelled by GoalsData (north_star, future additions).
+  let existing: Record<string, unknown> = {};
+  if (fs.existsSync(filePath)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    } catch {
+      // Corrupt/unparseable existing file: fall back to a clean write of `data`.
+      existing = {};
+    }
+  }
+
+  // Overlay only DEFINED fields from `data`, so an undefined optional (e.g.
+  // daily_focus) never clobbers a value already on disk — mirrors the PATCH
+  // route's "only apply provided fields" semantics.
+  const overlay = Object.fromEntries(
+    Object.entries(data).filter(([, v]) => v !== undefined),
+  );
+  const merged = { ...existing, ...overlay, updated_at: new Date().toISOString() };
+
   const tmp = path.join(os.tmpdir(), `goals-${org}-${Date.now()}.json`);
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
   fs.renameSync(tmp, filePath);
 }
 
