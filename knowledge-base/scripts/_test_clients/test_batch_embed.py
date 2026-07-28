@@ -25,8 +25,25 @@ PARENT = os.path.dirname(HERE)
 if PARENT not in sys.path:
     sys.path.insert(0, PARENT)
 
+# These scenarios exercise the GEMINI batch-REST path (they monkey-patch _call_batch_embed_rest
+# and assert on REST call counts). mmrag reads EMBEDDING_BACKEND ONCE at import, so it must be
+# pinned BEFORE the import below.
+#
+# It used to be left ambient. That was invisible while the fleet default was 'gemini' — but the
+# 2026-07-11 fleet flip to EMBEDDING_BACKEND=local exported 'local' into every agent's env, and
+# embed_contents_batch then took its local ONNX branch: zero REST calls, so all five scenarios
+# went red while testing a path they were never written to test. A test whose MEANING depends on
+# ambient env is not a test. The local branch deserves its own coverage; it must not silently
+# hijack this one.
+os.environ["EMBEDDING_BACKEND"] = "gemini"
+
 import mmrag
 from _test_clients import fault_injection
+
+assert mmrag.EMBEDDING_BACKEND == "gemini", (
+    f"expected the gemini batch path, got EMBEDDING_BACKEND={mmrag.EMBEDDING_BACKEND!r} — "
+    "these scenarios assert on REST calls the local ONNX branch never makes"
+)
 
 
 FAILURES = []
