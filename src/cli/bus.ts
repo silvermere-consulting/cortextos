@@ -3765,7 +3765,7 @@ busCommand
           // Log to event bus
           if (!opts.dryRun) {
             try {
-              logEvent(paths, env.agentName, env.org, 'agent_activity' as any, 'tool_call', 'info', {
+              logEvent(paths, env.agentName, env.org, 'action', 'tool_call', 'info', {
                 line: trimmed,
                 session: sessionName,
                 high_signal: isHighSignal,
