@@ -4,6 +4,7 @@ import {
   parseClaudeVersion,
   readClaudeVersion,
   checkClaudePinFromEnv,
+  AUTHORISED_CLAUDE_VERSION,
 } from '../../../src/daemon/claude-pin';
 
 /**
@@ -71,23 +72,49 @@ describe('readClaudeVersion (injectable runner)', () => {
 });
 
 describe('checkClaudePinFromEnv (env wiring)', () => {
-  it('resolves bin + expected from env and matches (the boot known-positive)', () => {
+  it('reads the bin UNDER TEST from env and matches the hardcoded reference (boot known-positive)', () => {
     const env = {
       CTX_CLAUDE_BIN: '/home/x/.local/share/claude-code/2.1.219/claude.exe',
-      CTX_CLAUDE_VERSION_EXPECTED: '2.1.219',
     } as NodeJS.ProcessEnv;
     const r = checkClaudePinFromEnv(env, () => '2.1.219 (Claude Code)');
     expect(r.ok).toBe(true);
     expect(r.resolvedBin).toBe(env.CTX_CLAUDE_BIN);
+    expect(r.expectedVersion).toBe(AUTHORISED_CLAUDE_VERSION);
   });
 
   it('flags the exact 2026-07-29 revert: stale bin resolves to 2.1.141', () => {
     const env = {
       CTX_CLAUDE_BIN: '/usr/bin/claude',
-      CTX_CLAUDE_VERSION_EXPECTED: '2.1.219',
     } as NodeJS.ProcessEnv;
     const r = checkClaudePinFromEnv(env, () => '2.1.141 (Claude Code)');
     expect(r.ok).toBe(false);
     expect(r.reason).toContain('PIN MISMATCH');
+  });
+
+  // DEFECT 1 (env on both sides): a stale dump.pm2 carrying BOTH a wrong bin AND
+  // a matching wrong CTX_CLAUDE_VERSION_EXPECTED must NOT satisfy the guard. The
+  // expectation is the hardcoded constant, so env cannot forge agreement.
+  it('env cannot supply a fake expectation: stale bin + matching stale expected still fails', () => {
+    const env = {
+      CTX_CLAUDE_BIN: '/usr/bin/claude',
+      CTX_CLAUDE_VERSION_EXPECTED: '2.1.141',
+    } as NodeJS.ProcessEnv;
+    const r = checkClaudePinFromEnv(env, () => '2.1.141 (Claude Code)');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('PIN MISMATCH');
+    expect(r.expectedVersion).toBe(AUTHORISED_CLAUDE_VERSION);
+  });
+
+  // DEFECT 2 (unset disarms): absence is the default state of an env var nobody
+  // exported — it must NOT drop the guard to observability-only. The guard stays
+  // armed on the hardcoded reference regardless of what env omits.
+  it('stays armed when CTX_CLAUDE_VERSION_EXPECTED is absent from env', () => {
+    const env = {
+      CTX_CLAUDE_BIN: '/usr/bin/claude',
+    } as NodeJS.ProcessEnv;
+    const r = checkClaudePinFromEnv(env, () => '2.1.141 (Claude Code)');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('PIN MISMATCH');
+    expect(r.expectedVersion).toBe(AUTHORISED_CLAUDE_VERSION);
   });
 });

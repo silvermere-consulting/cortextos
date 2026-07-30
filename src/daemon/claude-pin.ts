@@ -18,6 +18,24 @@ import { execFileSync } from 'child_process';
  * is strictly better than a dead fleet, and the loud page ensures a human sees it.
  */
 
+/**
+ * The authorised Claude Code version — the REFERENCE the guard compares against.
+ *
+ * HARDCODED on purpose, never read from env. The guard exists to detect a
+ * compromised / stale environment, so the expectation it measures against must
+ * not come from that same environment: if it did, an inherited state could
+ * satisfy the guard by supplying BOTH a wrong binary (CTX_CLAUDE_BIN) AND a
+ * matching wrong expectation (CTX_CLAUDE_VERSION_EXPECTED) — the `||` precedence
+ * defect run backwards, and a guard keyed on something its adversary can write
+ * is not a guard. The OBSERVATION (resolvedBin, actualVersion) still reads env,
+ * because that IS the fact under test; only the REFERENCE must be independent.
+ *
+ * MUST equal CLAUDE_VERSION in ecosystem.config.js. Rolling the pin means
+ * editing BOTH files — a deliberate two-place cost that buys an independent
+ * cross-check: divergence pages instead of silently trusting env.
+ */
+export const AUTHORISED_CLAUDE_VERSION = '2.1.219';
+
 export interface PinCheck {
   resolvedBin: string;
   actualVersion: string | null;
@@ -92,16 +110,20 @@ function defaultVersionRunner(bin: string): string {
 }
 
 /**
- * Resolve the pinned binary + expected version from the daemon env, read the
- * actual version, and classify. This is the thin env-reading wrapper around the
- * pure `evaluateClaudePin`; the boot wiring logs the reason and pages on !ok.
+ * Resolve the binary UNDER TEST from the daemon env, read its actual version,
+ * and classify against the hardcoded {@link AUTHORISED_CLAUDE_VERSION}.
+ *
+ * The expectation is deliberately NOT taken from env (see AUTHORISED_CLAUDE_VERSION):
+ * `resolvedBin` is the observation, so it reads env; the version it's checked
+ * against is the fixed reference, so it does not. This also means the guard is
+ * always ARMED — there is no "expectation unset" state that a missing env var
+ * could use to disarm it into observability-only.
  */
 export function checkClaudePinFromEnv(
   env: NodeJS.ProcessEnv = process.env,
   runner?: (bin: string) => string,
 ): PinCheck {
   const resolvedBin = env.CTX_CLAUDE_BIN || 'claude';
-  const expectedVersion = env.CTX_CLAUDE_VERSION_EXPECTED || null;
   const actualVersion = readClaudeVersion(resolvedBin, runner);
-  return evaluateClaudePin(resolvedBin, actualVersion, expectedVersion);
+  return evaluateClaudePin(resolvedBin, actualVersion, AUTHORISED_CLAUDE_VERSION);
 }
