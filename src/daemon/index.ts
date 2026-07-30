@@ -2,6 +2,7 @@ import { AgentManager } from './agent-manager.js';
 import { IPCServer } from './ipc-server.js';
 import { FrozenTurnWatchdog, type FrozenTurnDetail } from './frozen-turn-watchdog.js';
 import { pageOperator, validateOperatorChat } from './operator-page.js';
+import { checkClaudePinFromEnv } from './claude-pin.js';
 import { CredentialRefresher, buildCredentialGate } from './credential-refresh.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { spawnSync } from 'child_process';
@@ -288,6 +289,23 @@ class Daemon {
       try {
         chmodSync(pidFile, 0o600);
       } catch { /* best effort */ }
+    }
+
+    // Boot-time claude pin guard (task_1785377221211). Runs BEFORE agents spawn,
+    // since agents inherit CTX_CLAUDE_BIN. Logs the resolved binary + its actual
+    // --version — the known-positive that makes "which version are agents on"
+    // answerable from the boot log instead of /proc archaeology — and pages the
+    // operator loudly on a mismatch. Never exits: a fleet on the wrong version
+    // beats a dead fleet, and the page ensures a human sees it.
+    try {
+      const pin = checkClaudePinFromEnv();
+      console.log(`[daemon] [pin] ${pin.reason}`);
+      if (!pin.ok) {
+        console.error(`[daemon] [pin] CRITICAL — ${pin.reason}`);
+        pageOperator(frameworkRoot, `Claude pin check FAILED at daemon boot: ${pin.reason}`, 'claude-pin');
+      }
+    } catch (err) {
+      console.error(`[daemon] [pin] pin check threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     }
 
     // Create agent manager
