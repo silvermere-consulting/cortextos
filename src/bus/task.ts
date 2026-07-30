@@ -297,6 +297,7 @@ export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
+  agentName: string,
   note?: string,
   dueDate?: string,
 ): void {
@@ -310,12 +311,10 @@ export function updateTask(
   // re-wrapped as "update failed". undefined = leave unchanged; '' = clear.
   const normalizedDue = dueDate !== undefined ? (dueDate ? parseDueDate(dueDate) : null) : undefined;
   let prevStatus: TaskStatus | undefined;
-  let assignee: string | undefined;
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
-    assignee = task.assigned_to;
     task.status = status;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     if (note) {
@@ -335,8 +334,41 @@ export function updateTask(
   }
   // note: undefined is dropped by JSON.stringify, so a note-less update stays
   // note-absent in the JSONL rather than carrying an empty field.
-  appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status, note });
+  // agent = the CALLING agent (actor), NOT task.assigned_to. Stamping the
+  // assignee here (the pre-2026-07-30 defect) launders one agent's action into
+  // the owner's voice and makes every task look self-serviced.
+  appendTaskAudit(paths, taskId, { event: 'update', agent: agentName, from: prevStatus, to: status, note });
 }
+
+/**
+ * Audit schema version. Bumped to 2 on the 2026-07-30 provenance fix, when
+ * updateTask/completeTask were corrected to stamp the CALLING agent (the actor)
+ * instead of the task's assigned_to (the assignee). appendTaskAudit stamps this
+ * on EVERY row it writes, so the version travels with the datum it describes.
+ *
+ * Reading provenance by version:
+ *  - v >= 2         : `agent` is the true ACTOR for every event type.
+ *  - v absent / < 2 : pre-cutover row. `agent` was always the actor for
+ *    create/claim, but is the ASSIGNEE (not the actor) for update/complete, and
+ *    the real actor is unrecoverable. No backfill is possible or attempted.
+ */
+export const AUDIT_SCHEMA_VERSION = 2;
+
+/**
+ * The instant the v2 (actor-stamping) code STARTS RUNNING in production — the
+ * SINGLE source of truth for the pre-cutover vs. post-cutover boundary. Readers
+ * import this constant; they must never copy the date, or they create a second
+ * source of truth that silently drifts (the reason we did not add a marker file).
+ *
+ * It defaults to a far-future sentinel so the "chokepoint bypassed" alarm CANNOT
+ * fire before the value is armed: until then every v-less row is treated as
+ * harmless pre-cutover history. The DEPLOY step sets this to the real deploy
+ * instant; only after that does a v-less row dated AFTER it become a live alarm.
+ * Setting it to the commit time would fire false positives on every
+ * legitimately-pre-fix row written in the commit->deploy gap, and an alarm whose
+ * first act is a burst of false positives gets muted.
+ */
+export const AUDIT_V2_CUTOVER_ISO = '2099-01-01T00:00:00Z'; // TODO(deploy): set to the real deploy instant
 
 /**
  * One audit entry written to a task's append-only JSONL log. Every
@@ -346,10 +378,11 @@ export function updateTask(
 export interface TaskAuditEntry {
   ts: string; // ISO 8601
   event: 'create' | 'claim' | 'update' | 'complete';
-  agent: string; // who caused the event
+  agent: string; // who caused the event (the ACTOR, for v>=2 rows)
   from?: TaskStatus;
   to?: TaskStatus;
   note?: string;
+  v?: number; // audit schema version; absent = pre-v2 (see AUDIT_SCHEMA_VERSION)
 }
 
 /**
@@ -373,6 +406,10 @@ export function appendTaskAudit(
     const line: TaskAuditEntry = {
       ts: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
       ...entry,
+      // Stamped after the spread so a caller can never override it: the chokepoint,
+      // not the caller, decides the schema version. This is what makes a v-less row
+      // written after the cutover a detectable bypass rather than an ambiguity.
+      v: AUDIT_SCHEMA_VERSION,
     };
     appendFileSync(join(auditDir, `${taskId}.jsonl`), JSON.stringify(line) + '\n', { encoding: 'utf-8', mode: 0o600 });
   } catch {
@@ -595,6 +632,7 @@ export function reassignTask(
 export function completeTask(
   paths: BusPaths,
   taskId: string,
+  agentName: string,
   result?: string,
 ): void {
   const filePath = findTaskFile(paths, taskId);
@@ -622,7 +660,10 @@ export function completeTask(
   } catch (err) {
     throw new Error(`Task ${taskId} complete failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'complete', agent: assignee || 'unknown', from: prevStatus, to: 'completed', note: result });
+  // agent = the CALLING agent (actor), NOT task.assigned_to — same fix as
+  // updateTask. assignee is still used below for the activity-feed event, which
+  // is a separate attribution surface (who owns the completion on the feed).
+  appendTaskAudit(paths, taskId, { event: 'complete', agent: agentName, from: prevStatus, to: 'completed', note: result });
 
   // Activity-feed event. Best-effort — the task is already persisted.
   if (assignee) {

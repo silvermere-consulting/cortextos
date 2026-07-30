@@ -324,7 +324,7 @@ describe('Advanced Task Management', () => {
 
     it('persists a note onto task.notes, timestamp-prefixed', () => {
       createBackdatedTask(paths, { id: 'task_030_030', status: 'pending' });
-      updateTask(paths, 'task_030_030', 'in_progress', 'started the work');
+      updateTask(paths, 'task_030_030', 'in_progress', 'engineer', 'started the work');
 
       const task = readTask('task_030_030');
       expect(task.notes).toBeDefined();
@@ -335,8 +335,8 @@ describe('Advanced Task Management', () => {
 
     it('appends successive notes newest-last, newline-separated', () => {
       createBackdatedTask(paths, { id: 'task_031_031', status: 'pending' });
-      updateTask(paths, 'task_031_031', 'in_progress', 'first note');
-      updateTask(paths, 'task_031_031', 'blocked', 'second note');
+      updateTask(paths, 'task_031_031', 'in_progress', 'engineer', 'first note');
+      updateTask(paths, 'task_031_031', 'blocked', 'engineer', 'second note');
 
       const task = readTask('task_031_031');
       const lines = (task.notes ?? '').split('\n');
@@ -347,7 +347,7 @@ describe('Advanced Task Management', () => {
 
     it('leaves notes absent when no note is supplied', () => {
       createBackdatedTask(paths, { id: 'task_032_032', status: 'pending' });
-      updateTask(paths, 'task_032_032', 'in_progress');
+      updateTask(paths, 'task_032_032', 'in_progress', 'engineer');
 
       const task = readTask('task_032_032');
       expect(task.notes).toBeUndefined();
@@ -355,9 +355,9 @@ describe('Advanced Task Management', () => {
 
     it('preserves an existing note when a later update omits one', () => {
       createBackdatedTask(paths, { id: 'task_033_033', status: 'pending' });
-      updateTask(paths, 'task_033_033', 'in_progress', 'only note');
+      updateTask(paths, 'task_033_033', 'in_progress', 'engineer', 'only note');
       const afterFirst = readTask('task_033_033').notes;
-      updateTask(paths, 'task_033_033', 'completed');
+      updateTask(paths, 'task_033_033', 'completed', 'engineer');
 
       expect(readTask('task_033_033').notes).toBe(afterFirst);
     });

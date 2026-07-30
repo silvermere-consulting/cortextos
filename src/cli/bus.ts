@@ -5,7 +5,7 @@ import { join, dirname } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { checkRecipient, buildRefusal, priorityBodyMismatch } from '../bus/recipient-check.js';
 import { validateAgentName } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, reassignTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile, parseTaskStatus } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, reassignTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile, parseTaskStatus, AUDIT_V2_CUTOVER_ISO } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -242,7 +242,11 @@ busCommand
     }
 
     try {
-      updateTask(paths, id, status as TaskStatus, opts.note, opts.due);
+      // env.agentName = the ACTOR: the real agent for a CLI call, and 'dashboard'
+      // when the dashboard shells out (it sets CTX_AGENT_NAME='dashboard'). Either
+      // way the audit row names who acted, never the assignee. It is placed BEFORE
+      // the optional note/due so the actor can never be defaulted or omitted.
+      updateTask(paths, id, status as TaskStatus, env.agentName, opts.note, opts.due);
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
@@ -330,7 +334,26 @@ busCommand
     for (const e of entries) {
       const transition = e.from && e.to ? `${e.from} -> ${e.to}` : e.to || '';
       const note = e.note ? ` | ${e.note}` : '';
-      console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${transition}${note}`);
+      // A row is pre-v2 iff it carries no schema version. v2 is the first
+      // versioned schema (it is the fix that made `agent` the true actor for
+      // update/complete), so an absent `v` means the old actor-laundering
+      // schema — never a newer one.
+      const preV2 = e.v === undefined;
+      let provenance = '';
+      if (preV2) {
+        if (e.ts > AUDIT_V2_CUTOVER_ISO) {
+          // LOUD: a v-less row written AFTER the cutover means the audit
+          // chokepoint (appendTaskAudit, which stamps v) was bypassed — the
+          // `agent` value here has unknown provenance and must not be trusted.
+          provenance = '  ⚠️  ANOMALY: unversioned row after v2 cutover — audit chokepoint bypassed, actor UNTRUSTED';
+        } else if (e.event === 'update' || e.event === 'complete') {
+          // QUIET: legitimate pre-cutover update/complete rows stamped the
+          // ASSIGNEE, not the actor. The real actor is unrecoverable (no
+          // backfill), so flag `agent` as unverified without alarming.
+          provenance = '  (actor unverified — pre-v2 row, agent shown is the assignee)';
+        }
+      }
+      console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${transition}${note}${provenance}`);
     }
   });
 
@@ -378,7 +401,7 @@ busCommand
       }
     }
 
-    completeTask(paths, id, effectiveResult);
+    completeTask(paths, id, env.agentName, effectiveResult);
     console.log(`Completed ${id}`);
   });
 

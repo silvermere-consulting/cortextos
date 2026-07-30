@@ -122,12 +122,12 @@ test.describe('Task JSON format (dashboard sync compatibility)', () => {
     const taskId = createTask(paths, 'testbot', 'test-org', 'Test task');
     const taskFile = join(paths.taskDir, `${taskId}.json`);
 
-    updateTask(paths, taskId, 'in_progress');
+    updateTask(paths, taskId, 'in_progress', 'testbot');
     let task = JSON.parse(readFileSync(taskFile, 'utf-8'));
     expect(task.status).toBe('in_progress');
     expect(task.updated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 
-    completeTask(paths, taskId, 'Done');
+    completeTask(paths, taskId, 'testbot', 'Done');
     task = JSON.parse(readFileSync(taskFile, 'utf-8'));
     expect(task.status).toBe('done');
     expect(task.completed_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);

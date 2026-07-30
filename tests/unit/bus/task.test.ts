@@ -65,7 +65,7 @@ describe('Task Management', () => {
   describe('updateTask', () => {
     it('updates task status', () => {
       const taskId = createTask(paths, 'paul', 'acme', 'Test task');
-      updateTask(paths, taskId, 'in_progress');
+      updateTask(paths, taskId, 'in_progress', 'paul');
 
       const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
       expect(content.status).toBe('in_progress');
@@ -75,7 +75,7 @@ describe('Task Management', () => {
   describe('completeTask', () => {
     it('sets status to completed and completed_at', () => {
       const taskId = createTask(paths, 'paul', 'acme', 'Test task');
-      completeTask(paths, taskId, 'Landing page done, committed at abc123');
+      completeTask(paths, taskId, 'paul', 'Landing page done, committed at abc123');
 
       const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
       expect(content.status).toBe('completed');
@@ -87,7 +87,7 @@ describe('Task Management', () => {
       const taskId = createTask(paths, 'paul', 'acme', 'Complete-event task', {
         assignee: 'boris',
       });
-      completeTask(paths, taskId, 'shipped');
+      completeTask(paths, taskId, 'boris', 'shipped');
 
       // Event file: <analyticsDir>/events/boris/<YYYY-MM-DD>.jsonl
       const today = new Date().toISOString().split('T')[0];
@@ -131,7 +131,7 @@ describe('Task Management', () => {
     it('filters by status', () => {
       const id1 = createTask(paths, 'paul', 'acme', 'Task 1');
       createTask(paths, 'paul', 'acme', 'Task 2');
-      updateTask(paths, id1, 'completed');
+      updateTask(paths, id1, 'completed', 'paul');
 
       const pending = listTasks(paths, { status: 'pending' });
       expect(pending.length).toBe(1);
@@ -219,7 +219,7 @@ describe('Cross-org task lifecycle', () => {
     // Regression guard for the existing single-org behavior. This is the
     // hot path and must not pay any cross-org scan cost when it hits.
     const taskId = createTask(orgAPaths, 'agentA', 'OrgA', 'Same-org task');
-    updateTask(orgAPaths, taskId, 'in_progress');
+    updateTask(orgAPaths, taskId, 'in_progress', 'agentA');
 
     const content = JSON.parse(
       readFileSync(join(orgAPaths.taskDir, `${taskId}.json`), 'utf-8'),
@@ -234,7 +234,7 @@ describe('Cross-org task lifecycle', () => {
     const taskId = 'task_test_001';
     writeOrgBTask(taskId);
 
-    updateTask(orgAPaths, taskId, 'in_progress');
+    updateTask(orgAPaths, taskId, 'in_progress', 'agentA');
 
     // Verify the OrgB file got updated, NOT the (nonexistent) OrgA file.
     const orgBContent = JSON.parse(
@@ -252,7 +252,7 @@ describe('Cross-org task lifecycle', () => {
   });
 
   it('updateTask not found anywhere: throws with a clear error naming ctxRoot', () => {
-    expect(() => updateTask(orgAPaths, 'task_999_000', 'in_progress')).toThrow(
+    expect(() => updateTask(orgAPaths, 'task_999_000', 'in_progress', 'agentA')).toThrow(
       /not found in any org under .*\/orgs\//,
     );
   });
@@ -261,7 +261,7 @@ describe('Cross-org task lifecycle', () => {
     const taskId = 'task_test_002';
     writeOrgBTask(taskId);
 
-    completeTask(orgAPaths, taskId, 'cross-org completion');
+    completeTask(orgAPaths, taskId, 'agentA', 'cross-org completion');
 
     const orgBContent = JSON.parse(
       readFileSync(join(orgBTaskDir, `${taskId}.json`), 'utf-8'),
@@ -402,7 +402,7 @@ describe('claimTask — atomic claim (beads-inspired)', () => {
 
   it('rejects claim on a non-pending task with a clear status message', () => {
     const id = createTask(paths, 'alice', 'acme', 'Already done');
-    updateTask(paths, id, 'completed');
+    updateTask(paths, id, 'completed', 'alice');
     expect(() => claimTask(paths, id, 'alice')).toThrow(/not pending.*status=completed/);
   });
 
@@ -493,7 +493,7 @@ describe('Task audit log (append-only JSONL)', () => {
   it('full lifecycle records create + claim + complete in order', () => {
     const id = createTask(paths, 'alice', 'acme', 'Lifecycle');
     claimTask(paths, id, 'alice');
-    completeTask(paths, id, 'shipped');
+    completeTask(paths, id, 'alice', 'shipped');
 
     const log = readTaskAudit(paths, id);
     expect(log.map(e => e.event)).toEqual(['create', 'claim', 'complete']);
@@ -505,25 +505,29 @@ describe('Task audit log (append-only JSONL)', () => {
     expect(log[2].note).toBe('shipped');
   });
 
-  it('updateTask audit captures from->to transition with assignee as agent', () => {
+  it('updateTask audit captures from->to transition with the ACTOR (not the assignee) as agent', () => {
+    // The task is assigned to alice, but carol is the one driving the
+    // transitions. The audit must name carol — stamping alice here was the
+    // pre-v2 defect that laundered carol's action into alice's voice.
     const id = createTask(paths, 'alice', 'acme', 'Updatable', { assignee: 'alice' });
-    updateTask(paths, id, 'blocked');
-    updateTask(paths, id, 'pending');
+    updateTask(paths, id, 'blocked', 'carol');
+    updateTask(paths, id, 'pending', 'carol');
 
     const log = readTaskAudit(paths, id);
     expect(log.length).toBe(3); // create + 2 updates
     expect(log[1].event).toBe('update');
     expect(log[1].from).toBe('pending');
     expect(log[1].to).toBe('blocked');
-    expect(log[1].agent).toBe('alice');
+    expect(log[1].agent).toBe('carol');
     expect(log[2].from).toBe('blocked');
     expect(log[2].to).toBe('pending');
+    expect(log[2].agent).toBe('carol');
   });
 
   it('updateTask plumbs an optional note into the audit entry (the field create/complete already use)', () => {
     const id = createTask(paths, 'alice', 'acme', 'Noted', { assignee: 'alice' });
-    updateTask(paths, id, 'blocked', 'waiting on appr_123 — retracted off-box claim');
-    updateTask(paths, id, 'pending');
+    updateTask(paths, id, 'blocked', 'alice', 'waiting on appr_123 — retracted off-box claim');
+    updateTask(paths, id, 'pending', 'alice');
 
     const log = readTaskAudit(paths, id);
     expect(log[1].event).toBe('update');
@@ -537,7 +541,7 @@ describe('Task audit log (append-only JSONL)', () => {
     const id = createTask(paths, 'alice', 'acme', 'Append proof');
     const path = join(paths.taskDir, 'audit', `${id}.jsonl`);
     const before = readFileSync(path, 'utf-8');
-    updateTask(paths, id, 'blocked');
+    updateTask(paths, id, 'blocked', 'alice');
     const after = readFileSync(path, 'utf-8');
     expect(after.startsWith(before)).toBe(true);
     expect(after.length).toBeGreaterThan(before.length);
@@ -548,7 +552,7 @@ describe('Task audit log (append-only JSONL)', () => {
     const path = join(paths.taskDir, 'audit', `${id}.jsonl`);
     // Inject a malformed line between two valid ones
     writeFileSync(path, readFileSync(path, 'utf-8') + 'not-json-at-all\n');
-    updateTask(paths, id, 'in_progress');
+    updateTask(paths, id, 'in_progress', 'alice');
     const log = readTaskAudit(paths, id);
     expect(log.length).toBe(2); // create + update, corrupt middle line skipped
     expect(log[0].event).toBe('create');
@@ -629,7 +633,7 @@ describe('Task dependency DAG (blocks / blocked_by)', () => {
     expect(open[0].id).toBe(blocker);
     expect(open[0].status).toBe('pending');
 
-    completeTask(paths, blocker, 'done');
+    completeTask(paths, blocker, 'alice', 'done');
     open = checkTaskDependencies(paths, blocked);
     expect(open).toEqual([]);
   });
@@ -695,7 +699,7 @@ describe('Task dependency DAG (blocks / blocked_by)', () => {
     expect(idx(blocked)).toBeGreaterThan(idx(free));
 
     // Once blocker completes, respectDeps no longer demotes blocked.
-    completeTask(paths, blocker, 'done');
+    completeTask(paths, blocker, 'alice', 'done');
     const reordered = listTasks(paths, { respectDeps: true });
     const blockedTask = reordered.find(t => t.id === blocked)!;
     expect(blockedTask.status).toBe('pending');
@@ -738,7 +742,7 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
 
   it('archives a completed task older than cutoff — removes active JSON, preserves audit log', () => {
     const id = createTask(paths, 'alice', 'acme', 'Old done', { assignee: 'alice' });
-    completeTask(paths, id, 'shipped');
+    completeTask(paths, id, 'alice', 'shipped');
     backdateCompletion(id, 40);
 
     const auditPath = join(paths.taskDir, 'audit', `${id}.jsonl`);
@@ -764,7 +768,7 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
 
   it('skips recently-completed tasks (within cutoff)', () => {
     const id = createTask(paths, 'alice', 'acme', 'Fresh done');
-    completeTask(paths, id, 'ok');
+    completeTask(paths, id, 'alice', 'ok');
     // Leave completed_at as "just now" — should be skipped.
     const report = compactTasks(paths, { olderThanDays: 30 });
     expect(report.archived).toEqual([]);
@@ -775,7 +779,7 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
     const a = createTask(paths, 'alice', 'acme', 'In progress');
     claimTask(paths, a, 'alice'); // -> in_progress
     const b = createTask(paths, 'alice', 'acme', 'Blocked');
-    updateTask(paths, b, 'blocked');
+    updateTask(paths, b, 'blocked', 'alice');
 
     const report = compactTasks(paths, { olderThanDays: 0 });
     expect(report.archived).toEqual([]);
@@ -784,7 +788,7 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
   it('NEVER archives a completed task still referenced by an open task\'s blocked_by chain', () => {
     const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
     const dependent = createTask(paths, 'alice', 'acme', 'Dependent', { blockedBy: [blocker] });
-    completeTask(paths, blocker, 'done');
+    completeTask(paths, blocker, 'alice', 'done');
     backdateCompletion(blocker, 60);
 
     // Dependent is still pending → blocker must not be compacted away.
@@ -802,8 +806,8 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
     expect(c).toBeDefined();
 
     // A + B both completed and aged out; C stays open.
-    completeTask(paths, a, 'done-a');
-    completeTask(paths, b, 'done-b');
+    completeTask(paths, a, 'alice', 'done-a');
+    completeTask(paths, b, 'alice', 'done-b');
     backdateCompletion(a, 60);
     backdateCompletion(b, 60);
 
@@ -822,9 +826,9 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
   it('once the dependent completes, the blocker becomes eligible', () => {
     const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
     const dependent = createTask(paths, 'alice', 'acme', 'Dependent', { blockedBy: [blocker] });
-    completeTask(paths, blocker, 'done');
+    completeTask(paths, blocker, 'alice', 'done');
     backdateCompletion(blocker, 60);
-    completeTask(paths, dependent, 'done');
+    completeTask(paths, dependent, 'alice', 'done');
     backdateCompletion(dependent, 60);
 
     const report = compactTasks(paths, { olderThanDays: 30 });
@@ -834,7 +838,7 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
 
   it('is idempotent — running a second time on the same data archives nothing', () => {
     const id = createTask(paths, 'alice', 'acme', 'Run-twice');
-    completeTask(paths, id, 'ok');
+    completeTask(paths, id, 'alice', 'ok');
     backdateCompletion(id, 60);
 
     const first = compactTasks(paths, { olderThanDays: 30 });
@@ -846,7 +850,7 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
 
   it('dry-run reports candidates without modifying anything', () => {
     const id = createTask(paths, 'alice', 'acme', 'Dry-run target');
-    completeTask(paths, id, 'ok');
+    completeTask(paths, id, 'alice', 'ok');
     backdateCompletion(id, 60);
 
     const report = compactTasks(paths, { olderThanDays: 30, dryRun: true });

@@ -101,12 +101,12 @@ describe('E2E Lifecycle', () => {
       expect(tasks[0].status).toBe('pending');
 
       // Update to in_progress
-      updateTask(paths, taskId, 'in_progress');
+      updateTask(paths, taskId, 'in_progress', 'paul');
       tasks = listTasks(paths, { status: 'in_progress' });
       expect(tasks.length).toBe(1);
 
       // Complete
-      completeTask(paths, taskId, 'Landing page deployed at /landing');
+      completeTask(paths, taskId, 'paul', 'Landing page deployed at /landing');
       tasks = listTasks(paths, { status: 'completed' });
       expect(tasks.length).toBe(1);
       expect(tasks[0].result).toBe('Landing page deployed at /landing');
@@ -171,7 +171,7 @@ describe('E2E Lifecycle', () => {
       expect(borisMessages.length).toBe(1);
 
       // Boris starts the task
-      updateTask(borisPaths, taskId, 'in_progress');
+      updateTask(borisPaths, taskId, 'in_progress', 'boris');
 
       // Boris sends progress update to Paul
       sendMessage(borisPaths, 'boris', 'paul', 'normal', `Task ${taskId} in progress. ETA: 2h`);
@@ -182,7 +182,7 @@ describe('E2E Lifecycle', () => {
       expect(paulMessages[0].from).toBe('boris');
 
       // Boris completes the task
-      completeTask(borisPaths, taskId, 'API endpoint deployed');
+      completeTask(borisPaths, taskId, 'boris', 'API endpoint deployed');
       sendMessage(borisPaths, 'boris', 'paul', 'normal', `Task ${taskId} complete`);
 
       // Paul asks sentinel to verify
