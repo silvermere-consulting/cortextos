@@ -21,6 +21,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -43,6 +44,17 @@ DOC_EXTS = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls"}
 TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".py", ".js", ".ts", ".go",
              ".rs", ".java", ".cpp", ".c", ".sh", ".yaml", ".yml", ".toml",
              ".html", ".css", ".sql", ".rb", ".swift", ".kt", ".r", ".lua"}
+
+# Non-content files/dirs skipped by ingest_file(). Lifted to module scope so the
+# post-ingest self-verify (cmd_ingest) can mirror the EXACT same routing rules
+# when deciding which sources are text-verifiable — a drifting copy would raise
+# false TRUNCATED alarms on files ingest never indexed.
+SKIP_FILE_NAMES = {".ds_store", "thumbs.db", ".gitignore", ".gitkeep",
+                   "package-lock.json", "yarn.lock", "pnpm-lock.yaml", ".eslintcache"}
+SKIP_DIR_NAMES = {".git", "node_modules", "__pycache__", ".venv", "venv", ".env",
+                  ".next", ".nuxt", "dist", "build", ".cache", ".turbo",
+                  "vendor", ".terraform", ".angular", ".svelte-kit", ".output",
+                  "coverage", ".nyc_output", ".pytest_cache", ".mypy_cache"}
 
 # Defaults
 DEFAULT_TEXT_CHUNK_SIZE = 1500
@@ -1812,18 +1824,12 @@ def ingest_file(client, config, collection, file_path):
     ext = file_path.suffix.lower()
 
     # Skip common non-content files
-    skip_names = {".ds_store", "thumbs.db", ".gitignore", ".gitkeep", "package-lock.json",
-                  "yarn.lock", "pnpm-lock.yaml", ".eslintcache"}
-    if file_path.name.lower() in skip_names:
+    if file_path.name.lower() in SKIP_FILE_NAMES:
         return 0
 
     # Skip junk directories
-    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".env",
-                 ".next", ".nuxt", "dist", "build", ".cache", ".turbo",
-                 "vendor", ".terraform", ".angular", ".svelte-kit", ".output",
-                 "coverage", ".nyc_output", ".pytest_cache", ".mypy_cache"}
     parts = set(file_path.parts)
-    if parts & skip_dirs:
+    if parts & SKIP_DIR_NAMES:
         return 0
 
     # Skip text files > 10MB (likely generated/binary)
@@ -1860,6 +1866,84 @@ def ingest_file(client, config, collection, file_path):
             return 0
 
 # ---------------------------------------------------------------------------
+# Post-ingest self-verify (truncation guard)
+# ---------------------------------------------------------------------------
+def _is_text_route(file_path):
+    """Mirror ingest_file()'s routing: would this file be handled by
+    ingest_text_file()? Only text-routed sources have index counts that
+    chunk_text() can predict, so only they are self-verifiable. Kept in lockstep
+    with ingest_file() (same skip sets, same ext gating, same size cap)."""
+    file_path = Path(file_path)
+    if not file_path.is_file():
+        return False
+    if file_path.name.lower() in SKIP_FILE_NAMES:
+        return False
+    if set(file_path.parts) & SKIP_DIR_NAMES:
+        return False
+    ext = file_path.suffix.lower()
+    if ext in VIDEO_EXTS or ext in AUDIO_EXTS or ext in IMAGE_EXTS or ext in DOC_EXTS:
+        return False
+    if ext == ".pdf":
+        return False
+    size_mb = file_path.stat().st_size / (1024 * 1024)
+    if ext in TEXT_EXTS:
+        return size_mb <= 10  # ingest_file skips text files > 10MB
+    # Unknown extension: ingest_file tries to read it as text — mirror that probe.
+    try:
+        file_path.read_text(errors="strict")[:100]
+        return True
+    except Exception:
+        return False
+
+
+def verify_indexed_counts(collection, config, sources):
+    """Layer-3 acceptance guard, run as a STANDING check after every ingest.
+
+    For each text source touched this run, independently RE-DERIVE the expected
+    chunk count from the file via chunk_text() (the shared predicate — NOT the
+    process's own "Added N" self-report, which would be circular) using the SAME
+    resolved chunk config the ingest used, then count how many of that file's
+    doc_ids (md5(path)+_chunk{i}) actually exist in the collection.
+
+    Because the commit model is all-or-nothing PER FILE and doc_ids are keyed on
+    THIS file's path+index, the collection must hold exactly N doc_ids for a
+    COMPLETE run — regardless of how many were newly embedded vs deduped this run.
+    actual < expected means chunks are missing (a kill mid-embed, or any silent
+    under-persist). Returns True if ANY source is truncated (after printing every
+    offender LOUD to stderr); False if all sources verify.
+    """
+    resolved_size = config.get("text_chunk_size", DEFAULT_TEXT_CHUNK_SIZE)
+    resolved_overlap = config.get("text_chunk_overlap", DEFAULT_TEXT_CHUNK_OVERLAP)
+
+    truncated = False
+    checked = 0
+    for src in sources:
+        src = Path(src)
+        try:
+            text = src.read_text(errors="replace")
+        except Exception as e:
+            print(f"KB-INGEST VERIFY: cannot read {src}: {e}", file=sys.stderr)
+            truncated = True
+            continue
+        expected_ids = [file_id(src, i)
+                        for i in range(len(chunk_text(text, resolved_size, resolved_overlap)))]
+        n_expected = len(expected_ids)
+        if n_expected == 0:
+            continue  # empty/whitespace file — nothing to index, nothing to verify
+        got = collection.get(ids=expected_ids)
+        m_indexed = len((got or {}).get("ids") or [])
+        checked += 1
+        if m_indexed < n_expected:
+            print(f"KB-INGEST TRUNCATED: {src} indexed {m_indexed} != expected {n_expected}",
+                  file=sys.stderr)
+            truncated = True
+
+    if not truncated and checked:
+        print(f"Verify: {checked} text source(s) fully indexed (chunk counts match).")
+    return truncated
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 def cmd_ingest(args):
@@ -1881,6 +1965,74 @@ def cmd_ingest(args):
     total = 0
     skipped = 0
     errors = 0
+    verify_sources = []  # text sources touched this run, for the post-verify pass
+
+    # ---- Layers 1 + 2: interrupt / wall-clock timeout guard --------------
+    # Progress state the interrupt handler reads to report WHAT was persisted vs
+    # what was in-flight. `current` is set ONLY while a single file's
+    # embed+upsert is executing (that's the commit-atomic unit — a kill there
+    # persists nothing for it); it is cleared the instant the file completes.
+    progress = {"start": time.time(), "done": 0, "total": 0, "current": None}
+    # Pre-count the files so `done/total` is meaningful the moment a signal lands
+    # (cheap directory re-walk; matches the same discovery the loop uses).
+    for path_str in args.paths:
+        p = Path(path_str).resolve()
+        if p.is_dir():
+            progress["total"] += sum(1 for f in p.rglob("*")
+                                     if f.is_file() and not f.name.startswith("."))
+        elif p.is_file():
+            progress["total"] += 1
+
+    def _on_interrupt(signum, frame):
+        # GNU `timeout` sends SIGTERM by default; SIGALRM is our own --timeout
+        # deadline; SIGINT is Ctrl-C. All three convert a would-be SILENT kill
+        # into a LOUD, machine-greppable line + a distinct exit code (2).
+        # NOTE: a Python signal handler only runs between bytecode ops, so if the
+        # signal lands during the blocking ONNX embed C-call it fires when that
+        # call returns (batch-group boundary), not instantly — still loud, just
+        # granular. `-s KILL`/SIGKILL is uncatchable; layer 3 (verify) covers it.
+        elapsed = time.time() - progress["start"]
+        try:
+            reason = signal.Signals(signum).name
+        except Exception:
+            reason = str(signum)
+        sys.stderr.write(
+            f"\nKB-INGEST INTERRUPTED after {elapsed:.0f}s: "
+            f"{progress['done']}/{progress['total']} files persisted, "
+            f"current='{progress['current']}' NOT persisted ({reason})\n"
+        )
+        sys.stderr.flush()
+        # Raise SystemExit(2) on the main thread. It is NOT caught by the
+        # per-file `except Exception` (SystemExit is BaseException), and the
+        # outer `finally` still flushes the usage tracker on the way out.
+        sys.exit(2)
+
+    _prev_handlers = {}
+
+    def _install(sig):
+        try:
+            _prev_handlers[sig] = signal.signal(sig, _on_interrupt)
+        except (ValueError, OSError):
+            pass  # not the main thread (e.g. under a test harness) — skip
+
+    _install(signal.SIGTERM)
+    _install(signal.SIGINT)
+    timeout = getattr(args, "timeout", None)
+    # --force disables the internal deadline: a full re-embed is legitimately long
+    # (chief measured --force MEMORY.md at 8m18s) and must not be capped. The
+    # default (600s) is a genuine-HANG catch for the routine DELTA path, NOT a
+    # caller's cap adopted as the tool's own — L1 already covers a caller kill.
+    if getattr(args, "force", False):
+        timeout = None
+    _alarm_armed = False
+    if timeout and timeout > 0 and hasattr(signal, "SIGALRM"):
+        # SIGALRM (not a per-file elapsed check) because it can fire BETWEEN
+        # embed batch-groups within a single large file, not only at file
+        # boundaries — strictly finer granularity, and it needs no polling.
+        _install(signal.SIGALRM)
+        signal.alarm(int(timeout))
+        _alarm_armed = True
+        print(f"Timeout armed: {int(timeout)}s wall-clock (SIGALRM -> loud exit 2 on deadline)")
 
     try:
         for path_str in args.paths:
@@ -1890,29 +2042,43 @@ def cmd_ingest(args):
                 print(f"Ingesting directory: {p} ({len(files)} files)")
                 for f in files:
                     print(f"  Processing: {f.relative_to(p)}")
+                    progress["current"] = str(f)
                     try:
                         count = ingest_file(client, config, collection, f)
                         total += count
+                        if _is_text_route(f):
+                            verify_sources.append(f)
                         if count > 0:
                             print(f"    Added {count} chunk(s)")
                         elif count == 0:
                             skipped += 1
+                        progress["done"] += 1
                     except Exception as e:
                         print(f"    ERROR: {e}")
                         errors += 1
+                    finally:
+                        progress["current"] = None
             elif p.is_file():
                 print(f"Ingesting: {p.name}")
+                progress["current"] = str(p)
                 try:
                     count = ingest_file(client, config, collection, p)
                     total += count
+                    if _is_text_route(p):
+                        verify_sources.append(p)
                     if count > 0:
                         print(f"  Added {count} chunk(s)")
+                    progress["done"] += 1
                 except Exception as e:
                     print(f"  ERROR: {e}")
                     errors += 1
+                finally:
+                    progress["current"] = None
             else:
                 print(f"NOT FOUND: {p}")
     finally:
+        if _alarm_armed:
+            signal.alarm(0)  # disarm — verify/persist must not be interrupted
         _tracker.persist()
 
     print(f"\nDone! Ingested {total} new chunk(s) into '{collection_name}'")
@@ -1921,6 +2087,15 @@ def cmd_ingest(args):
     if errors:
         print(f"  Errors: {errors}")
     print(_tracker.summary_line())
+
+    # ---- Layer 3: post-ingest self-verify (default ON; --no-verify off) ---
+    # Runs only on files that ingested WITHOUT raising (errored files are
+    # reported via the errors=1 path below and are deliberately not re-flagged
+    # here). A truncation is louder and more specific than a per-file error, so
+    # exit 3 takes precedence over exit 1.
+    if not getattr(args, "no_verify", False):
+        if verify_indexed_counts(collection, config, verify_sources):
+            sys.exit(3)
 
     if errors:
         # Non-zero exit so the bus knowledge-base.ts wrapper can detect
@@ -2420,6 +2595,14 @@ def main():
     p_ingest.add_argument("paths", nargs="+", help="File or directory paths to ingest")
     p_ingest.add_argument("--collection", "-c", help="Collection name (default: 'default')")
     p_ingest.add_argument("--force", action="store_true", help="Re-ingest files even if already in the KB")
+    p_ingest.add_argument("--timeout", type=int, default=600, metavar="SECONDS",
+                          help="Abort the run after N seconds wall-clock (SIGALRM); loud stderr + exit 2. "
+                               "Default 600s = a genuine-hang catch (NOT tuned to any caller's cap; L1 "
+                               "handles caller kills). Auto-disabled under --force. Pass 0 to disable.")
+    p_ingest.add_argument("--no-verify", action="store_true",
+                          help="Disable the post-ingest self-verify. By default, after the run each "
+                               "text source's indexed chunk count is checked against chunk_text(source); "
+                               "a mismatch prints 'KB-INGEST TRUNCATED' and exits 3.")
 
     # query
     p_query = sub.add_parser("query", help="Query the knowledge base")
