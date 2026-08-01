@@ -11,6 +11,14 @@ const INSTANCE_ID = process.env.CTX_INSTANCE_ID || 'default';
 const CTX_ROOT = process.env.CTX_ROOT || path.join(os.homedir(), '.cortextos', INSTANCE_ID);
 const CTX_ORG = process.env.CTX_ORG || '';
 
+// Authorised Claude Code pin — SINGLE SOURCE OF TRUTH for the version string.
+// Roll the fleet by editing this constant; the binary path and the boot-time
+// version assertion (CTX_CLAUDE_VERSION_EXPECTED) are both derived from it, so
+// they can never disagree. Steve go tg9125 (2026-07-27) chose 2.1.219 for the
+// opus-4-8 / sonnet-5 1M window.
+const CLAUDE_VERSION = '2.1.219';
+const AUTHORISED_CLAUDE_BIN = path.join(os.homedir(), '.local', 'share', 'claude-code', CLAUDE_VERSION, 'claude.exe');
+
 module.exports = {
   apps: [
     {
@@ -33,10 +41,21 @@ module.exports = {
         // auto-updates (2.1.219 native build installs to ~/.local/share/claude/
         // versions/ which IS auto-update-capable, so a byte-identical copy is
         // frozen here instead — deliberately NOT the pin target). Grants opus-4-8
-        // + sonnet-5 their 1M window. Revert if regressed: in-place to the FROZEN
-        // 2.1.218 copy (~/.local/share/claude-code/2.1.218/claude.exe); deep
-        // revert '/usr/bin/claude' (2.1.141, no opus-4-8 registry entry -> 200k).
-        CTX_CLAUDE_BIN: process.env.CTX_CLAUDE_BIN || path.join(os.homedir(), '.local', 'share', 'claude-code', '2.1.219', 'claude.exe'),
+        // + sonnet-5 their 1M window. Revert if regressed: edit CLAUDE_VERSION
+        // above (frozen 2.1.218 copy exists at .../claude-code/2.1.218/claude.exe).
+        //
+        // AUTHORITATIVE, not a fallback. This was `process.env.CTX_CLAUDE_BIN ||
+        // <default>` until 2026-07-30: on that form an INHERITED env var beat the
+        // pin. A pm2 resurrect from a stale ~/.pm2/dump.pm2 (carrying the 07-23
+        // Track-A value CTX_CLAUDE_BIN=/usr/bin/claude, i.e. 2.1.141) silently
+        // reverted the ENTIRE FLEET three versions on 2026-07-29 23:12:59Z —
+        // undetected for hours because every roll since 07-23 had only edited a
+        // default that no longer applied (task_1785377221211). The pin now WINS
+        // over any inherited env; you roll by editing CLAUDE_VERSION, never by
+        // exporting CTX_CLAUDE_BIN. The daemon re-checks this at boot and pages
+        // the operator if the resolved binary's --version != CTX_CLAUDE_VERSION_EXPECTED.
+        CTX_CLAUDE_BIN: AUTHORISED_CLAUDE_BIN,
+        CTX_CLAUDE_VERSION_EXPECTED: CLAUDE_VERSION,
         // Debug-only: set to '1' to enable SIGUSR2 signal → controlled
         // uncaughtException for testing the crash-visibility path
         // (.daemon-crashed markers + crash-loop operator Telegram alert).

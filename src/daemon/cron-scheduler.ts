@@ -181,6 +181,20 @@ function changeKeyFor(c: CronDefinition): string {
 }
 
 /**
+ * Catch-up decision (task_1785377398985). A cron catches up (fires immediately
+ * for a missed window) only when its next fire is already in the past AND this
+ * is NOT a schedule-edit reload. A reschedule takes effect from now — the slot
+ * the new expression lands in the past interval is a phantom, not a missed run.
+ */
+export function shouldCatchUp(
+  nextFireAtMs: number,
+  nowMs: number,
+  isRescheduleReload: boolean,
+): boolean {
+  return nextFireAtMs <= nowMs && !isRescheduleReload;
+}
+
+/**
  * Compute the next fire time for a cron definition.
  *
  * For interval shorthands ("6h", "30m") we count forward from the
@@ -436,7 +450,24 @@ export class CronScheduler {
       if (stateFire) candidates.push(new Date(stateFire).getTime());
       const referenceMs = candidates.length > 0 ? Math.max(...candidates) : now;
 
-      let nextFireAt = computeNextFireAt(def, referenceMs, this.timezone);
+      // SCHEDULE-EDIT SUPPRESSION (task_1785377398985): a cron reaching here on
+      // the reload path WITH an existing entry did so because its changeKey
+      // (name|schedule) differs — the name is the map key, so the SCHEDULE was
+      // edited. A reschedule must take effect from NOW; it must never fire a
+      // phantom slot that the NEW expression happens to place in the interval
+      // (last_fired_at, now]. So recompute from `now` (not the old last-fire
+      // reference) and skip catch-up for this cron.
+      //
+      // PARTITION: genuine downtime recovery runs only on the FRESH-START path
+      // (isReload=false), where `existing` is always undefined — so the only
+      // route into reload catch-up is a schedule edit. Suppressing here removes
+      // catch-up from the reload path entirely and confines it to daemon
+      // restart, which is exactly where a "missed while stopped" fire belongs.
+      const isRescheduleReload =
+        isReload && existing !== undefined && existing.definition.schedule !== def.schedule;
+      const recomputeFrom = isRescheduleReload ? now : referenceMs;
+
+      let nextFireAt = computeNextFireAt(def, recomputeFrom, this.timezone);
 
       if (isNaN(nextFireAt)) {
         this.logger(
@@ -445,10 +476,19 @@ export class CronScheduler {
         continue;
       }
 
+      if (isRescheduleReload) {
+        this.logger(
+          `[cron-scheduler] reschedule: cron "${def.name}" schedule changed to "${def.schedule}" — ` +
+          `next fire ${new Date(nextFireAt).toISOString()} (catch-up suppressed; edits take effect from now)`
+        );
+      }
+
       // CATCH-UP POLICY: if nextFireAt is in the past (daemon was stopped),
       // fire once immediately for the missed window, then recompute from now.
       // We do NOT flood-fire all missed windows — one catch-up is sufficient.
-      if (nextFireAt <= now) {
+      // Suppressed for a reschedule reload (see above): edits are not missed
+      // fires.
+      if (shouldCatchUp(nextFireAt, now, isRescheduleReload)) {
         this.logger(
           `[cron-scheduler] catch-up: cron "${def.name}" missed fire at ${new Date(nextFireAt).toISOString()} — scheduling immediate fire`
         );

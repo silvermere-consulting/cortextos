@@ -32,7 +32,7 @@ vi.mock('../../../src/bus/crons.js', () => ({
 // Imports AFTER mock setup
 // ---------------------------------------------------------------------------
 
-import { CronScheduler, nextFireFromCron } from '../../../src/daemon/cron-scheduler';
+import { CronScheduler, nextFireFromCron, shouldCatchUp } from '../../../src/daemon/cron-scheduler';
 import type { CronDefinition } from '../../../src/types/index';
 
 // ---------------------------------------------------------------------------
@@ -73,6 +73,20 @@ function localOf(ms: number) {
     dayOfWeek:  d.getDay(),
   };
 }
+
+describe('shouldCatchUp (pure catch-up predicate — task_1785377398985)', () => {
+  const NOW = 1_000_000;
+  it('catches up a past fire on a non-reschedule load (fresh start / unchanged reload)', () => {
+    expect(shouldCatchUp(NOW - 1, NOW, false)).toBe(true);
+  });
+  it('does NOT catch up a past fire when the load is a schedule edit', () => {
+    expect(shouldCatchUp(NOW - 1, NOW, true)).toBe(false);
+  });
+  it('never catches up a future fire, reschedule or not', () => {
+    expect(shouldCatchUp(NOW + 1, NOW, false)).toBe(false);
+    expect(shouldCatchUp(NOW + 1, NOW, true)).toBe(false);
+  });
+});
 
 describe('nextFireFromCron', () => {
   it('computes correct next fire for "*/5 * * * *" (every 5 minutes)', () => {
@@ -418,6 +432,97 @@ describe('CronScheduler', () => {
     const afterReload = scheduler.getNextFireTimes().find(e => e.name === 'changing');
     // 12h window is bigger — nextFireAt should be different (further out)
     expect(afterReload!.nextFireAt).not.toBe(beforeReload!.nextFireAt);
+  });
+
+  // -------------------------------------------------------------------------
+  // reload() — schedule-edit catch-up SUPPRESSION (task_1785377398985)
+  //
+  // Hazard: editing a cron's SCHEDULE makes it fire immediately if the NEW
+  // expression has an occurrence in (last_fired_at, now].  A long-cadence cron
+  // (weekly/monthly) carries a last_fired_at old enough that almost any new
+  // expression lands a phantom slot in the gap, so a routine reschedule
+  // detonates an unwanted run — the exact defect chief hit rescheduling jones's
+  // crons.  Fix: on the RELOAD path a changed schedule recomputes nextFireAt
+  // from NOW instead of catch-up-firing.  Genuine downtime recovery stays on
+  // the fresh-start (isReload=false) path, which is asserted below to prove the
+  // suppression did not blind recovery.
+  // -------------------------------------------------------------------------
+
+  it('schedule edit does NOT catch-up-fire on reload (hazard suppressed)', async () => {
+    // Freeze the wall clock so weekday reasoning is deterministic.
+    const now = new Date(2026, 6, 15, 12, 0, 0); // local noon
+    vi.setSystemTime(now);
+    const dowNow = now.getDay();
+    const dowTomorrow = (dowNow + 1) % 7;
+
+    // last_fired_at: 5 days old — the long-cadence gap that arms the hazard.
+    const lastFired = new Date(now.getTime() - 5 * 24 * 3_600_000);
+    const lastFiredIso = lastFired.toISOString();
+
+    // OLD expr: weekly on TOMORROW's weekday @09:00 — its first occurrence
+    // after last_fired is in the FUTURE, so start() stays quiet (no catch-up).
+    const oldExpr = `0 9 * * ${dowTomorrow}`;
+    // NEW expr: weekly on TODAY's weekday @09:00 — its first occurrence after
+    // last_fired (today 09:00) is in the PAST (now is 12:00): the hazard.
+    const newExpr = `0 9 * * ${dowNow}`;
+
+    // ASSERTION 1 (hazard armed — grounds the test in the real catch-up path):
+    // absent suppression the new expression WOULD catch-up-fire, because its
+    // first occurrence strictly after last_fired has already elapsed.
+    const armedNext = nextFireFromCron(newExpr, lastFired.getTime());
+    expect(armedNext).not.toBeNaN();
+    expect(armedNext).toBeLessThanOrEqual(now.getTime());
+
+    // Start on the OLD schedule — must be quiet (no catch-up at start).
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'weekly-review', schedule: oldExpr, last_fired_at: lastFiredIso }),
+    ]);
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(TICK);
+    expect(fired.map(c => c.name)).not.toContain('weekly-review');
+
+    // Reload with the NEW schedule — a routine reschedule.
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'weekly-review', schedule: newExpr, last_fired_at: lastFiredIso }),
+    ]);
+    scheduler.reload();
+
+    // ASSERTION 2 (patched suppresses): the reschedule must NOT fire, and
+    // nextFireAt must be recomputed into the future (not pinned to now).
+    await vi.advanceTimersByTimeAsync(TICK);
+    expect(fired.map(c => c.name)).not.toContain('weekly-review');
+    const entry = scheduler.getNextFireTimes().find(e => e.name === 'weekly-review');
+    expect(entry).toBeDefined();
+    expect(entry!.nextFireAt).toBeGreaterThan(now.getTime());
+  });
+
+  it('fresh daemon start STILL catch-up-fires a genuinely missed slot (recovery preserved)', async () => {
+    // isReload=false path: a real restart after downtime must recover the
+    // missed fire.  Suppression is confined to the reload path; this asserts it
+    // did not blind downtime recovery.
+    const now = new Date(2026, 6, 15, 12, 0, 0);
+    vi.setSystemTime(now);
+    const dowNow = now.getDay();
+    const lastFired = new Date(now.getTime() - 5 * 24 * 3_600_000);
+
+    // Weekly cron whose slot (today 09:00) fell inside the downtime gap.
+    const expr = `0 9 * * ${dowNow}`;
+    const armedNext = nextFireFromCron(expr, lastFired.getTime());
+    expect(armedNext).toBeLessThanOrEqual(now.getTime()); // slot genuinely missed
+
+    const recFired: CronDefinition[] = [];
+    const recScheduler = new CronScheduler({
+      agentName: 'test-agent',
+      onFire: (c) => { recFired.push(c); },
+      logger: (msg) => logs.push(msg),
+    });
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'weekly-review', schedule: expr, last_fired_at: lastFired.toISOString() }),
+    ]);
+    recScheduler.start(); // isReload=false — the recovery path
+    await vi.advanceTimersByTimeAsync(TICK);
+    expect(recFired.map(c => c.name)).toContain('weekly-review');
+    recScheduler.stop();
   });
 
   // -------------------------------------------------------------------------

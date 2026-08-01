@@ -28,7 +28,13 @@ vi.mock('../../../src/telegram/api', () => ({
 import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createApproval, updateApproval, listPendingApprovals } from '../../../src/bus/approval';
+import {
+  createApproval,
+  updateApproval,
+  listPendingApprovals,
+  evaluateApprovalPingGate,
+  resurfaceDeferredApprovalPings,
+} from '../../../src/bus/approval';
 import type { BusPaths } from '../../../src/types';
 
 let testDir: string;
@@ -65,12 +71,23 @@ beforeEach(() => {
   telegramSendMessageSpy.mockResolvedValue({ result: { message_id: 1 } });
   telegramConstructorSpy.mockClear();
   delete process.env.CTX_FRAMEWORK_ROOT;
+  // NIGHT-GATE (task_1785376444454): the agent-bot ping is now contact-clock
+  // gated. Force DAY here so these delivery/metadata assertions are
+  // deterministic (they were written before the gate and assume the ping
+  // always delivers). Night behaviour is covered in its own describe block.
+  process.env.CTX_DAY_MODE_START = '00:00';
+  process.env.CTX_DAY_MODE_END = '24:00';
 });
 
 afterEach(() => {
   rmSync(testDir, { recursive: true, force: true });
   rmSync(frameworkRoot, { recursive: true, force: true });
   delete process.env.CTX_FRAMEWORK_ROOT;
+  delete process.env.CTX_DAY_MODE_START;
+  delete process.env.CTX_DAY_MODE_END;
+  delete process.env.CTX_TIMEZONE;
+  delete process.env.CTX_USER_TIMEZONE;
+  delete process.env.CTX_USER_TIMEZONE_UNTIL;
 });
 
 describe('createApproval', () => {
@@ -486,6 +503,130 @@ describe('createApproval — metadata field (Foundry bridge)', () => {
     );
     const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
     expect(approval.metadata).toEqual(metadata);
+  });
+});
+
+describe('NIGHT-GATE for the approval ping (task_1785376444454)', () => {
+  function writeAgentEnv(agentDir: string, vars: Record<string, string>): void {
+    mkdirSync(agentDir, { recursive: true });
+    const lines = Object.entries(vars).map(([k, v]) => `${k}=${v}`);
+    writeFileSync(join(agentDir, '.env'), lines.join('\n') + '\n');
+  }
+  /** Derived agent dir resurface uses (projectRoot/orgs/<org>/agents/<agent>). */
+  function derivedAgentDir(agent: string): string {
+    return join(frameworkRoot, 'orgs', 'TestOrg', 'agents', agent);
+  }
+  const forceDay = () => { process.env.CTX_DAY_MODE_START = '00:00'; process.env.CTX_DAY_MODE_END = '24:00'; };
+  // start === end collapses the day window to zero width -> always NIGHT,
+  // independent of the real wall clock.
+  const forceNight = () => { process.env.CTX_DAY_MODE_START = '00:00'; process.env.CTX_DAY_MODE_END = '00:00'; };
+
+  // KNOWN-POSITIVE at the decision layer: the guard must be able to say YES.
+  it('evaluateApprovalPingGate: DAY delivers now (the guard can say YES)', () => {
+    const g = evaluateApprovalPingGate('day');
+    expect(g.deliver).toBe(true);
+    expect(g.defer).toBe(false);
+    expect(g.reason).toMatch(/DAY/);
+  });
+
+  it('evaluateApprovalPingGate: NIGHT defers, never discards', () => {
+    const g = evaluateApprovalPingGate('night');
+    expect(g.deliver).toBe(false);
+    expect(g.defer).toBe(true);
+    expect(g.reason).toMatch(/NIGHT/);
+    expect(g.reason).toMatch(/defer/i);
+  });
+
+  it('NIGHT: suppresses the ping, persists the approval, and stamps a ping_deferred marker', async () => {
+    forceNight();
+    const agentDir = derivedAgentDir('alice');
+    writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-night', CHAT_ID: 'chat-night' });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const id = await createApproval(
+      paths, 'alice', 'TestOrg', 'Nighttime approval', 'deployment', 'ctx', frameworkRoot, agentDir,
+    );
+
+    // The ping must NOT have fired at night.
+    expect(telegramSendMessageSpy).not.toHaveBeenCalled();
+    // The approval itself is persisted (never discarded) WITH a deferral marker.
+    const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
+    expect(approval.status).toBe('pending');
+    expect(approval.metadata).toBeDefined();
+    expect(approval.metadata.ping_deferred).toBeDefined();
+    // Operator gets a visible deferral warn (not a silent drop).
+    const warnCalls = warnSpy.mock.calls.map((c) => c.join(' '));
+    expect(warnCalls.some((w) => w.includes('[approval]') && w.includes(id) && /day-start/.test(w))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it('DAY: delivers the ping immediately and writes NO deferral marker', async () => {
+    forceDay();
+    const agentDir = derivedAgentDir('alice');
+    writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-day', CHAT_ID: 'chat-day' });
+
+    const id = await createApproval(
+      paths, 'alice', 'TestOrg', 'Daytime approval', 'deployment', 'ctx', frameworkRoot, agentDir,
+    );
+
+    expect(telegramSendMessageSpy).toHaveBeenCalledTimes(1);
+    const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
+    expect(approval.metadata?.ping_deferred).toBeUndefined();
+  });
+
+  it('resurface (forced DAY): re-sends the deferred ping and clears the marker (DELIVERS)', async () => {
+    // 1. Create at night -> deferred, no send.
+    forceNight();
+    const agentDir = derivedAgentDir('alice');
+    writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-r', CHAT_ID: 'chat-r' });
+    const id = await createApproval(
+      paths, 'alice', 'TestOrg', 'Deferred then resurfaced', 'deployment', 'ctx', frameworkRoot, agentDir,
+    );
+    expect(telegramSendMessageSpy).not.toHaveBeenCalled();
+
+    // 2. Day-start sweep: force DAY via injected mode, capture the send.
+    const sent: Array<{ token: string; chat: string; msg: string }> = [];
+    const result = await resurfaceDeferredApprovalPings(paths, {
+      projectRoot: frameworkRoot,
+      mode: 'day',
+      send: async (token, chat, msg) => { sent.push({ token, chat, msg }); },
+    });
+
+    expect(result.resurfaced).toBe(1);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].chat).toBe('chat-r');
+    expect(sent[0].msg).toContain('Deferred then resurfaced');
+    // Marker cleared so a second sweep is a no-op (fires exactly once).
+    const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
+    expect(approval.metadata?.ping_deferred).toBeUndefined();
+
+    const second = await resurfaceDeferredApprovalPings(paths, {
+      projectRoot: frameworkRoot, mode: 'day', send: async () => {},
+    });
+    expect(second.resurfaced).toBe(0);
+  });
+
+  it('resurface (still NIGHT): leaves the deferral in place and sends nothing', async () => {
+    forceNight();
+    const agentDir = derivedAgentDir('alice');
+    writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-n', CHAT_ID: 'chat-n' });
+    const id = await createApproval(
+      paths, 'alice', 'TestOrg', 'Still night', 'deployment', 'ctx', frameworkRoot, agentDir,
+    );
+
+    const sent: unknown[] = [];
+    const result = await resurfaceDeferredApprovalPings(paths, {
+      projectRoot: frameworkRoot,
+      mode: 'night',
+      send: async (...a) => { sent.push(a); },
+    });
+
+    expect(result.resurfaced).toBe(0);
+    expect(result.stillDeferred).toBe(1);
+    expect(sent).toHaveLength(0);
+    // Marker retained — not discarded.
+    const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
+    expect(approval.metadata.ping_deferred).toBeDefined();
   });
 });
 
