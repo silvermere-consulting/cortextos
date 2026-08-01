@@ -94,7 +94,17 @@ export function updateHeartbeat(
   ensureDir(paths.stateDir);
 
   const ts = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-  const mode = options?.timezone ? detectDayNightMode(options.timezone) : detectDayNightMode('UTC');
+  // Fallback resolves the AGENT'S configured operating zone (TZ / CTX_TIMEZONE,
+  // injected by the daemon), NOT hardcoded UTC. The old UTC fallback made the
+  // mode field read "night" ~8h wrong for every agent that calls update-heartbeat
+  // WITHOUT --timezone (which is all of them) — a reliably-wrong DISPLAY field.
+  // Fixing the fallback (not each call site) makes every caller correct by
+  // construction; a call-site fix is a list we would miss the next entry on.
+  // NOTE: this is the agent OPERATING window (dashboard status). User-contact
+  // day/night is a different decision and must use contact-clock.sh, never this.
+  const mode = detectDayNightMode(
+    options?.timezone ?? process.env.TZ ?? process.env.CTX_TIMEZONE ?? 'UTC',
+  );
 
   const heartbeat: Heartbeat = {
     agent: agentName,
