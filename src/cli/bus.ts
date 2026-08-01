@@ -421,7 +421,14 @@ busCommand
     });
 
     if (opts.format === 'json') {
-      console.log(JSON.stringify(tasks, null, 2));
+      // Additive read-aliases so a consumer guessing keys from the WRITE flags
+      // (--desc / --assignee) finds them instead of a silent jq null on
+      // `.desc` / `.assignee`. This is what misled a cold read on 2026-07-30.
+      // Purely additive: existing .description / .assigned_to consumers are
+      // untouched, and each alias is computed here from the same field so it
+      // cannot drift out of sync with what it mirrors.
+      const withAliases = tasks.map(t => ({ ...t, desc: t.description, assignee: t.assigned_to }));
+      console.log(JSON.stringify(withAliases, null, 2));
       return;
     }
 
