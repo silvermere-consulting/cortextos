@@ -178,21 +178,29 @@ busCommand
   .option('--blocked-by <ids>', 'Comma-separated task IDs that must complete before this task can progress')
   .option('--blocks <ids>', 'Comma-separated task IDs that this new task will block (symmetric reverse edge)')
   .option('--requestor <telegram_user_id>', 'Telegram user_id of the person who requested this task')
-  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string; requestor?: string }) => {
+  .option('--due <date>', 'Target date (ISO YYYY-MM-DD) — persisted, sortable due_date')
+  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string; requestor?: string; due?: string }) => {
     const env = resolveEnv();
     { const r = refuseMintedIdentity(env, 'create-task', { needsOrg: true }); if (r) { console.error(r); process.exit(1); } }
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
-    const taskId = createTask(paths, env.agentName, env.org, title, {
-      description: opts.desc,
-      assignee: opts.assignee,
-      priority: opts.priority as Priority,
-      project: opts.project,
-      needsApproval: opts.needsApproval ?? false,
-      blockedBy: parseList(opts.blockedBy),
-      blocks: parseList(opts.blocks),
-      requestor: opts.requestor,
-    });
+    let taskId: string;
+    try {
+      taskId = createTask(paths, env.agentName, env.org, title, {
+        description: opts.desc,
+        assignee: opts.assignee,
+        priority: opts.priority as Priority,
+        project: opts.project,
+        needsApproval: opts.needsApproval ?? false,
+        dueDate: opts.due,
+        blockedBy: parseList(opts.blockedBy),
+        blocks: parseList(opts.blocks),
+        requestor: opts.requestor,
+      });
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
     console.log(taskId);
     // Auto-notify assignee so the task is visible immediately (issue #78)
     if (opts.assignee && opts.assignee !== env.agentName) {
@@ -208,7 +216,8 @@ busCommand
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
   .option('--note <text>', 'Reason for the transition — lands in the task audit log (visible via task-history)')
-  .action((id: string, status: string, opts: { note?: string }) => {
+  .option('--due <date>', 'Set target date (ISO YYYY-MM-DD); pass an empty string to clear it')
+  .action((id: string, status: string, opts: { note?: string; due?: string }) => {
     try {
       parseTaskStatus(status);
     } catch (err) {
@@ -230,8 +239,13 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus, opts.note);
-    console.log(`Updated ${id} -> ${status}${opts.note ? ' (note recorded)' : ''}`);
+    try {
+      updateTask(paths, id, status as TaskStatus, opts.note, opts.due);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+    console.log(`Updated ${id} -> ${status}${opts.note ? ' (note recorded)' : ''}${opts.due !== undefined ? ' (due set)' : ''}`);
   });
 
 busCommand

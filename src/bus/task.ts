@@ -7,6 +7,24 @@ import { validatePriority } from '../utils/validate.js';
 import { logEvent } from './event.js';
 
 /**
+ * Validate + normalise a --due value to an ISO date (YYYY-MM-DD). Rejects
+ * ambiguous / non-ISO / non-real dates so a persisted, sortable due_date can
+ * never be garbage. Lives in the writer (not the caller) so every path that
+ * sets a due date is validated by construction. Throws a message the CLI shows.
+ */
+export function parseDueDate(raw: string): string {
+  const s = raw.trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?$/.exec(s);
+  if (!m) throw new Error(`Invalid --due "${raw}": expected an ISO date (YYYY-MM-DD)`);
+  const iso = `${m[1]}-${m[2]}-${m[3]}`;
+  const d = new Date(`${iso}T00:00:00Z`);
+  if (isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== iso) {
+    throw new Error(`Invalid --due "${raw}": not a real calendar date`);
+  }
+  return iso;
+}
+
+/**
  * Create a new task. Identical JSON format to bash create-task.sh.
  */
 export function createTask(
@@ -78,7 +96,7 @@ export function createTask(
     created_at: now,
     updated_at: now,
     completed_at: null,
-    due_date: dueDate || null,
+    due_date: dueDate ? parseDueDate(dueDate) : null,
     archived: false,
     ...(blockedBy.length ? { blocked_by: [...blockedBy] } : {}),
     ...(blocks.length ? { blocks: [...blocks] } : {}),
@@ -280,6 +298,7 @@ export function updateTask(
   taskId: string,
   status: TaskStatus,
   note?: string,
+  dueDate?: string,
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -287,6 +306,9 @@ export function updateTask(
       `Task ${taskId} not found in any org under ${paths.ctxRoot}/orgs/`,
     );
   }
+  // Validate the due date BEFORE the write-try so its clear message is not
+  // re-wrapped as "update failed". undefined = leave unchanged; '' = clear.
+  const normalizedDue = dueDate !== undefined ? (dueDate ? parseDueDate(dueDate) : null) : undefined;
   let prevStatus: TaskStatus | undefined;
   let assignee: string | undefined;
   try {
@@ -303,6 +325,9 @@ export function updateTask(
       // timestamped, human-readable log — appended newest-last.
       const line = `[${task.updated_at}] ${note}`;
       task.notes = task.notes ? `${task.notes}\n${line}` : line;
+    }
+    if (normalizedDue !== undefined) {
+      task.due_date = normalizedDue;
     }
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
