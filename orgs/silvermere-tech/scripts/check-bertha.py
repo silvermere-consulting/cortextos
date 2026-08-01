@@ -77,28 +77,41 @@ def _extract_body(msg: email.message.Message) -> str:
     text/html with tags stripped."""
     text_plain: str | None = None
     text_html: str | None = None
+    non_text: list[str] = []  # content-types we saw but won't decode as body
 
     if msg.is_multipart():
         for part in msg.walk():
+            if part.is_multipart():
+                continue  # container part, no leaf payload
             ct = (part.get_content_type() or "").lower()
             if part.get("Content-Disposition", "").lower().startswith("attachment"):
+                if ct:
+                    non_text.append(ct)
                 continue
             if ct == "text/plain" and text_plain is None:
                 text_plain = _decode_payload(part)
             elif ct == "text/html" and text_html is None:
                 text_html = _decode_payload(part)
+            elif not ct.startswith("text/"):
+                non_text.append(ct)
     else:
         ct = (msg.get_content_type() or "").lower()
-        body = _decode_payload(msg)
         if ct == "text/html":
-            text_html = body
+            text_html = _decode_payload(msg)
+        elif (msg.get_content_maintype() or "").lower() == "text":
+            text_plain = _decode_payload(msg)
         else:
-            text_plain = body
+            # Single-part binary (e.g. an application/zip DMARC aggregate report).
+            # Its payload is NOT a text body — decoding it as one is what fed a
+            # ZIP's null bytes into the surface call. Surface a note, not bytes.
+            return f"[non-text message: {ct or 'unknown content-type'}, no text body]"
 
     if text_plain:
         return _clean_text(text_plain)
     if text_html:
         return _clean_text(_strip_html(text_html))
+    if non_text:
+        return f"[no text body — non-text parts only: {', '.join(sorted(set(non_text)))}]"
     return ""
 
 
@@ -116,6 +129,11 @@ def _decode_payload(part: email.message.Message) -> str:
 
 _HTML_TAG = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\s+")
+# Control chars EXCEPT \t \n \r (which _WS collapses). Strips the NULL byte a
+# binary attachment decoded-as-text carries — subprocess.run refuses any arg
+# containing \x00 (ValueError: embedded null byte), which crashed the whole
+# poll before _save_seen and blocked the mailbox behind one DMARC ZIP.
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _strip_html(html: str) -> str:
@@ -123,7 +141,9 @@ def _strip_html(html: str) -> str:
 
 
 def _clean_text(s: str) -> str:
-    return _WS.sub(" ", s).strip()
+    # Strip control/null bytes BEFORE whitespace-collapse — universal safety net
+    # so no decoded payload from any path can carry a null into the surface call.
+    return _WS.sub(" ", _CTRL.sub("", s)).strip()
 
 
 def _load_seen() -> set[str]:
