@@ -1,8 +1,8 @@
 import { readFileSync, existsSync, writeFileSync } from 'fs';
 import { join, basename } from 'path';
-import { homedir } from 'os';
 import type { CtxEnv } from '../types/index.js';
 import { ensureDir } from './atomic.js';
+import { resolveCtxRoot } from './paths.js';
 import { validateAgentName, validateOrgName } from './validate.js';
 import { stripBom } from './strip-bom.js';
 
@@ -89,11 +89,13 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
     envFile.CTX_INSTANCE_ID ||
     'default';
 
+  // ctxRoot goes through the SHARED resolveCtxRoot (paths.ts) so this resolver
+  // and resolvePaths cannot diverge on the CTX_ROOT override. Precedence is
+  // preserved exactly: overrides > process.env.CTX_ROOT > envFile.CTX_ROOT >
+  // derived (the last three live inside resolveCtxRoot).
   const ctxRoot =
     overrides?.ctxRoot ||
-    process.env.CTX_ROOT ||
-    envFile.CTX_ROOT ||
-    join(homedir(), '.cortextos', instanceId);
+    resolveCtxRoot(instanceId, envFile.CTX_ROOT);
 
   const frameworkRoot =
     overrides?.frameworkRoot ||
