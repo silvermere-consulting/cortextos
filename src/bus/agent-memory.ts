@@ -50,7 +50,11 @@ export interface MemorySnapshot {
 }
 
 export interface MemoryThresholds {
-  /** Per-agent RSS (MB) ladder. */
+  /**
+   * Per-agent SESSION-PSS (MB) ladder — evaluated against session_pss_mb (the true
+   * per-session footprint), NOT the process-tree RSS sum. See evaluateMemoryAnomalies
+   * for why (class: rss_mb_is_a_tree_sum, fixed 2026-08-02).
+   */
   agent_warn_mb: number;
   agent_elevated_mb: number;
   agent_critical_mb: number;
@@ -66,9 +70,15 @@ export interface MemoryThresholds {
  * the per-agent ladder catches a single bloated agent on any box.
  */
 export const DEFAULT_MEMORY_THRESHOLDS: MemoryThresholds = {
-  agent_warn_mb: 1000,
-  agent_elevated_mb: 1300,
-  agent_critical_mb: 1600,
+  // Per-agent SESSION-PSS ladder (MB). ⚠️ PROVISIONAL / UNCALIBRATED (2026-08-02):
+  // guessed off a HEALTHY-ONLY distribution (session_pss 278–349 MB observed) with
+  // ZERO observed-breach data — the upper tail here is imagined, not measured. These
+  // are env-overridable (CTX_MEM_AGENT_*_MB); treat the FIRST real high-session_pss
+  // event as the calibration point and harvest it — do NOT re-guess from a desk.
+  // (Previously 1000/1300/1600, but that was TREE-SUM scale; see evaluateMemoryAnomalies.)
+  agent_warn_mb: 600,
+  agent_elevated_mb: 900,
+  agent_critical_mb: 1200,
   headroom_warn_pct: 15,
   headroom_elevated_pct: 10,
   headroom_critical_pct: 7,
@@ -124,8 +134,12 @@ export function parseAgentFromEnviron(environText: string): string | null {
 }
 
 /**
- * Classify a snapshot into anomalies (one per over-threshold agent + one for
- * low headroom). Pure — this is the load-bearing logic the analyst routes on.
+ * Classify a snapshot into anomalies. Per-agent: one anomaly per agent whose
+ * session_pss_mb exceeds the ladder WHILE the host is constrained (see the
+ * per-agent block for the two-gate rationale). Headroom: one anomaly when
+ * MemAvailable is low (the primary, box-relative OOM signal). Also returns
+ * sessionPssAbsent — agents skipped for missing session_pss — so a silent skip
+ * cannot pass as a clean evaluation. Pure — the load-bearing logic analyst routes on.
  * Severity: warning | critical; tier: warning | elevated | critical (matches the
  * disk monitor's shape so analyst routing is uniform). Steven-eligibility keys
  * off tier === 'critical'.
@@ -136,6 +150,17 @@ export interface MemoryAnomaly {
   severity: 'warning' | 'critical';
   tier: 'warning' | 'elevated' | 'critical';
   agent?: string;
+  /**
+   * scope:'agent' GATING figure — the true per-session footprint (PSS of the
+   * session-root pid). This is what the per-agent ladder tiers on. Undefined for
+   * headroom anomalies.
+   */
+  session_pss_mb?: number;
+  /**
+   * scope:'agent' CONTEXT only — the process-tree RSS sum. NOT the gate: it is
+   * inflated by an agent's own child builds (see evaluateMemoryAnomalies). Kept in
+   * the anomaly so a reader can see the tree-vs-session gap that caused the old FPs.
+   */
   rss_mb?: number;
   threshold_mb?: number;
   mem_available_mb: number;
@@ -143,29 +168,77 @@ export interface MemoryAnomaly {
   available_pct: number;
 }
 
+/**
+ * Result of evaluateMemoryAnomalies. `sessionPssAbsent` names every agent the
+ * per-agent arm SKIPPED because its session_pss_mb was unavailable — surfaced so a
+ * silent skip cannot masquerade as a clean evaluation. If the population wiring
+ * regresses fleet-wide, this list fills with every agent instead of a quiet green.
+ */
+export interface MemoryAnomalyResult {
+  anomalies: MemoryAnomaly[];
+  sessionPssAbsent: string[];
+}
+
 export function evaluateMemoryAnomalies(
   snap: MemorySnapshot,
   t: MemoryThresholds = DEFAULT_MEMORY_THRESHOLDS,
-): MemoryAnomaly[] {
+): MemoryAnomalyResult {
   const out: MemoryAnomaly[] = [];
+  const sessionPssAbsent: string[] = [];
   const base = {
     mem_available_mb: snap.mem_available_mb,
     mem_total_mb: snap.mem_total_mb,
     available_pct: snap.available_pct,
   };
 
-  // Per-agent RSS ladder.
+  // Per-agent SESSION-FOOTPRINT ladder.
+  //
+  // Fixed 2026-08-02 (class: rss_mb_is_a_tree_sum). This arm gates on
+  // session_pss_mb — the true per-session footprint (PSS of the session-root pid,
+  // shared pages divided by their sharers) — NOT rss_mb, which is a process-TREE
+  // SUM. A coding agent's own child builds inflate the tree-sum, so it tripped a
+  // ~1 GB ladder almost every cycle while its real footprint was ~300 MB (measured
+  // FPs 2026-08-01/02: engineer 1077/278, 1100/293, 1158/349; research 1261/320).
+  // That was a WRONG-OBJECT measurement — workload SHAPE read as memory pressure —
+  // not a wrong threshold, which is why the fix changes WHAT is measured, not the
+  // ceiling.
+  //
+  // ⚠️ TWO-PART FIX, MUST STAY TOGETHER — do NOT land "the simple half". The
+  // emitting caller (collect-memory-sample) must POPULATE a.session_pss_mb onto the
+  // snapshot AND this arm must READ it. Reading without the population wiring sees
+  // `undefined`, fires never, and is DISABLED — indistinguishable from a correctly
+  // desensitised arm on a fixture set made only of should-not-fire cases. The
+  // known-positive fixtures are the only thing that tell those two apart.
+  //
+  // GATE #2 — host pressure. A large per-session footprint is only PRESSURE when
+  // the host is ALSO constrained (available_pct below the headroom warn bar). A big
+  // session on a box with free RAM is workload, not pressure. So this arm is "name
+  // the disproportionate contributor when the host is already tight"; the headroom
+  // ladder below is the PRIMARY, box-relative OOM tripwire (it fires even when
+  // session_pss is unavailable, and catches many-medium-sessions no per-agent level
+  // could).
+  const hostConstrained = snap.mem_total_mb > 0 && snap.available_pct < t.headroom_warn_pct;
   for (const a of snap.agents) {
+    const footprint = a.session_pss_mb;
+    // Cannot measure the session footprint → SKIP this agent's arm, but RECORD the
+    // skip (observability: a silent skip is byte-identical to a clean eval). NEVER
+    // fall back to the tree-sum (that reintroduces the very defect). The headroom
+    // ladder still covers the box. Recorded regardless of host state — this is the
+    // DATA-health signal, not a pressure signal.
+    if (footprint == null) { sessionPssAbsent.push(a.agent); continue; }
+    // Not pressure unless the host is also tight (AND, not OR).
+    if (!hostConstrained) continue;
     let tier: MemoryAnomaly['tier'] | null = null;
     let threshold = 0;
-    if (a.rss_mb > t.agent_critical_mb) { tier = 'critical'; threshold = t.agent_critical_mb; }
-    else if (a.rss_mb > t.agent_elevated_mb) { tier = 'elevated'; threshold = t.agent_elevated_mb; }
-    else if (a.rss_mb > t.agent_warn_mb) { tier = 'warning'; threshold = t.agent_warn_mb; }
+    if (footprint > t.agent_critical_mb) { tier = 'critical'; threshold = t.agent_critical_mb; }
+    else if (footprint > t.agent_elevated_mb) { tier = 'elevated'; threshold = t.agent_elevated_mb; }
+    else if (footprint > t.agent_warn_mb) { tier = 'warning'; threshold = t.agent_warn_mb; }
     if (tier) {
       out.push({
         kind: 'memory', scope: 'agent',
         severity: tier === 'critical' ? 'critical' : 'warning',
-        tier, agent: a.agent, rss_mb: a.rss_mb, threshold_mb: threshold, ...base,
+        tier, agent: a.agent, session_pss_mb: footprint, rss_mb: a.rss_mb,
+        threshold_mb: threshold, ...base,
       });
     }
   }
@@ -187,7 +260,7 @@ export function evaluateMemoryAnomalies(
     }
   }
 
-  return out;
+  return { anomalies: out, sessionPssAbsent };
 }
 
 // ── Collection (best-effort /proc scan; Linux only, never throws) ────────────

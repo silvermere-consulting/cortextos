@@ -1088,10 +1088,10 @@ function emitMemoryAnomalies(
   env: ReturnType<typeof resolveEnv>,
   memory: MemorySnapshot,
   verdicts: SlopeVerdict[],
-): { emitted: number; suppressed: number } {
-  const level = evaluateMemoryAnomalies(memory, memoryThresholdsFromEnv());
+): { emitted: number; suppressed: number; sessionPssAbsent: string[] } {
+  const { anomalies: level, sessionPssAbsent } = evaluateMemoryAnomalies(memory, memoryThresholdsFromEnv());
   const { anomalies, suppressed_flat } = applySlopeToAnomalies(level, verdicts);
-  if (!anomalies.length && !suppressed_flat.length) return { emitted: 0, suppressed: 0 };
+  if (!anomalies.length && !suppressed_flat.length) return { emitted: 0, suppressed: 0, sessionPssAbsent };
   const paths = resolvePaths(env.agentName, env.instanceId, env.org);
   for (const a of anomalies) {
     if (a.kind === 'memory_slope') {
@@ -1104,8 +1104,8 @@ function emitMemoryAnomalies(
     } else {
       logEvent(paths, env.agentName, env.org, 'metric', 'anomaly_detected', a.severity, JSON.stringify({
         kind: 'memory', class: 'memory_pressure', scope: a.scope, tier: a.tier, agent: a.agent,
-        rss_mb: a.rss_mb, threshold_mb: a.threshold_mb, mem_available_mb: a.mem_available_mb,
-        mem_total_mb: a.mem_total_mb, available_pct: a.available_pct,
+        session_pss_mb: a.session_pss_mb, rss_mb: a.rss_mb, threshold_mb: a.threshold_mb,
+        mem_available_mb: a.mem_available_mb, mem_total_mb: a.mem_total_mb, available_pct: a.available_pct,
       }));
     }
   }
@@ -1114,11 +1114,11 @@ function emitMemoryAnomalies(
   for (const a of suppressed_flat) {
     logEvent(paths, env.agentName, env.org, 'metric', 'memory_trend', 'info', JSON.stringify({
       kind: 'memory', class: 'memory_pressure', scope: a.scope, tier: a.tier, agent: a.agent,
-      rss_mb: a.rss_mb, threshold_mb: a.threshold_mb,
+      session_pss_mb: a.session_pss_mb, rss_mb: a.rss_mb, threshold_mb: a.threshold_mb,
       suppressed: 'flat_baseline_same_session',
     }));
   }
-  return { emitted: anomalies.length, suppressed: suppressed_flat.length };
+  return { emitted: anomalies.length, suppressed: suppressed_flat.length, sessionPssAbsent };
 }
 
 busCommand
@@ -1137,15 +1137,41 @@ busCommand
     // the tree-sum; nothing evaluates it (evaluateAllSlopes reads only rss_mb).
     const sessionKeys = collectSessionKeys('/proc', env.ctxRoot);
     const sessionPss = collectSessionPss(sessionKeys, '/proc');
+    // TWO-PART FIX (2026-08-02, class rss_mb_is_a_tree_sum): the LEVEL arm gates on
+    // session_pss_mb, so the snapshot it evaluates MUST carry it. This path
+    // previously fed sessionPss ONLY into history — the emitter's snapshot never had
+    // it, so a naive session_pss read would see undefined and DISABLE the arm. Keep
+    // this population loop and evaluateMemoryAnomalies' session_pss gate together;
+    // neither half is safe alone. Mirrors metrics.ts (collect-metrics).
+    for (const a of memory.agents) {
+      const pss = sessionPss.get(a.agent);
+      if (pss != null) a.session_pss_mb = pss;
+    }
     const history = appendMemoryHistory(env.ctxRoot, memory, sessionKeys, t, undefined, sessionPss);
     const verdicts = evaluateAllSlopes(history, memory, t);
-    const { emitted, suppressed } = emitMemoryAnomalies(env, memory, verdicts);
+    const { emitted, suppressed, sessionPssAbsent } = emitMemoryAnomalies(env, memory, verdicts);
+    // Observability: a silent skip on missing session_pss is byte-identical to a
+    // clean eval. Surface the count EVERY cycle; alarm (warning event) only on TOTAL
+    // blanking — every sampled agent absent = the population wiring regressed
+    // fleet-wide (the exact failure this fix closed, re-appearing). Transient
+    // single-agent absence stays quiet in the count; partial-persistent absence is
+    // read from the count by analyst (accepted, owned).
+    if (memory.agents.length && sessionPssAbsent.length === memory.agents.length) {
+      const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+      logEvent(paths, env.agentName, env.org, 'metric', 'anomaly_detected', 'warning', JSON.stringify({
+        kind: 'memory', class: 'session_pss_unavailable',
+        note: 'per-agent memory arm evaluated NOBODY — session_pss absent for all sampled agents (population wiring?)',
+        skipped: sessionPssAbsent.length, agents: sessionPssAbsent,
+      }));
+    }
     console.log(JSON.stringify({
       sampled: memory.agents.length,
       history_samples: history.length,
       verdicts,
       anomalies_emitted: emitted,
       suppressed_flat: suppressed,
+      session_pss_absent: sessionPssAbsent.length,
+      session_pss_absent_agents: sessionPssAbsent,
     }, null, 2));
   });
 
