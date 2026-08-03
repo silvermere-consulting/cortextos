@@ -5,7 +5,7 @@ import { join, dirname } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { checkRecipient, buildRefusal, priorityBodyMismatch } from '../bus/recipient-check.js';
 import { validateAgentName } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile, parseTaskStatus } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, reassignTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile, parseTaskStatus } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -218,7 +218,8 @@ busCommand
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
   .option('--note <text>', 'Reason for the transition — lands in the task audit log (visible via task-history)')
   .option('--due <date>', 'Set target date (ISO YYYY-MM-DD); pass an empty string to clear it')
-  .action((id: string, status: string, opts: { note?: string; due?: string }) => {
+  .option('--assignee <name>', 'Reassign (hand down) the task to another agent — works on ANY status, unlike claim-task, and fires an inbox dispatch so the new assignee actually sees it')
+  .action((id: string, status: string, opts: { note?: string; due?: string; assignee?: string }) => {
     try {
       parseTaskStatus(status);
     } catch (err) {
@@ -246,7 +247,27 @@ busCommand
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
-    console.log(`Updated ${id} -> ${status}${opts.note ? ' (note recorded)' : ''}${opts.due !== undefined ? ' (due set)' : ''}`);
+    // Reassignment (discoverable hand-down). Done AFTER the status write so a
+    // bad status still fails loudly before we touch assignment — and so the
+    // move lives where people look (update-task), not behind claim-task's
+    // pending-gated, self-pull-named door.
+    if (opts.assignee) {
+      try {
+        reassignTask(paths, id, opts.assignee, env.agentName);
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+      // Fire an inbox dispatch so "routed to you" is a STATE CHANGE WITH A READ
+      // PATH, not prose in a note that changed nothing (the silent-routing bug
+      // this option exists to close). Skip a self-reassignment.
+      if (opts.assignee !== env.agentName) {
+        const assigneePaths = resolvePaths(opts.assignee, env.instanceId, env.org);
+        sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
+          `Task reassigned to you: ${id} (status ${status})${opts.note ? ` — ${opts.note.slice(0, 120)}` : ''}`);
+      }
+    }
+    console.log(`Updated ${id} -> ${status}${opts.note ? ' (note recorded)' : ''}${opts.due !== undefined ? ' (due set)' : ''}${opts.assignee ? ` (reassigned to ${opts.assignee})` : ''}`);
   });
 
 busCommand

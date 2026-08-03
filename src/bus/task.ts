@@ -518,6 +518,69 @@ export function claimTask(
 }
 
 /**
+ * Reassign a task to a different agent, regardless of its current status.
+ *
+ * This is the DISCOVERABLE hand-down path. `claimTask` models claim-from-pool:
+ * it is pending-gated, lock-based, and refuses cross-assignment, so it cannot
+ * move an in_progress task onto another agent's board. That gap is why routing
+ * a live task used to fail silently — the sender described the move in a note
+ * that changed nothing (assigned_to stayed put). `reassignTask` closes it:
+ * it sets assigned_to on ANY status and rewrites the claim lock so claim state
+ * and assigned_to stay consistent.
+ *
+ * The task JSON's `assigned_to` is authoritative; the claim-lock rewrite is
+ * best-effort (a stale lock would only mis-name the owner to a future
+ * claimTask, and assigned_to still tells the truth). Returns the updated task
+ * so the caller can dispatch an inbox notification to the new assignee.
+ */
+export function reassignTask(
+  paths: BusPaths,
+  taskId: string,
+  newAssignee: string,
+  byAgent: string,
+): Task {
+  const filePath = findTaskFile(paths, taskId);
+  if (!filePath) {
+    throw new Error(
+      `Task ${taskId} not found in any org under ${paths.ctxRoot}/orgs/`,
+    );
+  }
+  let task: Task;
+  try {
+    task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+  } catch (err) {
+    throw new Error(`Task ${taskId} reassign failed (unreadable): ${err}`);
+  }
+  const prevAssignee = task.assigned_to;
+  const now = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  task.assigned_to = newAssignee;
+  task.updated_at = now;
+  try {
+    atomicWriteSync(filePath, JSON.stringify(task));
+  } catch (err) {
+    throw new Error(`Task ${taskId} reassign commit failed: ${err}`);
+  }
+  // Keep the claim lock consistent with assigned_to. A stale lock naming the
+  // OLD owner would make a later claimTask reject the new owner and report the
+  // wrong owner. Overwrite (not O_EXCL) — reassignment is authoritative and
+  // takes over the lock. Best-effort: assigned_to on the task is the truth, so
+  // a lock-write failure must not strand a completed reassignment.
+  try {
+    const claimsDir = join(paths.taskDir, '.claims');
+    ensureDir(claimsDir);
+    writeFileSync(join(claimsDir, `${taskId}.claim`), `${newAssignee}\t${now}\n`, { encoding: 'utf-8', mode: 0o600 });
+  } catch {
+    // best-effort — assigned_to on the task is authoritative
+  }
+  appendTaskAudit(paths, taskId, {
+    event: 'update',
+    agent: byAgent,
+    note: `reassigned ${prevAssignee ?? 'unassigned'} -> ${newAssignee} by ${byAgent}`,
+  });
+  return task;
+}
+
+/**
  * Complete a task. Sets status to done, completed_at, and optional result.
  * Matches bash complete-task.sh behavior, with the cross-org fallback from
  * findTaskFile so an assignee in one org can complete a task filed by an

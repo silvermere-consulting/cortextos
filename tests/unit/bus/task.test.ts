@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile, parseTaskStatus, TASK_STATUSES } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, claimTask, reassignTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile, parseTaskStatus, TASK_STATUSES } from '../../../src/bus/task';
 import type { BusPaths } from '../../../src/types';
 
 describe('Task Management', () => {
@@ -854,5 +854,76 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
     expect(report.archived.map(a => a.id)).toEqual([id]);
     // Active JSON still present
     expect(existsSync(join(paths.taskDir, `${id}.json`))).toBe(true);
+  });
+});
+
+describe('reassignTask — discoverable hand-down (works on any status)', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-reassign-test-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'x'),
+      inflight: join(testDir, 'inflight', 'x'),
+      processed: join(testDir, 'processed', 'x'),
+      logDir: join(testDir, 'logs', 'x'),
+      stateDir: join(testDir, 'state', 'x'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    };
+  });
+
+  afterEach(() => { rmSync(testDir, { recursive: true, force: true }); });
+
+  it('reassigns an IN_PROGRESS task — the exact case claimTask cannot do', () => {
+    const id = createTask(paths, 'chief', 'acme', 'Live work');
+    claimTask(paths, id, 'chief');                 // now in_progress, assigned chief
+    const task = reassignTask(paths, id, 'engineer', 'chief');
+    expect(task.assigned_to).toBe('engineer');
+    expect(task.status).toBe('in_progress');       // status preserved, not reset
+    const onDisk = JSON.parse(readFileSync(join(paths.taskDir, `${id}.json`), 'utf-8'));
+    expect(onDisk.assigned_to).toBe('engineer');
+  });
+
+  it('rewrites the claim lock to the new assignee so claim state stays consistent', () => {
+    const id = createTask(paths, 'chief', 'acme', 'Hand down');
+    claimTask(paths, id, 'chief');
+    reassignTask(paths, id, 'engineer', 'chief');
+    const lock = readFileSync(join(paths.taskDir, '.claims', `${id}.claim`), 'utf-8');
+    expect(lock.split('\t')[0]).toBe('engineer');
+  });
+
+  it('writes an audit entry naming the from->to->by move', () => {
+    const id = createTask(paths, 'chief', 'acme', 'Auditable move');
+    reassignTask(paths, id, 'engineer', 'chief');
+    const audit = readTaskAudit(paths, id);
+    const last = audit[audit.length - 1];
+    expect(last.event).toBe('update');
+    expect(last.agent).toBe('chief');
+    expect(last.note).toMatch(/reassigned .* -> engineer by chief/);
+  });
+
+  it('works on a NON-pending status (blocked) — no pending gate', () => {
+    const id = createTask(paths, 'chief', 'acme', 'Blocked work');
+    updateTask(paths, id, 'blocked');
+    const task = reassignTask(paths, id, 'research', 'chief');
+    expect(task.assigned_to).toBe('research');
+    expect(task.status).toBe('blocked');
+  });
+
+  it('leaves the reassigned task re-claimable by the new owner (idempotent lock)', () => {
+    const id = createTask(paths, 'chief', 'acme', 'Then claimed');
+    reassignTask(paths, id, 'engineer', 'chief');
+    // The lock now names engineer, so engineer's later claim is idempotent (no throw).
+    const again = claimTask(paths, id, 'engineer');
+    expect(again.assigned_to).toBe('engineer');
+  });
+
+  it('throws "not found" for an unknown task id', () => {
+    expect(() => reassignTask(paths, 'task_nonexistent_000', 'engineer', 'chief')).toThrow(/not found in any org/);
   });
 });
