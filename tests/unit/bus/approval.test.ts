@@ -34,8 +34,25 @@ import {
   listPendingApprovals,
   evaluateApprovalPingGate,
   resurfaceDeferredApprovalPings,
+  isIntendedApprovalRecipient,
 } from '../../../src/bus/approval';
 import type { BusPaths } from '../../../src/types';
+
+/**
+ * Declare an agent an INTENDED approval recipient (or not) by writing its
+ * config.json approval_rules.notify_operator_chat. Kept SEPARATE from
+ * writeAgentEnv on purpose: the intended-recipient gate is fail-closed
+ * (absent = false), so a test that does NOT call this inherits PRODUCTION's
+ * real default (no ping), never a phantom non-prod default. Recipient status is
+ * therefore a visible, explicit line only in the tests that turn it on.
+ */
+function writeApprovalRecipient(agentDir: string, recipient: boolean): void {
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(
+    join(agentDir, 'config.json'),
+    JSON.stringify({ approval_rules: { always_ask: [], never_ask: [], notify_operator_chat: recipient } }),
+  );
+}
 
 let testDir: string;
 let frameworkRoot: string;
@@ -282,6 +299,7 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
   it('pings the agent bot when agentDir/.env/BOT_TOKEN/CHAT_ID are all present', async () => {
     const agentDir = join(testDir, 'agent-with-bot');
     writeAgentEnv(agentDir, { BOT_TOKEN: 'test-token-123', CHAT_ID: '987654321' });
+    writeApprovalRecipient(agentDir, true);
 
     const id = await createApproval(
       paths,
@@ -346,6 +364,9 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
   it('skips with a warn when BOT_TOKEN is missing from .env', async () => {
     const agentDir = join(testDir, 'agent-missing-token');
     writeAgentEnv(agentDir, { CHAT_ID: '987654321' });
+    // A would-be RECIPIENT: proves the missing-token check precedes (and
+    // short-circuits) the recipient gate — the deliberate gate ordering.
+    writeApprovalRecipient(agentDir, true);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Missing token', 'deployment', undefined, frameworkRoot, agentDir);
@@ -359,6 +380,8 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
   it('skips with a warn when CHAT_ID is missing from .env', async () => {
     const agentDir = join(testDir, 'agent-missing-chat');
     writeAgentEnv(agentDir, { BOT_TOKEN: 'test-token-123' });
+    // Would-be RECIPIENT: proves the missing-CHAT_ID check precedes the recipient gate.
+    writeApprovalRecipient(agentDir, true);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Missing chat', 'deployment', undefined, frameworkRoot, agentDir);
@@ -374,6 +397,7 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
     // channel is best-effort, so is the agent-bot ping.
     const agentDir = join(testDir, 'agent-tg-down');
     writeAgentEnv(agentDir, { BOT_TOKEN: 'test-token-123', CHAT_ID: '987654321' });
+    writeApprovalRecipient(agentDir, true);
     telegramSendMessageSpy.mockRejectedValueOnce(new Error('telegram unreachable'));
 
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Telegram down', 'deployment', undefined, frameworkRoot, agentDir);
@@ -385,6 +409,7 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
   it('message body includes title, category, agent, id, context, and the orchestrator-chat hint', async () => {
     const agentDir = join(testDir, 'agent-body-test');
     writeAgentEnv(agentDir, { BOT_TOKEN: 'test-token-123', CHAT_ID: '987654321' });
+    writeApprovalRecipient(agentDir, true);
 
     const id = await createApproval(
       paths,
@@ -541,6 +566,7 @@ describe('NIGHT-GATE for the approval ping (task_1785376444454)', () => {
     forceNight();
     const agentDir = derivedAgentDir('alice');
     writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-night', CHAT_ID: 'chat-night' });
+    writeApprovalRecipient(agentDir, true);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const id = await createApproval(
@@ -564,6 +590,7 @@ describe('NIGHT-GATE for the approval ping (task_1785376444454)', () => {
     forceDay();
     const agentDir = derivedAgentDir('alice');
     writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-day', CHAT_ID: 'chat-day' });
+    writeApprovalRecipient(agentDir, true);
 
     const id = await createApproval(
       paths, 'alice', 'TestOrg', 'Daytime approval', 'deployment', 'ctx', frameworkRoot, agentDir,
@@ -579,6 +606,7 @@ describe('NIGHT-GATE for the approval ping (task_1785376444454)', () => {
     forceNight();
     const agentDir = derivedAgentDir('alice');
     writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-r', CHAT_ID: 'chat-r' });
+    writeApprovalRecipient(agentDir, true);
     const id = await createApproval(
       paths, 'alice', 'TestOrg', 'Deferred then resurfaced', 'deployment', 'ctx', frameworkRoot, agentDir,
     );
@@ -610,6 +638,7 @@ describe('NIGHT-GATE for the approval ping (task_1785376444454)', () => {
     forceNight();
     const agentDir = derivedAgentDir('alice');
     writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-n', CHAT_ID: 'chat-n' });
+    writeApprovalRecipient(agentDir, true);
     const id = await createApproval(
       paths, 'alice', 'TestOrg', 'Still night', 'deployment', 'ctx', frameworkRoot, agentDir,
     );
@@ -627,6 +656,135 @@ describe('NIGHT-GATE for the approval ping (task_1785376444454)', () => {
     // Marker retained — not discarded.
     const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
     expect(approval.metadata.ping_deferred).toBeDefined();
+  });
+});
+
+describe('INTENDED-RECIPIENT gate for the approval ping (fail-closed)', () => {
+  // Local .env writer. Recipient status is written SEPARATELY via the
+  // module-scope writeApprovalRecipient so a test that omits it inherits
+  // production's real default (config-absent = NOT a recipient = no ping).
+  function writeAgentEnv(agentDir: string, vars: Record<string, string>): void {
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, '.env'), Object.entries(vars).map(([k, v]) => `${k}=${v}`).join('\n') + '\n');
+  }
+  const forceNight = () => {
+    process.env.CTX_DAY_MODE_START = '00:00';
+    process.env.CTX_DAY_MODE_END = '00:00';
+  };
+
+  describe('isIntendedApprovalRecipient (pure helper)', () => {
+    it('true only when approval_rules.notify_operator_chat === true', () => {
+      const dir = join(testDir, 'recip-true');
+      writeApprovalRecipient(dir, true);
+      expect(isIntendedApprovalRecipient(dir)).toBe(true);
+    });
+    it('false when the flag is explicitly false', () => {
+      const dir = join(testDir, 'recip-false');
+      writeApprovalRecipient(dir, false);
+      expect(isIntendedApprovalRecipient(dir)).toBe(false);
+    });
+    it('false when the flag is absent (approval_rules present, notify_operator_chat missing)', () => {
+      const dir = join(testDir, 'recip-absent-flag');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'config.json'), JSON.stringify({ approval_rules: { always_ask: [], never_ask: [] } }));
+      expect(isIntendedApprovalRecipient(dir)).toBe(false);
+    });
+    it('false when approval_rules is absent entirely', () => {
+      const dir = join(testDir, 'recip-no-rules');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'config.json'), JSON.stringify({ agent_name: 'x' }));
+      expect(isIntendedApprovalRecipient(dir)).toBe(false);
+    });
+    it('false when config.json is missing (fail-closed)', () => {
+      const dir = join(testDir, 'recip-no-config');
+      mkdirSync(dir, { recursive: true });
+      expect(isIntendedApprovalRecipient(dir)).toBe(false);
+    });
+    it('false when config.json is malformed (fail-closed, never throws)', () => {
+      const dir = join(testDir, 'recip-bad-json');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'config.json'), '{ not valid json');
+      expect(isIntendedApprovalRecipient(dir)).toBe(false);
+    });
+    it('false when agentDir is undefined', () => {
+      expect(isIntendedApprovalRecipient(undefined)).toBe(false);
+    });
+  });
+
+  it('DAY + NON-recipient: persists the approval but sends NO 1:1 ping (warn names the reason)', async () => {
+    // module beforeEach forces DAY, so this is the pure recipient gate, not the clock.
+    const agentDir = join(testDir, 'nonrecip-day');
+    writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-x', CHAT_ID: 'chat-x' });
+    writeApprovalRecipient(agentDir, false);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const id = await createApproval(
+      paths, 'alice', 'TestOrg', 'Specialist approval', 'deployment', 'ctx', frameworkRoot, agentDir,
+    );
+
+    // Approval still created + visible on the dashboard — only the direct ping is gated.
+    expect(existsSync(join(paths.approvalDir, 'pending', `${id}.json`))).toBe(true);
+    expect(telegramSendMessageSpy).not.toHaveBeenCalled();
+    const warnCalls = warnSpy.mock.calls.map((c) => c.join(' '));
+    expect(warnCalls.some((w) => w.includes('not a configured approval recipient') && w.includes(id))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it('NIGHT + NON-recipient: writes NO ping_deferred marker (a ping that will never fire is not "deferred")', async () => {
+    forceNight();
+    const agentDir = join(testDir, 'nonrecip-night');
+    writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-y', CHAT_ID: 'chat-y' });
+    writeApprovalRecipient(agentDir, false);
+
+    const id = await createApproval(
+      paths, 'alice', 'TestOrg', 'Specialist night approval', 'deployment', 'ctx', frameworkRoot, agentDir,
+    );
+
+    expect(telegramSendMessageSpy).not.toHaveBeenCalled();
+    const approval = JSON.parse(readFileSync(join(paths.approvalDir, 'pending', `${id}.json`), 'utf-8'));
+    expect(approval.status).toBe('pending'); // still persisted, never discarded
+    // No marker: skipping it stops the resurface path from pinging a non-recipient at day-start.
+    expect(approval.metadata?.ping_deferred).toBeUndefined();
+  });
+
+  it('resurface: a NON-recipient with a pre-existing deferred marker is NOT pinged (choke-point holds on the resurface path too)', async () => {
+    // Simulate a marker written before this fix, or a config flipped to false
+    // after the marker existed: the gate inside pingAgentChatId must still hold.
+    const agentDir = join(frameworkRoot, 'orgs', 'TestOrg', 'agents', 'alice');
+    writeAgentEnv(agentDir, { BOT_TOKEN: 'tok-z', CHAT_ID: 'chat-z' });
+    writeApprovalRecipient(agentDir, false);
+    const pendingDir = join(paths.approvalDir, 'pending');
+    mkdirSync(pendingDir, { recursive: true });
+    const id = 'approval_pre_marker';
+    writeFileSync(
+      join(pendingDir, `${id}.json`),
+      JSON.stringify({
+        id,
+        title: 'Pre-existing deferred',
+        requesting_agent: 'alice',
+        org: 'TestOrg',
+        category: 'deployment',
+        status: 'pending',
+        description: 'ctx',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        resolved_at: null,
+        resolved_by: null,
+        metadata: { ping_deferred: { since: '2026-01-01T00:00:00Z', reason: 'test' } },
+      }),
+    );
+
+    const sent: unknown[] = [];
+    await resurfaceDeferredApprovalPings(paths, {
+      projectRoot: frameworkRoot,
+      mode: 'day',
+      send: async (...a) => {
+        sent.push(a);
+      },
+    });
+
+    // The security property: NO ping to a non-recipient, even in day mode, even with a marker present.
+    expect(sent).toHaveLength(0);
   });
 });
 

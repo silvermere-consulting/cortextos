@@ -185,6 +185,20 @@ export interface AgentConfig {
   approval_rules?: {
     always_ask: string[];
     never_ask: string[];
+    /**
+     * Does this agent's operator 1:1 chat (BOT_TOKEN+CHAT_ID in .env) receive
+     * approval pings when this agent runs create-approval? FAIL-CLOSED:
+     * absent/false = NO 1:1 ping (the safe default). This converts the
+     * UNMEASURED case into the SAFE one — an agent nobody has decided about
+     * does not direct-ping a human who may not want approval notifications, and
+     * (for silvermere specialists whose CHAT_ID is the user's own chat) does not
+     * bypass the orchestrator-routing rule. Set true ONLY for agents whose
+     * CHAT_ID is an intended approval recipient (e.g. the orchestrator, the one
+     * sanctioned direct path to the user). Deliberately NOT written into
+     * add-agent defaults so absent=false stays true by construction. Read by
+     * isIntendedApprovalRecipient in src/bus/approval.ts.
+     */
+    notify_operator_chat?: boolean;
   };
   ecosystem?: EcosystemConfig;
   /** Context window % at which to warn agent + user. Default: 70. Absent = observe-only. */

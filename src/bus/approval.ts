@@ -219,6 +219,33 @@ function buildApprovalPingMessage(
  * Errors from the network round-trip are suppressed: a Telegram outage
  * must not block approval creation.
  */
+/**
+ * FAIL-CLOSED gate: is this agent's operator 1:1 chat an INTENDED recipient of
+ * approval pings? Reads config.json `approval_rules.notify_operator_chat`.
+ *
+ * Default — absent flag, false, missing/unreadable/malformed config, or no
+ * agentDir — is FALSE (do NOT ping). This converts the UNMEASURED case into the
+ * SAFE one: an agent nobody has decided about does not direct-ping a human who
+ * may not want approval notifications (e.g. a 1:1 bot whose operator has not
+ * onboarded), and does not bypass orchestrator routing for a specialist whose
+ * CHAT_ID resolves to the user's own chat. An intended recipient must be
+ * explicitly opted in. Enforced at the single ping choke point so the day path
+ * and the night-resurface path are both covered without any caller remembering.
+ */
+export function isIntendedApprovalRecipient(agentDir: string | undefined): boolean {
+  if (!agentDir) return false;
+  try {
+    const cfgPath = join(agentDir, 'config.json');
+    if (!existsSync(cfgPath)) return false;
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8')) as {
+      approval_rules?: { notify_operator_chat?: boolean };
+    };
+    return cfg.approval_rules?.notify_operator_chat === true;
+  } catch {
+    return false; // unreadable/malformed config -> fail closed (do not ping)
+  }
+}
+
 function pingAgentChatId(
   agentDir: string | undefined,
   approvalId: string,
@@ -244,6 +271,22 @@ function pingAgentChatId(
   if (!botToken || !chatId) {
     console.warn(
       `[approval] BOT_TOKEN or CHAT_ID missing in ${envPath} — skipping agent-bot Telegram ping for ${approvalId}.`,
+    );
+    return Promise.resolve();
+  }
+
+  // INTENDED-RECIPIENT gate (fail-closed). Placed LAST — after the No-agentDir /
+  // missing-.env / missing-token checks — so those keep firing as before and
+  // only this policy gate is new. Both the day-ping call site and the
+  // night-resurface call site route through this one function, so gating here
+  // (not per-caller) covers both. An agent whose operator chat is not a
+  // configured approval recipient is never pinged, even in day mode: this is
+  // the code guard that enforces "specialists route approvals via the
+  // orchestrator" and lets a per-agent prose rule retire.
+  if (!isIntendedApprovalRecipient(agentDir)) {
+    console.warn(
+      `[approval] ${agentName}'s operator chat is not a configured approval recipient ` +
+        `(config.approval_rules.notify_operator_chat !== true) — skipping agent-bot ping for ${approvalId}.`,
     );
     return Promise.resolve();
   }
@@ -368,6 +411,12 @@ export async function createApproval(
   // The approval itself is ALWAYS persisted — only the ping is clock-gated.
   const clockMode = resolveContactClockMode(org, frameworkRoot);
   const pingGate = evaluateApprovalPingGate(clockMode);
+  // Whether this agent's operator chat is an intended approval recipient. Used
+  // to skip the defer marker for non-recipients (below): a ping_deferred marker
+  // for a ping the recipient gate will never deliver is a false state that would
+  // outlive the approval and mislead the resurface path. The day-ping itself is
+  // gated independently inside pingAgentChatId (the choke point).
+  const isRecipient = isIntendedApprovalRecipient(agentDir);
 
   const approval: Approval = {
     id: approvalId,
@@ -383,7 +432,7 @@ export async function createApproval(
     resolved_by: null,
     ...(metadata ? { metadata } : {}),
   };
-  if (pingGate.defer) {
+  if (pingGate.defer && isRecipient) {
     approval.metadata = {
       ...(approval.metadata || {}),
       ping_deferred: { since: now, reason: pingGate.reason },
@@ -415,9 +464,14 @@ export async function createApproval(
   // ping resurfaces at day-start.
   if (pingGate.deliver) {
     await pingAgentChatId(agentDir, approvalId, title, category, agentName, context);
-  } else {
+  } else if (isRecipient) {
     console.warn(
       `[approval] ${pingGate.reason} — ${approvalId} persisted to pending; agent-bot ping held for day-start.`,
+    );
+  } else {
+    console.warn(
+      `[approval] contact-clock NIGHT and ${agentName}'s operator chat is not a configured approval recipient — ` +
+        `${approvalId} persisted to pending; no agent-bot ping, no deferral.`,
     );
   }
 
