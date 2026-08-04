@@ -1,8 +1,7 @@
 import { NextRequest } from 'next/server';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync } from 'fs';
 import path from 'path';
-import os from 'os';
-import { getCTXRoot, getFrameworkRoot } from '@/lib/config';
+import { guardKbPath, BINARY_DOC_EXTS } from '@/lib/kb-path-guard';
 
 export const dynamic = 'force-dynamic';
 
@@ -20,41 +19,23 @@ const MIME: Record<string, string> = {
 /**
  * GET /api/kb/document/download?path=<absolute-path>&org=<org>
  *
- * Serves binary files (PDFs, images) with correct Content-Type.
- * Same path allowlist as /api/kb/document — only files under
- * CTX_ROOT, frameworkRoot, or ~/.cortextos are served.
+ * Serves binary KB documents (PDFs, images) with correct Content-Type.
+ *
+ * Security: same shared guard as /api/kb/document (guardKbPath), with the
+ * BINARY servable-extension set — the resolved path must sit under
+ * <root>/orgs[/<org>], must not be a credential-shaped file, and must carry a
+ * servable binary-document extension. See src/lib/kb-path-guard.ts.
  */
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const filePath = searchParams.get('path') ?? '';
   const org = searchParams.get('org') ?? '';
 
-  if (!filePath) {
-    return Response.json({ error: 'path parameter required' }, { status: 400 });
+  const guard = guardKbPath(filePath, org, BINARY_DOC_EXTS);
+  if (!guard.ok) {
+    return Response.json({ error: guard.error }, { status: guard.status });
   }
-  if (org && !/^[a-z0-9_-]+$/.test(org)) {
-    return Response.json({ error: 'Invalid org' }, { status: 400 });
-  }
-
-  const resolved = path.resolve(filePath);
-
-  const ctxRoot = path.resolve(getCTXRoot());
-  const frameworkRoot = path.resolve(getFrameworkRoot());
-  const homeDir = os.homedir();
-  const cortextosRoot = path.resolve(path.join(homeDir, '.cortextos'));
-
-  const allowed =
-    resolved.startsWith(ctxRoot + path.sep) ||
-    resolved.startsWith(frameworkRoot + path.sep) ||
-    resolved.startsWith(cortextosRoot + path.sep);
-
-  if (!allowed) {
-    return Response.json({ error: 'Path not within allowed directories' }, { status: 403 });
-  }
-
-  if (!existsSync(resolved)) {
-    return Response.json({ error: 'File not found' }, { status: 404 });
-  }
+  const resolved = guard.resolved;
 
   const ext = path.extname(resolved).slice(1).toLowerCase();
   const contentType = MIME[ext] ?? 'application/octet-stream';

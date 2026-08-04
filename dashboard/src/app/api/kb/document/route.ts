@@ -1,52 +1,32 @@
 import { NextRequest } from 'next/server';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync } from 'fs';
 import path from 'path';
-import os from 'os';
-import { getCTXRoot, getFrameworkRoot } from '@/lib/config';
+import { guardKbPath, TEXT_DOC_EXTS } from '@/lib/kb-path-guard';
 
 export const dynamic = 'force-dynamic';
 
 /**
  * GET /api/kb/document?path=<absolute-path>&org=<org>
  *
- * Returns the full content of a KB source document.
- * Security: only files under CTX_ROOT or frameworkRoot/orgs/ are served.
+ * Returns the full TEXT content of a KB source document.
  *
- * Response: { content: string, filename: string, ext: string }
+ * Security: access is gated by the shared guardKbPath() — the resolved path must
+ * sit under <root>/orgs[/<org>], must not be a credential-shaped file, and must
+ * carry a servable text-document extension. See src/lib/kb-path-guard.ts. The
+ * guard is shared with /api/kb/document/download so the rule lives in one place.
+ *
+ * Response: { content: string, filename: string, ext: string, path: string }
  */
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const filePath = searchParams.get('path') ?? '';
   const org = searchParams.get('org') ?? '';
 
-  if (!filePath) {
-    return Response.json({ error: 'path parameter required' }, { status: 400 });
+  const guard = guardKbPath(filePath, org, TEXT_DOC_EXTS);
+  if (!guard.ok) {
+    return Response.json({ error: guard.error }, { status: guard.status });
   }
-  if (org && !/^[a-z0-9_-]+$/.test(org)) {
-    return Response.json({ error: 'Invalid org' }, { status: 400 });
-  }
-
-  // Resolve to absolute, normalised path (prevents traversal via ../)
-  const resolved = path.resolve(filePath);
-
-  // Allowlist: only serve files under CTX_ROOT, frameworkRoot (whole repo), or ~/.cortextos
-  const ctxRoot = path.resolve(getCTXRoot());
-  const frameworkRoot = path.resolve(getFrameworkRoot());
-  const homeDir = os.homedir();
-  const cortextosRoot = path.resolve(path.join(homeDir, '.cortextos'));
-
-  const allowed =
-    resolved.startsWith(ctxRoot + path.sep) ||
-    resolved.startsWith(frameworkRoot + path.sep) ||
-    resolved.startsWith(cortextosRoot + path.sep);
-
-  if (!allowed) {
-    return Response.json({ error: 'Path not within allowed directories' }, { status: 403 });
-  }
-
-  if (!existsSync(resolved)) {
-    return Response.json({ error: 'File not found' }, { status: 404 });
-  }
+  const resolved = guard.resolved;
 
   let content: string;
   try {
