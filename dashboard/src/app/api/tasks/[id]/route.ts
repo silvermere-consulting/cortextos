@@ -28,6 +28,28 @@ function isValidAgentName(name: string): boolean {
   return typeof name === 'string' && /^[a-z0-9_-]+$/.test(name) && name.length <= 64;
 }
 
+// Recipients for a task status-change notification: BOTH the creator and the
+// assignee (the bug this fixes: it used to key on created_by ONLY, so a task
+// dispatched by one agent to another never notified the assignee). Deduped, so
+// a self-created + self-assigned task gets ONE message, not two. Filtered to
+// real agent names — never 'dashboard'/'human'/'user', never a name that fails
+// the bus-CLI-safe whitelist. Exported for unit testing.
+//
+// No skip-actor filter, deliberately: this PATCH route is reached ONLY from the
+// dashboard UI (the bus CLI writes the task store directly and never calls this
+// HTTP handler — the handler is what SPAWNS the bus scripts). So the actor is a
+// human and is never a member of this agent recipient set; a self-page is
+// unreachable and a guard against it would be dead code.
+export function taskNotifyRecipients(
+  createdBy: string | undefined,
+  assignedTo: string | undefined,
+): string[] {
+  const nonAgent = new Set(['dashboard', 'human', 'user']);
+  return [...new Set([createdBy, assignedTo])].filter(
+    (r): r is string => !!r && !nonAgent.has(r) && isValidAgentName(r),
+  );
+}
+
 // Cap free-text fields (note, outputSummary) to a safe upper bound before
 // forwarding them as positional args to bus scripts.
 const MAX_FREE_TEXT_LEN = 2000;
@@ -318,31 +340,43 @@ export async function PATCH(
       throw new Error(spawnResult.stderr || spawnResult.stdout || 'Script failed');
     }
 
-    // Notify the task creator when a task is completed or status changes significantly.
+    // Notify the task's CREATOR AND ASSIGNEE when the status actually CHANGED.
+    // Two fixes here, both deliberate:
+    //  (1) targets — was created_by ONLY, so a task dispatched by one agent to
+    //      another never reached the assignee. Now both (deduped, filtered).
+    //  (2) status-move gate — `status !== task.status`. `task` was read at the
+    //      top of this handler BEFORE the update, so task.status is the OLD
+    //      value; a PATCH that re-sets the same status is a benign re-touch and
+    //      must NOT page anyone, or the notify degrades into furniture.
+    // ACCEPTED CONSEQUENCE of the gate (priced, not emergent): a same-status
+    // PATCH — e.g. an "add note" that re-sends the current status — no longer
+    // notifies. The suppressed ping was itself MISLABELLED ("Task status updated
+    // to X" when X did not change), so dropping it is net-correct, not just
+    // quieter. If note/comment notification is genuinely wanted, it is a
+    // separate feature with its own correct message, built when reachability
+    // shows up — not a hypothesis. (Reassignment is unaffected: it is the PUT
+    // handler and notifies the new assignee there, never this path.)
     // This is how agents find out their blocked tasks can be unblocked.
-    if (task?.source_file) {
+    if (task?.source_file && status !== task.status) {
       try {
-        const fs = await import('fs/promises');
-        const raw = await fs.default.readFile(task.source_file, 'utf-8');
+        const raw = fs.readFileSync(task.source_file, 'utf-8');
         const taskData = JSON.parse(raw);
-        const createdBy: string | undefined = taskData.created_by;
-        // Only notify agents (not 'dashboard', 'human', etc.) and only when
-        // the recipient name passes the agent-name whitelist — prevents
-        // passing crafted names into the bus CLI.
-        const agentNames = new Set(['dashboard', 'human', 'user']);
-        if (createdBy && !agentNames.has(createdBy) && isValidAgentName(createdBy)) {
+        const recipients = taskNotifyRecipients(taskData.created_by, taskData.assigned_to);
+        if (recipients.length > 0) {
           const rawMsg = status === 'completed'
             ? `Human task completed by user: [${id}] ${task.title} - you can now unblock your work`
             : `Task status updated to ${status}: [${id}] ${task.title}`;
           const msg = capText(rawMsg);
-          spawnSync(
-            'node',
-            [
-              path.join(frameworkRoot, 'dist', 'cli.js'),
-              'bus', 'send-message', createdBy, 'normal', msg,
-            ],
-            { timeout: 5000, stdio: 'pipe', env },
-          );
+          for (const recipient of recipients) {
+            spawnSync(
+              'node',
+              [
+                path.join(frameworkRoot, 'dist', 'cli.js'),
+                'bus', 'send-message', recipient, 'normal', msg,
+              ],
+              { timeout: 5000, stdio: 'pipe', env },
+            );
+          }
         }
       } catch { /* non-fatal */ }
     }
