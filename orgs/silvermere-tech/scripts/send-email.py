@@ -18,17 +18,27 @@ Credentials are read from:
   (HOSTINGER_SMTP_HOST, HOSTINGER_SMTP_PORT, HOSTINGER_EMAIL, HOSTINGER_EMAIL_APP_PASSWORD)
 """
 import argparse
+import json
 import mimetypes
 import os
 import smtplib
 import sys
+from datetime import datetime, timezone
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import make_msgid
 
 SECRETS_FILE = "/home/cortext/cortextos/orgs/silvermere-tech/secrets.env"
 STANDING_CC = "steven.barker@silvermereconsulting.com"
+# Durable send record (task_1785948533227). A scripted SMTP send does NOT append
+# to bertha's IMAP Sent, so without this there is NO trace of what went out — it
+# cost an hour to answer "did that outreach send" and would cost the same again.
+# One JSON line per send ATTEMPT (success AND failure). Message-ID is the
+# load-bearing field: the only durable handle a bounce or DMARC report ties back
+# to. Outreach is low-volume, so append-only — no rotation needed.
+SEND_LOG = "/home/cortext/cortextos/orgs/silvermere-tech/logs/send-email.jsonl"
 
 
 def load_secrets(path):
@@ -66,7 +76,22 @@ def build_message(sender, to_list, cc_list, subject, body, attachments):
     msg["To"] = ", ".join(to_list)
     msg["Cc"] = ", ".join(cc_list)
     msg["Subject"] = subject
+    # Set an explicit Message-ID so the value we LOG is the value on the wire.
+    # Without this the SMTP server assigns one and the sender never learns it —
+    # which is exactly why the send was untraceable.
+    msg["Message-ID"] = make_msgid(domain="silvermere.tech")
     return msg
+
+
+def log_send(record):
+    """Append one JSON line to the durable send log. Best-effort: a logging
+    failure must never mask or block the actual send result."""
+    try:
+        os.makedirs(os.path.dirname(SEND_LOG), exist_ok=True)
+        with open(SEND_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:  # noqa: BLE001 — logging must not break the send path
+        print(f"WARN: could not write send log ({SEND_LOG}): {e}", file=sys.stderr)
 
 
 def main():
@@ -121,16 +146,38 @@ def main():
 
     msg = build_message(sender, args.to, cc_list, args.subject, body, args.attach)
     all_recipients = args.to + cc_list
+    message_id = msg["Message-ID"]
+
+    # Base send record — the same object is stamped with the result and logged on
+    # EVERY path (ok / smtp_error / connection_error), so a failed send leaves a
+    # trace too, not just a successful one.
+    record = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "from": sender,
+        "to": args.to,
+        "cc": cc_list,
+        "subject": args.subject,
+        "message_id": message_id,
+        "attachments": [os.path.basename(p) for p in args.attach],
+    }
 
     try:
         with smtplib.SMTP_SSL(smtp_host, smtp_port) as smtp:
             smtp.login(sender, password)
             smtp.sendmail(sender, all_recipients, msg.as_string())
-        print(f"OK  sent to {', '.join(args.to)}  cc {', '.join(cc_list)}")
+        record["result"] = "ok"
+        log_send(record)
+        print(f"OK  sent to {', '.join(args.to)}  cc {', '.join(cc_list)}  message-id {message_id}")
     except smtplib.SMTPException as e:
+        record["result"] = "smtp_error"
+        record["error"] = str(e)
+        log_send(record)
         print(f"ERROR: SMTP failure — {e}", file=sys.stderr)
         sys.exit(1)
     except OSError as e:
+        record["result"] = "connection_error"
+        record["error"] = str(e)
+        log_send(record)
         print(f"ERROR: connection failed — {e}", file=sys.stderr)
         sys.exit(1)
 
