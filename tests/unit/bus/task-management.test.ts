@@ -153,6 +153,30 @@ describe('Advanced Task Management', () => {
       expect(report.stale_human.length).toBe(0);
       expect(report.overdue.length).toBe(0);
     });
+
+    it('classifies a [HUMAN]-title task as stale_human even with no assigned_to/project (isHumanTask tag arm)', () => {
+      // Title-tagged only: assigned_to defaults to 'agent1', project ''. This is the
+      // exact invisible-filings population — caught now via the shared isHumanTask tag arm.
+      createBackdatedTask(paths, {
+        id: 'task_008_008',
+        title: '[HUMAN] Verify email + join Classcard',
+        status: 'pending',
+        created_at: hoursAgo(48),
+        updated_at: hoursAgo(48),
+      });
+      // Non-vacuous negative: a look-alike that must NOT match (no leading-bracket tag).
+      createBackdatedTask(paths, {
+        id: 'task_009_009',
+        title: 'HUMAN readable summary (not a tag)',
+        status: 'pending',
+        created_at: hoursAgo(48),
+        updated_at: hoursAgo(48),
+      });
+      const report = checkStaleTasks(paths);
+      const humanIds = report.stale_human.map(t => t.id);
+      expect(humanIds).toContain('task_008_008');
+      expect(humanIds).not.toContain('task_009_009');
+    });
   });
 
   describe('archiveTasks', () => {
@@ -254,6 +278,42 @@ describe('Advanced Task Management', () => {
       expect(humanTasks.length).toBe(2);
       const ids = humanTasks.map(t => t.id).sort();
       expect(ids).toEqual(['task_020_020', 'task_021_021']);
+    });
+
+    it('classifies [HUMAN]-title and project=human-tasks as human tasks, not just assigned_to (shared isHumanTask)', () => {
+      // Title-tagged only (assigned_to defaults to 'agent1', no project) — was INVISIBLE
+      // to the old assignee-only predicate; the exact invisible-filings population.
+      createBackdatedTask(paths, {
+        id: 'task_024_024',
+        title: '[HUMAN] Verify email + join Classcard',
+        status: 'pending',
+        created_at: hoursAgo(25),
+        updated_at: hoursAgo(25),
+      });
+      // project=human-tasks with a NAMED human assignee (steven, not in {human,user}) —
+      // was invisible to checkHumanTasks's assignee-only predicate; caught now via project.
+      createBackdatedTask(paths, {
+        id: 'task_025_025',
+        title: 'Update saved card',
+        status: 'in_progress',
+        assigned_to: 'steven',
+        project: 'human-tasks',
+        created_at: hoursAgo(30),
+        updated_at: hoursAgo(30),
+      });
+      // Non-vacuous negative: a plain agent task with a look-alike title must NOT match.
+      createBackdatedTask(paths, {
+        id: 'task_026_026',
+        title: 'HUMAN readable report (not a tag)',
+        assigned_to: 'agent1',
+        status: 'pending',
+        created_at: hoursAgo(25),
+        updated_at: hoursAgo(25),
+      });
+      const ids = checkHumanTasks(paths).map(t => t.id).sort();
+      expect(ids).toContain('task_024_024');
+      expect(ids).toContain('task_025_025');
+      expect(ids).not.toContain('task_026_026');
     });
   });
 

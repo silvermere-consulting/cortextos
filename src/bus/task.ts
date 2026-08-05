@@ -735,6 +735,34 @@ function readAllTasks(taskDir: string): Task[] {
 }
 
 /**
+ * Single source of truth for "is this a human task" — the ONE unit every TS reader
+ * routes through, so the classification cannot be re-decided per copy and drift.
+ * (It already had: checkStaleTasks and checkHumanTasks held two DIFFERENT predicates
+ * 227 lines apart in THIS file — divergence needs no distance, and nothing detected it.)
+ *
+ * Three signals, all explicit and non-enumerated:
+ *   - assigned_to is "human"/"user"   — generic-human assignment
+ *   - project === "human-tasks"        — the explicit project bucket
+ *   - title starts with "[HUMAN]"      — the tag recipient-check.ts instructs agents to set
+ *
+ * Deliberately NOT matched: named humans (steven/steve/etc.). The dashboard read query
+ * (dashboard/src/lib/data/tasks.ts) enumerates first names — a bug that misses jen, dan,
+ * and anyone hired next month. Known debt, NOT copied here. The dashboard predicate is
+ * SQL (different runtime), so it cannot share this unit; the only link is this comment,
+ * which is a reminder — and reminders are exactly what failed. The real guard is a PARITY
+ * TEST (run the SQL predicate and isHumanTask over the same store, assert identical sets);
+ * filed as known debt (task), NOT built here — a named absence, not an implied presence.
+ */
+export function isHumanTask(task: Task): boolean {
+  return (
+    task.assigned_to === 'human' ||
+    task.assigned_to === 'user' ||
+    task.project === 'human-tasks' ||
+    (task.title ?? '').startsWith('[HUMAN]')
+  );
+}
+
+/**
  * Check for stale tasks. Matches bash check-stale-tasks.sh behavior.
  */
 export function checkStaleTasks(paths: BusPaths): StaleTaskReport {
@@ -771,12 +799,10 @@ export function checkStaleTasks(paths: BusPaths): StaleTaskReport {
       report.stale_pending.push(task);
     }
 
-    // Human tasks: assigned to "human" or "user", or in human-tasks project
-    if (
-      (['human', 'user'].includes(task.assigned_to ?? '') ||
-        task.project === 'human-tasks') &&
-      createdAge > STALE_HUMAN
-    ) {
+    // Human tasks: classified by the shared isHumanTask() predicate (see its doc).
+    // Previously this arm carried its own copy that matched only assigned_to/project
+    // and missed the [HUMAN] title tag — the invisible-filings population exactly.
+    if (isHumanTask(task) && createdAge > STALE_HUMAN) {
       report.stale_human.push(task);
     }
 
@@ -964,7 +990,10 @@ export function checkHumanTasks(paths: BusPaths): Task[] {
 
   for (const task of tasks) {
     if (task.status === 'completed' || task.status === 'cancelled') continue;
-    if (task.assigned_to !== 'human' && task.assigned_to !== 'user') continue;
+    // Shared predicate — was `assigned_to in {human,user}` only, the NARROWEST of the
+    // three readers (missed project=human-tasks AND the [HUMAN] tag) despite being the
+    // command whose whole job is this question. Now routed through isHumanTask().
+    if (!isHumanTask(task)) continue;
 
     const createdEpoch = Math.floor(new Date(task.created_at).getTime() / 1000);
     const age = nowEpoch - createdEpoch;
