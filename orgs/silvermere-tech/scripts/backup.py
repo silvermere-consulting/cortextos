@@ -1306,6 +1306,69 @@ def dump_odoo_dbs() -> tuple[bool, str]:
         return False, f"Odoo dumps: FAILED — {e}"
 
 
+# ── ARTEFACT VERIFIER (task_1783808113790) ───────────────────────────────────
+# The exclusion list (should_exclude) is what the build INTENDS to drop. This
+# reads what the zip ACTUALLY contains, AFTER building and BEFORE shipping. The
+# defect it closes: for ~25 days the backup mailed "Excluded credentials: .env
+# files" every night WHILE shipping a live sk-ant key in `.env.bak-pre-*` — a
+# narration that never read its own output, and the reason nobody looked. A
+# backup that cannot prove what it shipped must not assert what it excluded.
+#
+# Patterns are STRICT (length-bearing) ON PURPOSE. Agent memory files legitimately
+# DOCUMENT these very patterns as prose ("sk-ant-, ghp_, PRIVATE KEY, AKIA"), and
+# they ride the backup — a loose matcher would flag the documentation and block
+# every backup (grep-the-guard-not-the-bug, one layer along). A real secret clears
+# the length bar; a doc mention or a `.env.example` placeholder does not.
+CREDENTIAL_PATTERNS = [
+    ("anthropic-key",   re.compile(r"sk-ant-[a-z0-9]+-[A-Za-z0-9_-]{80,}")),
+    ("openai-proj-key", re.compile(r"sk-proj-[A-Za-z0-9_-]{60,}")),
+    ("github-token",    re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}")),
+    ("github-pat-fg",   re.compile(r"github_pat_[A-Za-z0-9_]{60,}")),
+    ("slack-token",     re.compile(r"xox[baprs]-\d[A-Za-z0-9-]{20,}")),
+    ("aws-access-key",  re.compile(r"\bAKIA[A-Z0-9]{16}\b")),
+    ("private-key",     re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")),
+    ("google-sa-key",   re.compile(r'"private_key_id"\s*:\s*"[a-f0-9]{40}"')),
+]
+
+# Safe placeholder suffixes — carried on purpose, never real values.
+_SAFE_ENV_SUFFIXES = (".env.template", ".env.example", ".env.sample", ".env.dist")
+
+
+def _is_credential_filename(name: str) -> bool:
+    """Belt-and-braces name check for a real .env credential file — the content
+    scan is primary, this catches a credential file that happens to hold no
+    matchable token. Whitelists the safe placeholder suffixes."""
+    n = name.rsplit("/", 1)[-1].lower()
+    if n.endswith(_SAFE_ENV_SUFFIXES):
+        return False
+    return (".env." in n or n.endswith(".env")
+            or n in ("secrets.env", "gsc-service-account.json"))
+
+
+def verify_archive_clean(zip_path: str) -> list:
+    """Scan the BUILT archive's real contents for credential material. Returns a
+    list of (entry, label) hits; a NON-EMPTY list means DO NOT SHIP. Reads the
+    artefact, not the exclusion intent."""
+    hits = []
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            name = info.filename
+            if name.endswith("/"):
+                continue
+            if _is_credential_filename(name):
+                hits.append((name, "credential-filename"))
+            if info.file_size > 5_000_000:  # secrets are tiny/textual; skip big binaries
+                continue
+            try:
+                text = zf.read(name).decode("utf-8", "ignore")
+            except Exception:
+                continue
+            for label, rx in CREDENTIAL_PATTERNS:
+                if rx.search(text):
+                    hits.append((name, label))
+    return hits
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backup a cortextos org (content org-scoped, transport infra-scoped)")
     parser.add_argument("--org", default=DEFAULT_ORG,
@@ -1368,6 +1431,24 @@ def main():
 
         if skipped:
             print(f"Excluded {len(skipped)} file(s) (credentials/binaries)")
+
+        # ARTEFACT VERIFY (task_1783808113790) — read what the zip CONTAINS, before
+        # ANY ship (retain, gateway, .10, R2). The `Excluded N` line above is INTENT;
+        # this is the FACT. On any hit: fail loud, do not ship, name what was FOUND.
+        verify_hits = []
+        for zlabel, zp in (("CORE", zip_path), ("FULL", full_path)):
+            for entry, kind in verify_archive_clean(zp):
+                verify_hits.append((zlabel, entry, kind))
+        if verify_hits:
+            print("Artefact verify: FAILED — credential material found IN THE BUILT ZIP; "
+                  "NOT SHIPPING:", file=sys.stderr)
+            for zlabel, entry, kind in verify_hits:
+                print(f"  [{zlabel}] {entry} :: {kind}", file=sys.stderr)
+            print("A backup that cannot prove what it shipped is not shipped. "
+                  "Fix should_exclude and re-run.", file=sys.stderr)
+            sys.exit(2)
+        print("Artefact verify: CLEAN — scanned CORE+FULL archive CONTENTS, 0 credential "
+              "hits (reads the zip itself, not the exclusion list).")
 
         # Durable on-box retained copy FIRST — the must-have safety net, done
         # before the upload tiers so a retained snapshot exists even if they fail.
