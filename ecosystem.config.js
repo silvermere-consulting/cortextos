@@ -15,8 +15,12 @@ const CTX_ORG = process.env.CTX_ORG || '';
 // Roll the fleet by editing this constant; the binary path and the boot-time
 // version assertion (CTX_CLAUDE_VERSION_EXPECTED) are both derived from it, so
 // they can never disagree. Steve go tg9125 (2026-07-27) chose 2.1.219 for the
-// opus-4-8 / sonnet-5 1M window.
-const CLAUDE_VERSION = '2.1.219';
+// opus-4-8 / sonnet-5 1M window. Rolled to 2.1.226 on 2026-08-09 (Steve go
+// tg10436/10447, chief's option-A call): worktree destructive-git containment
+// fix (2.1.222); 3b-verified behaviour-neutral (all fleet model IDs recognised
+// by 226, auto-compact enforcement never fires). 2.1.219 frozen copy retained
+// for revert; 2.1.218 second fallback.
+const CLAUDE_VERSION = '2.1.226';
 const AUTHORISED_CLAUDE_BIN = path.join(os.homedir(), '.local', 'share', 'claude-code', CLAUDE_VERSION, 'claude.exe');
 
 module.exports = {
