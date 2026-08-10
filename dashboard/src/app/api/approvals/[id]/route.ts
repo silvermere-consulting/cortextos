@@ -155,8 +155,11 @@ export async function PATCH(
     // Trigger sync so subsequent reads reflect the resolution
     try {
       syncAll();
-    } catch {
-      // Sync is best-effort
+    } catch (e) {
+      // Sync is best-effort (the resolution itself is already committed above), but a SILENT
+      // failure here is precisely the on-demand-cache-only staleness ⑰ addresses — make it
+      // visible rather than swallowed. Matches the layout.tsx call-site's console.error.
+      console.error('Post-approval syncAll() failed (best-effort; approval resolution still committed):', e);
     }
 
     return Response.json({ success: true });
