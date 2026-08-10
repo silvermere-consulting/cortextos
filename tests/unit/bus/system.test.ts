@@ -262,13 +262,20 @@ describe('Bus System', () => {
       return dir;
     };
 
-    it('reads goals.json and flags an over-threshold age as "aged" (not a "fresh" verdict anywhere)', () => {
-      writeGoals('myorg', 'worker', '2026-07-01T00:00:00Z', ['some goal']); // 12d old
+    it('(b) reports over-threshold age as "aged" DESCRIPTIVELY — age no longer flips needs_attention', () => {
+      writeGoals('myorg', 'worker', '2026-07-01T00:00:00Z', ['some goal']); // 12d old, no done_when
       const report = checkGoalStaleness(testDir, 7, { now: NOW });
       expect(report.summary.total).toBe(1);
-      expect(report.agents[0].age_status).toBe('aged');
-      expect(report.agents[0].needs_attention).toBe(true);
-      expect(report.summary.aged).toBe(1);
+      expect(report.agents[0].age_status).toBe('aged'); // age still COMPUTED (descriptive)
+      expect(report.summary.aged).toBe(1);              // still counted in the summary
+      // (b) 2026-08-10: the AGE arm is removed. An aged agent with 0 checkable done_when is
+      // UNEVALUABLE, not "needs attention" — the cascade keeps mtime fresh, so age was a broken
+      // proxy. needs_attention:false here is CANNOT_ASSESS, NOT clean. (This test guards the
+      // regression: if the age arm came back, needs_attention would flip true and this fails.)
+      expect(report.agents[0].needs_attention).toBe(false);
+      expect(report.agents[0].assessable).toBe(false);
+      expect(report.summary.cannot_assess).toBe(1);
+      expect(report.agents[0].reason).toContain('CANNOT ASSESS');
       // The load-bearing invariant: no "fresh"/"current" verdict exists.
       expect(JSON.stringify(report)).not.toMatch(/"(fresh|current)"/);
     });
@@ -295,13 +302,22 @@ describe('Bus System', () => {
       expect(a.reason).not.toContain('parse');   // no parse_error path anymore
     });
 
-    it('treats an empty updated_at as "no_timestamp" (never cascaded), not a false old date', () => {
-      writeGoals('myorg', 'othe', '', []); // the un-cascaded control
+    it('(b) empty goals[] flags needs_attention via the ARRAY (no direction), NOT via mtime; no_timestamp is descriptive', () => {
+      writeGoals('myorg', 'othe', '', []); // no timestamp, empty goals[] — an un-cascaded agent
       const report = checkGoalStaleness(testDir, 7, { now: NOW });
       const a = report.agents[0];
-      expect(a.age_status).toBe('no_timestamp');
+      expect(a.age_status).toBe('no_timestamp'); // still computed (descriptive), does NOT vote
+      // (b) + chief's call: empty goals[] = no direction = the MOST assessable state. It flags true,
+      // keyed on goals.length===0 (the ARRAY), not the timestamp — the one file-check that stays
+      // reachable after the age arm is gone (HEARTBEAT Step 6 duty). This guards the regression:
+      // if the trigger were dropped, needs_attention would go false and this fails.
       expect(a.needs_attention).toBe(true);
-      expect(a.reason).toContain('never cascaded');
+      expect(a.assessable).toBe(true);
+      expect(a.reason).toContain('no direction');
+      expect(a.reason).toContain('pre-onboarding'); // false-positive that explains itself
+      // and it counts as needs_attention, NOT cannot_assess:
+      expect(report.summary.needs_attention).toBe(1);
+      expect(report.summary.cannot_assess).toBe(0);
     });
 
     it('handles a missing goals.json', () => {

@@ -136,12 +136,21 @@ export interface AgentGoalStatus {
   // CURRENCY axis — the refusal state. Never 'current'/'fresh'.
   currency: GoalCurrency;
   /**
-   * Does a human need to look? A dead goal, an over-threshold age, or an
-   * absent/never-cascaded timestamp all demand attention. `unverified` currency
-   * on its own does NOT flip this true — but it is still not an all-clear, which
-   * is why the report never emits a "fresh"/"current" verdict anywhere.
+   * Does a human need to look? Fires ONLY on the done_when axes (a dead goal or an
+   * unresolvable handle) plus the two structural cases (missing / malformed goals.json).
+   * The AGE arm was REMOVED 2026-08-10 (b): the fleet cascade touches every goals.json,
+   * so mtime stays under threshold and `aged` cannot fire for an active agent — the same
+   * writes that break age as a direction proxy keep it green. age_status/age_days remain
+   * as DESCRIPTIVE fields. `unverified` currency does NOT flip this true.
    */
   needs_attention: boolean;
+  /**
+   * Could the check REACH a verdict? False when the agent has goals but none carries a
+   * checkable done_when — with the age arm gone, no axis can fire, so `needs_attention:false`
+   * means UNEVALUABLE, not healthy. Absence is not zero. (A missing/malformed goals.json is
+   * assessable:true — "broken" IS a verdict.)
+   */
+  assessable: boolean;
   reason: string;
 }
 
@@ -149,6 +158,9 @@ export interface GoalStalenessReport {
   summary: {
     total: number;
     needs_attention: number;
+    /** Agents the check could NOT evaluate (goals present, 0 checkable done_when). Their
+     *  needs_attention:false is UNEVALUABLE, not clean — read this before trusting a green. */
+    cannot_assess: number;
     dead: number;
     aged: number;
     no_goals: number;
@@ -912,14 +924,19 @@ function normalizeGoal(g: unknown): StructuredGoal {
 function goalStalenessNote(goalsTotal: number, goalsWithDoneWhen: number): string {
   return (
     'This check reports independent axes and NEVER certifies a goal as "fresh"/"current". ' +
-    '(1) AGE from goals.json updated_at. (2) DEADNESS reads ONLY a goal\'s declared ' +
+    '(1) AGE from goals.json updated_at is DESCRIPTIVE ONLY — removed from needs_attention ' +
+    '2026-08-10 (b): the fleet cascade touches every goals.json, so mtime stays under ' +
+    'threshold and `aged` cannot fire for an active agent (a broken direction-age proxy). ' +
+    '(2) DEADNESS reads ONLY a goal\'s declared ' +
     'structured done_when field — never ticket ids scraped from prose (a goal that cites a ' +
     'completed ticket as context is not a goal whose done-when IS that ticket). A done_when ' +
     'task that resolves to completed is dead at any age; a declared handle that does not ' +
     'resolve is surfaced as unresolvable, not guessed. (3) CURRENCY is UNVERIFIED wherever ' +
     'done-state cannot be checked — a REFUSAL, not an all-clear: a goal can be false and recent. ' +
     `DENOMINATOR: ${goalsWithDoneWhen}/${goalsTotal} goals declare a done_when handle, so ` +
-    'deadness can only fire on those. This tool does NOT fix stale goals — it stops issuing ' +
+    'deadness can only fire on those. With the age arm gone, an agent whose goals declare 0 ' +
+    'checkable done_when is UNEVALUABLE: its needs_attention:false is surfaced as CANNOT_ASSESS, ' +
+    'NOT clean (see summary.cannot_assess). This tool does NOT fix stale goals — it stops issuing ' +
     'verdicts it has not earned. Until goals carry a resolvable done_when, the fleet still has ' +
     'goals nothing can check; the numerator is honest and the denominator is what it is.'
   );
@@ -939,7 +956,7 @@ export function checkGoalStaleness(
   if (!existsSync(orgsDir)) {
     return {
       summary: {
-        total: 0, needs_attention: 0, dead: 0, aged: 0, no_goals: 0, unverified: 0,
+        total: 0, needs_attention: 0, cannot_assess: 0, dead: 0, aged: 0, no_goals: 0, unverified: 0,
         unresolvable_handles: 0, goals_total: 0, goals_with_done_when: 0,
         threshold_days: thresholdDays, note: goalStalenessNote(0, 0),
       },
@@ -992,7 +1009,7 @@ export function checkGoalStaleness(
           agent: agentName, org: orgName,
           updated_at: undefined, age_days: undefined, age_status: 'missing',
           goals_total: 0, goals_with_done_when: 0, dead_goals: [], unresolvable_handles: [],
-          currency: 'unverified', needs_attention: true,
+          currency: 'unverified', needs_attention: true, assessable: true,
           reason: 'no goals.json',
         });
         continue;
@@ -1006,7 +1023,7 @@ export function checkGoalStaleness(
           agent: agentName, org: orgName,
           updated_at: undefined, age_days: undefined, age_status: 'missing',
           goals_total: 0, goals_with_done_when: 0, dead_goals: [], unresolvable_handles: [],
-          currency: 'unverified', needs_attention: true,
+          currency: 'unverified', needs_attention: true, assessable: true,
           reason: 'goals.json unreadable or malformed',
         });
         continue;
@@ -1061,13 +1078,36 @@ export function checkGoalStaleness(
 
       // CURRENCY axis — the refusal state. Never 'current'/'fresh'.
       const currency: GoalCurrency = deadGoals.length > 0 ? 'has_dead_goal' : 'unverified';
+      // (b) 2026-08-10: AGE arm REMOVED from needs_attention — a broken proxy for
+      // direction-age. The fleet cascade touches every goals.json, so mtime stays under
+      // threshold and `aged` cannot fire for an active agent; the writes that break age
+      // as a proxy are the same writes that keep it green. needs_attention now fires on the
+      // done_when axes + an EMPTY goals[] read from the ARRAY (not mtime). age_status/age_days
+      // remain descriptive fields.
+      // EMPTY goals[] = no direction: the MOST assessable state there is, and a live orchestrator
+      // duty (HEARTBEAT Step 6 — write goals for an empty file). Keyed on the ARRAY, never the
+      // timestamp: this is the one file-check that stays reachable after the age arm is gone.
+      const noGoals = goals.length === 0;
       const needsAttention =
         deadGoals.length > 0 ||
         unresolvableHandles.length > 0 ||
-        ageStatus === 'aged' ||
-        ageStatus === 'no_timestamp';
+        noGoals;
+      // ASSESSABLE: no-goals IS a verdict (no direction). Otherwise the done_when axes need a
+      // handle; with none, the agent is UNEVALUABLE for staleness and needs_attention:false must
+      // NOT be read as healthy. Absence is not zero.
+      const assessable = noGoals || goalsWithDoneWhen > 0;
 
       const reasonParts: string[] = [];
+      if (noGoals) {
+        reasonParts.push(
+          'empty goals[] — this agent has no direction. Expected if pre-onboarding; otherwise it has never been cascaded',
+        );
+      } else if (!assessable) {
+        reasonParts.push(
+          `CANNOT ASSESS — no goal carries a checkable done_when (${goalsWithDoneWhen}/${goals.length}); ` +
+          `age arm removed as a broken proxy. needs_attention:false here means UNEVALUABLE, not healthy`,
+        );
+      }
       if (deadGoals.length > 0) {
         reasonParts.push(
           `${deadGoals.length} goal(s) whose done_when is a COMPLETED ticket (${deadGoals.map(d => d.handle).join(', ')}) — dead at any age`,
@@ -1078,13 +1118,8 @@ export function checkGoalStaleness(
           `${unresolvableHandles.length} declared done_when handle(s) did NOT resolve (${unresolvableHandles.map(h => h.handle).join(', ')}) — bad handle, surfaced not guessed`,
         );
       }
-      if (ageStatus === 'aged') {
-        reasonParts.push(`goals.json updated ${ageDays}d ago (threshold ${thresholdDays}d)`);
-      } else if (ageStatus === 'no_timestamp') {
-        reasonParts.push('goals.json has no usable updated_at (never cascaded?)');
-      } else if (ageStatus === 'ok') {
-        reasonParts.push(`age ok (${ageDays}d)`);
-      }
+      // AGE is descriptive only now (age_status/age_days fields carry it); NOT a trigger.
+      reasonParts.push(`age ${ageDays ?? '?'}d/${ageStatus} (descriptive — not a needs_attention trigger)`);
       if (currency === 'unverified') {
         reasonParts.push(
           `currency UNVERIFIED — ${goalsWithDoneWhen}/${goals.length} goals declare a done_when, the rest cannot be verified (not an all-clear)`,
@@ -1102,6 +1137,7 @@ export function checkGoalStaleness(
         unresolvable_handles: unresolvableHandles,
         currency,
         needs_attention: needsAttention,
+        assessable,
         reason: reasonParts.join('; '),
       });
     }
@@ -1114,6 +1150,7 @@ export function checkGoalStaleness(
     summary: {
       total: agents.length,
       needs_attention: agents.filter(a => a.needs_attention).length,
+      cannot_assess: agents.filter(a => !a.assessable).length,
       dead: agents.filter(a => a.dead_goals.length > 0).length,
       aged: agents.filter(a => a.age_status === 'aged').length,
       no_goals: agents.filter(a => a.age_status === 'missing' || a.age_status === 'no_timestamp').length,
