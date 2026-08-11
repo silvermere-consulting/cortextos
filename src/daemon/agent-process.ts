@@ -1,4 +1,5 @@
-import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { join, sep } from 'path';
 import { homedir } from 'os';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
@@ -12,6 +13,24 @@ import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { detectDayNightMode, resolveUserTimezone } from '../bus/heartbeat.js';
 import { resolvePaths } from '../utils/paths.js';
+
+// OOM-recovery runs at daemon STARTUP (shouldContinue), NOT at exit — the daemon
+// does NOT survive the OOM. Measured 2026-08-11: a single OOM in the shared cgroup
+// (task_memcg=/system.slice/pm2-cortext.service) cycles the whole pm2-cortext.service;
+// the node daemon (pid 3592916) and PM2 God Daemon (3592880) were both reborn ~8s
+// AFTER the 10:13:43 kill, so handleExit can never run for the victim. Instead, on
+// restart we read the PRIOR session's pid from the on-disk state/<agent>/session.pid
+// (it survives the death, and shouldContinue at start() runs BEFORE the new spawn
+// overwrites it) and ask journalctl -k whether that pid was OOM-killed.
+//
+// The query's lower time bound is the LATER of (session.pid mtime, now - OOM_RECENT_S),
+// closing the only false-positive route two independent ways: (a) the mtime
+// relationship — the OOM must POST-DATE the session's start, so an OOM predating a
+// reused pid can't match; (b) the OOM_RECENT_S cap — a pid cannot recur within
+// minutes (pid_max 4194304, ~35h to wrap at ~33 pids/s), so a days-stale session's
+// pid can't collide with a genuinely-OOM'd reuse. 5min covers daemon-down + boot
+// latency with wide margin (shouldContinue runs ~10-30s post-OOM in practice).
+const OOM_RECENT_S = 300;
 
 type LogFn = (msg: string) => void;
 
@@ -76,6 +95,12 @@ export class AgentProcess {
   // daemon should fire the codex-app-server back-online Telegram directly
   // (skipped on handoff restart — the agent sends its own contextual reply).
   private lastSpawnWasHandoff = false;
+  // OOM auto-recovery notice: set by shouldContinue() when it force-freshes an OOM-killed
+  // session, consumed by buildStartupPrompt() so the fresh agent SELF-DECLARES the recovery —
+  // else a recovered OOM is indistinguishable from a clean cold boot (the silence that hid
+  // this class through three occurrences). Reset on EVERY shouldContinue() so a stale value
+  // can never make a later clean boot falsely self-declare (phantom-proof by construction).
+  private oomRecovery: { line: string; transcript: string } | null = null;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -538,6 +563,82 @@ export class AgentProcess {
     }
   }
 
+  /**
+   * The kernel oom-kill line naming `pid` at or after `sinceEpoch` (unix seconds),
+   * or null. Per-pid attribution: only the OOM victim's pid appears in
+   * "Killed process <pid> (...)". The caller sets sinceEpoch to the later of the
+   * session's start (session.pid mtime) and now-OOM_RECENT_S, so the match is
+   * bounded to this session's lifetime AND to a reuse-safe recent window. Reads
+   * journalctl -k (readable at uid 1001 via the systemd-journal group; dmesg is
+   * blocked by dmesg_restrict=1). Returns null on ANY failure — fail-closed: an
+   * unreadable journal is NOT a confirmed OOM, and missing a recovery (crash-loop,
+   * today's behaviour) is recoverable where discarding a healthy transcript is not.
+   */
+  private findOomKillLine(pid: number, sinceEpoch: number): string | null {
+    try {
+      const out = execFileSync(
+        'journalctl',
+        ['-k', '--since', `@${sinceEpoch}`, '-o', 'cat', '--no-pager'],
+        { encoding: 'utf-8', timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
+      );
+      // Bounded so pid 3588109 cannot match 35881099: require the " (" that
+      // always follows the pid in "Killed process <pid> (comm)".
+      const needle = `Killed process ${pid} (`;
+      for (const line of out.split('\n')) {
+        if (line.includes(needle)) return line.trim();
+      }
+    } catch {
+      return null; // fail-closed
+    }
+    return null;
+  }
+
+  /**
+   * If the PRIOR session (pid in state/<agent>/session.pid) was OOM-killed, the
+   * kernel oom-kill line; else null. The query's lower bound is the LATER of the
+   * session's start (session.pid mtime — the OOM must post-date it) and
+   * now-OOM_RECENT_S (a pid cannot recur within minutes, so a days-stale pid cannot
+   * collide with a genuinely-OOM'd reuse). Fail-closed: a missing/unparseable
+   * session.pid or any read error returns null (-> normal --continue).
+   */
+  private priorSessionOomKill(): string | null {
+    try {
+      const pidFile = join(this.env.ctxRoot, 'state', this.name, 'session.pid');
+      if (!existsSync(pidFile)) return null;
+      const mtimeS = Math.floor(statSync(pidFile).mtimeMs / 1000);
+      const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+      if (!Number.isInteger(pid) || pid <= 0) return null;
+      const sinceEpoch = Math.max(mtimeS, Math.floor(Date.now() / 1000) - OOM_RECENT_S);
+      return this.findOomKillLine(pid, sinceEpoch);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Newest conversation transcript (.jsonl) for this agent, or null. This is the
+   * file the .force-fresh restart sets ASIDE — force-fresh makes the next start
+   * ignore the saved conversation; it does NOT delete the file. Logged on an OOM
+   * recovery so the transcript stays readable AND recoverable: recover with
+   * `claude --fork-session -r <session-id>`, which resumes into a NEW id leaving
+   * the original intact. Never plain --resume — that re-runs whatever OOM'd it.
+   */
+  private currentTranscriptPath(): string | null {
+    try {
+      const launchDir = this.config.working_directory || this.env.agentDir;
+      if (!launchDir) return null;
+      const convDir = join(homedir(), '.claude', 'projects', launchDir.split(sep).join('-'));
+      const files = readdirSync(convDir)
+        .filter((f) => f.endsWith('.jsonl'))
+        .map((f) => join(convDir, f));
+      if (files.length === 0) return null;
+      files.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+      return files[0] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   private handleExit(exitCode: number): void {
     // Capture last 16KB of the agent's stdout BEFORE nulling pty.
     // Used by the image-poison auto-recovery check below — reads the log
@@ -697,6 +798,42 @@ export class AgentProcess {
       return false;
     }
 
+    // OOM auto-recovery: if the PRIOR session (its pid still in session.pid — written
+    // at spawn and NOT yet overwritten, since this runs before the new spawn) was
+    // OOM-killed, start FRESH instead of --continue. Reloading an OOM-killed session's
+    // history re-runs whatever ballooned it into the OOM. The daemon cannot catch this
+    // at exit — it is killed in the same cgroup cycle — so it is caught here on the
+    // next start. Logs EVERY evaluation so a silently-inert check is visible; fails
+    // closed (any uncertainty -> fall through to the normal --continue decision below).
+    this.oomRecovery = null;   // reset every call: a stale notice must never self-declare on a later clean boot
+    const oomLine = this.priorSessionOomKill();
+    // The check-log is COMMENTARY and sits UPSTREAM of `return false` — an unwrapped throw here
+    // would propagate out of shouldContinue() and the force-fresh would never happen, the reporting
+    // turning a loop-that-breaks into one that doesn't. Wrapped so a log-sink failure is swallowed;
+    // the recovery depends ONLY on oomLine (from the internally-safe priorSessionOomKill), never on
+    // the log. (chief 2026-08-11 — the same condition-1 class the emission below already handles.)
+    try {
+      this.log(`OOM-recovery check: prior session ${oomLine ? 'WAS OOM-killed -> starting FRESH' : 'not OOM-killed'}`
+        + (oomLine ? ` — ${oomLine}` : ''));
+    } catch { /* log sink down — the recovery below must not depend on the commentary */ }
+    if (oomLine) {
+      const transcript = this.currentTranscriptPath() ?? '(transcript path unresolved)';
+      // The emission below is COMMENTARY — wrapped so its failure degrades to silent-but-working.
+      // The recovery (return false) is UNCONDITIONAL and downstream of all of it: a described break
+      // and an undescribed break must fail to the same place, a working break. The reporting layer
+      // is never allowed to turn a loop-that-breaks into a loop-that-no-longer-breaks.
+      try {
+        this.oomRecovery = { line: oomLine, transcript };
+        this.appendCrashToRestartsLog(0, 0, 'OOM_RECOVERY');   // durable + countable, no network (internally try/catch-safe)
+        this.log(`OOM auto-recovery: prior session OOM-killed — ${oomLine}. History PARKED (recoverable) at ${transcript}. `
+          + `Recover with \`claude --fork-session -r <session-id>\` (forks a new id, leaves the original intact); `
+          + `never plain --resume, which re-runs the killer. Starting FRESH.`);
+      } catch (err) {
+        try { this.log(`OOM-recovery emission failed (recovery proceeds regardless): ${err}`); } catch { /* ignore */ }
+      }
+      return false;
+    }
+
     // Check for existing conversation
     const launchDir = this.config.working_directory || this.env.agentDir;
     if (!launchDir) return false;
@@ -814,7 +951,21 @@ export class AgentProcess {
     const onlineMessage = (isHandoffRestart || nightSilentBoot)
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${bootSilenceBlock}${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    // OOM-RECOVERY self-declaration: if this fresh boot is a breaker recovery, TELL the agent —
+    // otherwise it mislabels an OOM-recovery as a normal cold start (the restart-cause-unfalsifiable
+    // problem). Framed RECOVERABLE, not lost (Steve's design point): the history is parked and
+    // forkable, not destroyed — an agent that believes its context was destroyed behaves
+    // differently from one that knows it can review and revive. Wrapped so a malformed notice
+    // degrades to the base prompt; the agent must ALWAYS boot.
+    let oomBlock = '';
+    try {
+      if (this.oomRecovery) {
+        const { line, transcript } = this.oomRecovery;
+        this.oomRecovery = null;   // consume-and-clear (belt-and-suspenders with the shouldContinue() reset)
+        oomBlock = ` OOM-RECOVERY: your PRIOR session was OOM-killed by the kernel (${line}). Its conversation history is PARKED, NOT LOST — the daemon started you fresh to break the reload-OOM loop, but the transcript survives at ${transcript}. You can READ it or REVIVE it with \`claude --fork-session -r <session-id>\` (forks a new id, leaves the original intact). Log this as an OOM recovery (cortextos bus log-event action oom_recovery info) and note it in daily memory, so the recovery is countable and you do not mistake this fresh boot for a normal cold start.`;
+      }
+    } catch { oomBlock = ''; }
+    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${bootSilenceBlock}${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${oomBlock}${onlineMessage}${onboardingAppend}`;
   }
 
   private buildContinuePrompt(): string {
@@ -1000,7 +1151,7 @@ export class AgentProcess {
   private appendCrashToRestartsLog(
     exitCode: number,
     backoffMs: number,
-    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY',
+    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY' | 'OOM_RECOVERY',
   ): void {
     try {
       const logDir = join(this.env.ctxRoot, 'logs', this.name);
@@ -1011,7 +1162,9 @@ export class AgentProcess {
           ? `exit_code=${exitCode} crash_count=${this.crashCount} max_crashes=${this.maxCrashesPerDay}`
           : kind === 'IMAGE_POISON_RECOVERY'
             ? `exit_code=${exitCode} backoff_s=${backoffMs / 1000} (not counted toward max_crashes)`
-            : `exit_code=${exitCode} crash_count=${this.crashCount} backoff_s=${backoffMs / 1000}`;
+            : kind === 'OOM_RECOVERY'
+              ? `prior session OOM-killed; history parked (recoverable via --fork-session), started fresh (not counted toward max_crashes)`
+              : `exit_code=${exitCode} crash_count=${this.crashCount} backoff_s=${backoffMs / 1000}`;
       const logLine = `[${timestamp}] ${kind}: ${details}\n`;
       appendFileSync(join(logDir, 'restarts.log'), logLine, 'utf-8');
     } catch {
