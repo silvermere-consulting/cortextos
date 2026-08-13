@@ -26,19 +26,70 @@ import imaplib
 import json
 import os
 import re
+import signal
+import socket
 import subprocess
 import sys
+import time
 from email.header import decode_header, make_header
 from pathlib import Path
 from typing import Iterable
 
-IMAP_HOST = "imap.hostinger.com"
-IMAP_PORT = 993
+IMAP_HOST = os.environ.get("BERTHA_IMAP_HOST", "imap.hostinger.com")
+IMAP_PORT = int(os.environ.get("BERTHA_IMAP_PORT", "993"))
+# Bounded polling (2026-08-13). WHY: IMAP4_SSL had NO timeout, so a stage that stalls (measured
+# ~1 in 3 polls today, ABOVE the transport — login/select/fetch, not DNS) hangs until the ~120s
+# harness/tool bound SIGTERMs the process (143) with NO output line; a `... | tail` caller reads
+# tail's 0, and silence + 0 reads as "polled, nothing new" = a hang wearing a clean quiet.
+# TWO bounds, because a per-op timeout is PER socket-op while the harness bound is TOTAL
+# (measured: 3 stalled recv @ settimeout(2) = 6.0s, exactly 3x) — so a per-op timeout ALONE
+# lets connect+login+select+fetch each burn it and blow the total bound in a multi-stall:
+#   POLL_DEADLINE — WALL-CLOCK bound on the whole process (signal.alarm). THE guarantee: fires
+#     however many stages stall, prints the line + which stage was in progress, exits 4.
+#     Generous vs the MEASURED normal poll ~1.8s (NOT the phantom 45s, which was an imposed
+#     `timeout 45`, never a duration). 60s = ~33x normal, well under the ~120s harness bound.
+#   IMAP_TIMEOUT — per socket-op, defence-in-depth: fails a single stall faster than the deadline.
+# Both env-overridable for the single-op blackhole AND multi-stall tests.
+POLL_DEADLINE = int(os.environ.get("BERTHA_POLL_DEADLINE", "60"))
+IMAP_TIMEOUT = int(os.environ.get("BERTHA_IMAP_TIMEOUT", "20"))
 SECRETS_ENV = Path("/home/cortext/cortextos/orgs/silvermere-tech/secrets.env")
 STATE_FILE = Path(
     os.environ.get("CTX_ROOT", os.path.expanduser("~/.cortextos/dev"))
 ) / "state" / "chief" / "bertha-seen.json"
 BODY_EXCERPT_CHARS = 800  # cap surfaced body to keep Telegram-friendly
+
+# ---- wall-clock deadline + per-stage timing (2026-08-13) ------------------------
+# _STAGE names the stage in progress + when it started, so (a) the deadline handler can name
+# the STALLED stage — a diagnosis, not another silent 143 — and (b) the success line reports
+# per-stage elapsed, so a stage trending slow is visible BEFORE it becomes a hang. The real
+# fault (~1 in 3 polls stall, above the transport) is unknown; this makes the next one legible.
+_STAGE = {"name": "startup", "t0": time.monotonic()}
+_TIMINGS: "dict[str, float]" = {}
+
+
+def _enter(stage: str) -> None:
+    now = time.monotonic()
+    prev = _STAGE["name"]
+    if prev:
+        _TIMINGS[prev] = now - _STAGE["t0"]
+    _STAGE["name"] = stage
+    _STAGE["t0"] = now
+
+
+def _deadline_handler(signum, frame):
+    # Wall-clock deadline hit: the PROCESS (not one op) exceeded POLL_DEADLINE — the multi-stall
+    # case a per-op socket timeout cannot bound (each op gets its own timeout; N stalls => N*T).
+    # Name the stalled stage, then hard-exit 4. flush BOTH ways (flush=True AND an explicit
+    # flush) because os._exit bypasses stdio flush and cron block-buffers stdout — without this
+    # the load-bearing status line dies in the buffer and the fix silently becomes the bug.
+    el = time.monotonic() - _STAGE["t0"]
+    print(
+        f"[check-bertha] TIMEOUT: poll did not complete within {POLL_DEADLINE}s "
+        f"(stalled at stage={_STAGE['name']}, {el:.1f}s in it)",
+        flush=True,
+    )
+    sys.stdout.flush()
+    os._exit(4)
 
 
 def _load_secrets() -> None:
@@ -276,19 +327,21 @@ def main(argv: list[str] | None = None) -> int:
     user = os.environ.get("HOSTINGER_EMAIL")
     pwd = os.environ.get("HOSTINGER_EMAIL_APP_PASSWORD")
     if not user or not pwd:
-        print("HOSTINGER_EMAIL or HOSTINGER_EMAIL_APP_PASSWORD missing", file=sys.stderr)
+        print("[check-bertha] FAILED: HOSTINGER_EMAIL or HOSTINGER_EMAIL_APP_PASSWORD missing", flush=True)
         return 2
 
-    try:
-        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        imap.login(user, pwd)
-    except Exception as exc:
-        print(f"IMAP login failed: {exc}", file=sys.stderr)
-        return 3
-
+    signal.signal(signal.SIGALRM, _deadline_handler)
+    signal.alarm(POLL_DEADLINE)  # WALL-CLOCK bound on the whole process — THE guarantee
+    imap = None
     surfaced = 0
     try:
+        _enter("connect")
+        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT)
+        _enter("login")
+        imap.login(user, pwd)
+        _enter("select")
         imap.select("INBOX", readonly=True)  # readonly = won't flip \\Seen
+        _enter("fetch")
         seen = _load_seen()
         new_seen = set(seen)
 
@@ -319,15 +372,40 @@ def main(argv: list[str] | None = None) -> int:
 
         if new_seen != seen:
             _save_seen(new_seen)
+        _enter("done")
+    except imaplib.IMAP4.error as exc:
+        # Auth/protocol REJECTED (e.g. bad credentials) — distinct from a hang. Non-zero + a
+        # FLUSHED status line naming the stage, so it is never a silent quiet.
+        signal.alarm(0)
+        print(f"[check-bertha] FAILED: imap {_STAGE['name']} rejected: {exc!r}", flush=True)
+        return 3
+    except (TimeoutError, OSError) as exc:
+        # Per-op timeout / TLS / network — DEFENCE-IN-DEPTH under the wall-clock deadline; fails
+        # a single stall faster than POLL_DEADLINE. socket.timeout is TimeoutError; ssl.SSLError
+        # and ConnectionError are OSError, so this catches a stall however it surfaces.
+        signal.alarm(0)
+        print(
+            f"[check-bertha] TIMEOUT: {_STAGE['name']} did not complete "
+            f"(per-op <= {IMAP_TIMEOUT}s): {exc!r}",
+            flush=True,
+        )
+        return 4
     finally:
-        try:
-            imap.logout()
-        except Exception:
-            pass
+        signal.alarm(0)  # cancel the deadline — nothing past here may block
+        if imap is not None:
+            try:
+                imap.shutdown()  # abrupt close; never a clean logout that could itself re-hang
+            except Exception:
+                pass
 
+    mode = "bootstrap" if bootstrap else "poll"
+    stage_timings = " ".join(f"{k}={v:.2f}s" for k, v in _TIMINGS.items())
     if not quiet:
-        mode = "bootstrap" if bootstrap else "poll"
-        print(f"[check-bertha] {mode}: surfaced={surfaced} seen_total={len(_load_seen())}")
+        print(
+            f"[check-bertha] {mode}: surfaced={surfaced} "
+            f"seen_total={len(_load_seen())} | {stage_timings}",
+            flush=True,
+        )
     return 0
 
 
