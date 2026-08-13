@@ -20,7 +20,7 @@ const CTX_ORG = process.env.CTX_ORG || '';
 // fix (2.1.222); 3b-verified behaviour-neutral (all fleet model IDs recognised
 // by 226, auto-compact enforcement never fires). 2.1.219 frozen copy retained
 // for revert; 2.1.218 second fallback.
-const CLAUDE_VERSION = '2.1.226';
+const CLAUDE_VERSION = '2.1.229';  // rolled 226->229 2026-08-13 (Steve go, roll-first ahead of migration: closes live exposure to the 228 session-cleanup memory-folder-delete bug; 3b: no cost-raising default, 229 prefix-stagger lowers spend). 2.1.226 frozen copy is the revert target.
 const AUTHORISED_CLAUDE_BIN = path.join(os.homedir(), '.local', 'share', 'claude-code', CLAUDE_VERSION, 'claude.exe');
 
 module.exports = {
