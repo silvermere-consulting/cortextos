@@ -34,7 +34,7 @@ import { execFileSync } from 'child_process';
  * editing BOTH files — a deliberate two-place cost that buys an independent
  * cross-check: divergence pages instead of silently trusting env.
  */
-export const AUTHORISED_CLAUDE_VERSION = '2.1.229';  // rolled 226->229 2026-08-13 (Steve go); MUST equal CLAUDE_VERSION in ecosystem.config.js
+export const AUTHORISED_CLAUDE_VERSION = '2.1.231';  // rolled 229->231 2026-08-13 (Steve go); MUST equal CLAUDE_VERSION in ecosystem.config.js
 
 export interface PinCheck {
   resolvedBin: string;

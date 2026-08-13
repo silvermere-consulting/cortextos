@@ -74,9 +74,9 @@ describe('readClaudeVersion (injectable runner)', () => {
 describe('checkClaudePinFromEnv (env wiring)', () => {
   it('reads the bin UNDER TEST from env and matches the hardcoded reference (boot known-positive)', () => {
     const env = {
-      CTX_CLAUDE_BIN: '/home/x/.local/share/claude-code/2.1.229/claude.exe',
+      CTX_CLAUDE_BIN: '/home/x/.local/share/claude-code/2.1.231/claude.exe',
     } as NodeJS.ProcessEnv;
-    const r = checkClaudePinFromEnv(env, () => '2.1.229 (Claude Code)');
+    const r = checkClaudePinFromEnv(env, () => '2.1.231 (Claude Code)');
     expect(r.ok).toBe(true);
     expect(r.resolvedBin).toBe(env.CTX_CLAUDE_BIN);
     expect(r.expectedVersion).toBe(AUTHORISED_CLAUDE_VERSION);
