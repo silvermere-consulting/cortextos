@@ -56,6 +56,15 @@ SECRETS_ENV = Path("/home/cortext/cortextos/orgs/silvermere-tech/secrets.env")
 STATE_FILE = Path(
     os.environ.get("CTX_ROOT", os.path.expanduser("~/.cortextos/dev"))
 ) / "state" / "chief" / "bertha-seen.json"
+# Per-poll sample series (2026-08-13). CAPTURE, not analysis — the baseline can only be
+# collected going forward; the moment we want it is right after a hang names a stage, too
+# late to have started. Best-effort append (see _record_sample): a write failure drops one
+# sample and NEVER breaks the poll. ~10KB/day; a logrotate is the bound if it ever matters.
+SAMPLE_LOG = Path(os.environ.get(
+    "BERTHA_SAMPLE_LOG",
+    str(Path(os.environ.get("CTX_ROOT", os.path.expanduser("~/.cortextos/dev")))
+        / "state" / "chief" / "bertha-poll-samples.jsonl"),
+))
 BODY_EXCERPT_CHARS = 800  # cap surfaced body to keep Telegram-friendly
 
 # ---- wall-clock deadline + per-stage timing (2026-08-13) ------------------------
@@ -76,6 +85,28 @@ def _enter(stage: str) -> None:
     _STAGE["t0"] = now
 
 
+def _record_sample(rc, surfaced=None, seen_total=None):
+    """Best-effort per-poll sample -> SAMPLE_LOG (JSONL). A write failure drops ONE sample and
+    NEVER breaks the poll or changes rc — that is the whole reason a poller can safely write."""
+    try:
+        _TIMINGS[_STAGE["name"]] = round(time.monotonic() - _STAGE["t0"], 3)  # close in-flight stage
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "rc": rc,
+            "stage": _STAGE["name"],
+            "timings": {k: round(v, 3) for k, v in _TIMINGS.items()},
+        }
+        if surfaced is not None:
+            rec["surfaced"] = surfaced
+        if seen_total is not None:
+            rec["seen_total"] = seen_total
+        SAMPLE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(SAMPLE_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass  # capture is best-effort; the poll's result stands regardless
+
+
 def _deadline_handler(signum, frame):
     # Wall-clock deadline hit: the PROCESS (not one op) exceeded POLL_DEADLINE — the multi-stall
     # case a per-op socket timeout cannot bound (each op gets its own timeout; N stalls => N*T).
@@ -89,6 +120,7 @@ def _deadline_handler(signum, frame):
         flush=True,
     )
     sys.stdout.flush()
+    _record_sample(4)  # capture the hang sample — the `with open` inside flushes BEFORE os._exit
     os._exit(4)
 
 
@@ -328,6 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     pwd = os.environ.get("HOSTINGER_EMAIL_APP_PASSWORD")
     if not user or not pwd:
         print("[check-bertha] FAILED: HOSTINGER_EMAIL or HOSTINGER_EMAIL_APP_PASSWORD missing", flush=True)
+        _record_sample(2)
         return 2
 
     signal.signal(signal.SIGALRM, _deadline_handler)
@@ -378,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
         # FLUSHED status line naming the stage, so it is never a silent quiet.
         signal.alarm(0)
         print(f"[check-bertha] FAILED: imap {_STAGE['name']} rejected: {exc!r}", flush=True)
+        _record_sample(3)
         return 3
     except (TimeoutError, OSError) as exc:
         # Per-op timeout / TLS / network — DEFENCE-IN-DEPTH under the wall-clock deadline; fails
@@ -389,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
             f"(per-op <= {IMAP_TIMEOUT}s): {exc!r}",
             flush=True,
         )
+        _record_sample(4)
         return 4
     finally:
         signal.alarm(0)  # cancel the deadline — nothing past here may block
@@ -399,13 +434,15 @@ def main(argv: list[str] | None = None) -> int:
                 pass
 
     mode = "bootstrap" if bootstrap else "poll"
+    seen_total = len(_load_seen())
     stage_timings = " ".join(f"{k}={v:.2f}s" for k, v in _TIMINGS.items())
     if not quiet:
         print(
             f"[check-bertha] {mode}: surfaced={surfaced} "
-            f"seen_total={len(_load_seen())} | {stage_timings}",
+            f"seen_total={seen_total} | {stage_timings}",
             flush=True,
         )
+    _record_sample(0, surfaced=surfaced, seen_total=seen_total)
     return 0
 
 
