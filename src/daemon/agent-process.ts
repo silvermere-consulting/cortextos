@@ -1077,6 +1077,21 @@ export class AgentProcess {
     const startedAt = Date.now();
     const initialMs = (this.config.max_session_seconds || DEFAULT_MAX_SESSION_S) * 1000;
 
+    // BUG-048 (concurrency, NOT the single-session-8GB fuel bug): every agent computes
+    // the same initialMs and starts its timer at daemon start, so the whole cohort fires
+    // in one ~60s window and restarts simultaneously. Add a deterministic per-agent jitter
+    // to the INITIAL deadline (keyed to the agent name → stable across restarts) so the
+    // cohort spreads over a band wider than one agent's restart. Only ever ADDS time, so
+    // no session is shortened and none fires early.
+    let nameHash = 0;
+    for (let i = 0; i < this.name.length; i++) nameHash = (nameHash * 31 + this.name.charCodeAt(i)) >>> 0;
+    // Jitter as a deterministic FRACTION of the session (0..~2%), NOT an absolute band —
+    // it must scale with duration: ~85 min of spread across the fleet at the 71h
+    // production deadline, yet negligible on short/test durations (a 1s session jitters
+    // by ≤20ms, so it still fires as expected).
+    const jitterMs = Math.floor(initialMs * (nameHash % 2000) / 100000);
+    this.log(`Session timer: initial ${initialMs / 1000}s + BUG-048 per-agent jitter ${Math.round(jitterMs / 1000)}s (name-keyed)`);
+
     // BUG-048 fix: re-read max_session_seconds from config.json on each timer
     // fire so that config changes after start() take effect. Without this, a
     // briefly-low max_session_seconds baked at start time causes a fleet-wide
@@ -1108,7 +1123,7 @@ export class AgentProcess {
       }, Math.min(delayMs, MAX_SETTIMEOUT_MS));
     };
 
-    scheduleCheck(initialMs);
+    scheduleCheck(initialMs + jitterMs);
   }
 
   private clearSessionTimer(): void {
