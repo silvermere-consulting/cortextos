@@ -1,7 +1,7 @@
 import { AgentManager } from './agent-manager.js';
 import { IPCServer } from './ipc-server.js';
 import { FrozenTurnWatchdog, type FrozenTurnDetail } from './frozen-turn-watchdog.js';
-import { pageOperator, validateOperatorChat } from './operator-page.js';
+import { pageOperator, validateOperatorChat, operatorSelfTestEvent } from './operator-page.js';
 import { checkClaudePinFromEnv } from './claude-pin.js';
 import { CredentialRefresher, buildCredentialGate } from './credential-refresh.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
@@ -529,14 +529,20 @@ class Daemon {
 
       if (v.ok) {
         console.log(`[daemon] operator-page self-test OK: ${v.detail}`);
-        return;
+      } else {
+        console.error(`[daemon] ⚠️ CRITICAL: operator-page self-test FAILED (${v.failed}): ${v.detail} — ` +
+          'the fleet CANNOT page the operator in a common-mode outage. Fix before relying on any alarm.');
       }
 
-      console.error(`[daemon] ⚠️ CRITICAL: operator-page self-test FAILED (${v.failed}): ${v.detail} — ` +
-        'the fleet CANNOT page the operator in a common-mode outage. Fix before relying on any alarm.');
-
-      // Event per org, attributed to its orchestrator (falls back to the
-      // org's first agent) — the streams that actually get read.
+      // Emit a per-org event on EVERY run — `operator_page_selftest_ok` on pass,
+      // `operator_page_selftest_failed` on fail — attributed to each org's
+      // orchestrator (falls back to the org's first agent), the streams that
+      // actually get read. A failure-only control cannot tell HEALTHY from DEAD:
+      // event-stream silence reads identically whether the page works or the
+      // self-test stopped running. The persistent marker already records both
+      // states; this brings the event stream to parity so a sweep need not know
+      // which store holds the positive signal (task_1787204161743, condition 1).
+      const ev = operatorSelfTestEvent(v);
       const agents = this.agentManager?.getAgentNames() ?? [];
       const orgFirstAgent = new Map<string, string>();
       for (const a of agents) {
@@ -552,8 +558,7 @@ class Daemon {
           } catch { /* no context.json — first agent carries it */ }
           logObserverEvent(
             resolvePaths(target, instanceId, org), target, org,
-            'error', 'operator_page_selftest_failed', 'error',
-            { failed: v.failed, detail: v.detail },
+            ev.category, ev.event, ev.severity, ev.meta,
           );
         } catch { /* per-org best-effort */ }
       }

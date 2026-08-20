@@ -6,6 +6,7 @@ import {
   getOperatorChatCreds,
   pageOperator,
   validateOperatorChat,
+  operatorSelfTestEvent,
   type PageTransport,
   type ValidationTransport,
 } from '../../../src/daemon/operator-page';
@@ -180,5 +181,36 @@ describe('validateOperatorChat (boot self-test)', () => {
     process.env.CTX_OPERATOR_CHAT_ID = '1';
     process.env.CTX_OPERATOR_BOT_TOKEN = '123:abc';
     expect(getOperatorChatCreds(frameworkRoot)?.source).toBe('env');
+  });
+});
+
+// The self-test emits an event on BOTH outcomes, not failure-only. A
+// failure-only control cannot tell HEALTHY from DEAD: event-stream silence
+// reads identically whether the page works or the self-test stopped running
+// (task_1787204161743, condition 1 — the defect that let 2,125 failures also
+// leave no positive signal in the stream). Both arms exercised: the OK arm must
+// actually fire the positive event, not merely not-fire the failure one.
+describe('operatorSelfTestEvent (event-stream parity, both arms)', () => {
+  it('OK arm: a passing self-test emits operator_page_selftest_ok (info/action), carrying detail', () => {
+    const ev = operatorSelfTestEvent({ ok: true, failed: 'none', detail: 'bot token valid, chat 111 reachable (source: env)' });
+    expect(ev.event).toBe('operator_page_selftest_ok');
+    expect(ev.category).toBe('action');
+    expect(ev.severity).toBe('info');
+    expect(ev.meta).toMatchObject({ detail: expect.stringContaining('reachable') });
+    expect(ev.meta).not.toHaveProperty('failed');
+  });
+
+  it('FAILED arm: a failing self-test emits operator_page_selftest_failed (error) and carries the failure reason', () => {
+    const ev = operatorSelfTestEvent({ ok: false, failed: 'not-explicit', detail: 'operator chat resolved by FALLBACK to chat 8465948173 (first agent .env)' });
+    expect(ev.event).toBe('operator_page_selftest_failed');
+    expect(ev.category).toBe('error');
+    expect(ev.severity).toBe('error');
+    expect(ev.meta).toMatchObject({ failed: 'not-explicit' });
+  });
+
+  it('the two arms are distinct events — silence in one is not the other (the ambiguity this closes)', () => {
+    const ok = operatorSelfTestEvent({ ok: true, failed: 'none', detail: 'ok' });
+    const bad = operatorSelfTestEvent({ ok: false, failed: 'getChat', detail: 'unreachable' });
+    expect(ok.event).not.toBe(bad.event);
   });
 });

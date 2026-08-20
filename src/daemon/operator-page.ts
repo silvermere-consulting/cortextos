@@ -195,6 +195,29 @@ export function validateOperatorChat(
   }
 }
 
+/** The observer event a self-test outcome should emit. */
+export interface OperatorSelfTestEvent {
+  category: 'action' | 'error';
+  event: 'operator_page_selftest_ok' | 'operator_page_selftest_failed';
+  severity: 'info' | 'error';
+  meta: Record<string, unknown>;
+}
+
+/**
+ * Map a self-test result to the observer event it emits. A per-run event on
+ * BOTH outcomes — not failure-only — so the event stream can tell HEALTHY from
+ * DEAD/stopped: with a failure-only control, event-stream silence reads
+ * identically whether the page works or the self-test stopped running. The
+ * persistent marker already records both states; this brings the event stream
+ * to parity so a sweep need not know which store holds the positive signal
+ * (task_1787204161743, condition 1).
+ */
+export function operatorSelfTestEvent(v: OperatorChatValidation): OperatorSelfTestEvent {
+  return v.ok
+    ? { category: 'action', event: 'operator_page_selftest_ok', severity: 'info', meta: { detail: v.detail } }
+    : { category: 'error', event: 'operator_page_selftest_failed', severity: 'error', meta: { failed: v.failed, detail: v.detail } };
+}
+
 export interface PageOperatorOptions {
   /** Injectable transport for tests / live harness. Default: curl. */
   transport?: PageTransport;

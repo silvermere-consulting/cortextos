@@ -23,6 +23,36 @@ const CTX_ORG = process.env.CTX_ORG || '';
 const CLAUDE_VERSION = '2.1.231';  // rolled 229->231 2026-08-13 (Steve go "4. Upgrade"; 3b: trivial delta — 231 = one MCP-OAuth-redirect bugfix, 230 no changelog entry, NO default/cost/memory/orchestration change). 2.1.229 frozen copy is the revert target.
 const AUTHORISED_CLAUDE_BIN = path.join(os.homedir(), '.local', 'share', 'claude-code', CLAUDE_VERSION, 'claude.exe');
 
+// Operator-page routing (P1 fix 2026-08-20, task_1787204161743). The last-resort
+// operator page — the frozen-agent escalation that covers even the orchestrator's
+// OWN unreachability — must go to the CHOSEN operator (Steven), not resolve by the
+// alphabetical first-agent-.env fallback in getOperatorChatCreds(). That fallback
+// had silently routed fleet last-resort alerts to another org's principal for 30+
+// days (2,125 operator_page_selftest_failed events; the self-test's requireExplicit
+// counts any fallback resolution as FAILED). Priority-1 needs CTX_OPERATOR_CHAT_ID +
+// CTX_OPERATOR_BOT_TOKEN in the DAEMON env.
+//
+// SECRET DISCIPLINE: this file is TRACKED in git, so the bot token is NEVER inlined
+// here. It is READ at load-time from chief/.env (untracked, chmod 600 — the
+// authoritative store), giving (Steven's chat id, the chief bot token) exactly as
+// chief specified. The tracked file holds a READER, not the value — inlining the
+// token would re-create, inside its own remediation, the at-rest-secret class this
+// estate spent 2026-08-20 removing. On any read failure the operator vars stay unset
+// and getOperatorChatCreds() falls back exactly as before (no regression, just no fix).
+function readOperatorCreds() {
+  try {
+    const envPath = path.join(FRAMEWORK_ROOT, 'orgs', 'silvermere-tech', 'agents', 'chief', '.env');
+    const txt = require('fs').readFileSync(envPath, 'utf-8');
+    const chat = (txt.match(/^CHAT_ID=(.+)$/m) || [])[1];
+    const token = (txt.match(/^BOT_TOKEN=(.+)$/m) || [])[1];
+    if (chat && token && /^\d+:[A-Za-z0-9_-]+$/.test(token.trim())) {
+      return { chat: chat.trim(), token: token.trim() };
+    }
+  } catch { /* fall through — operator page resolves by fallback as before */ }
+  return {};
+}
+const OPERATOR_CREDS = readOperatorCreds();
+
 module.exports = {
   apps: [
     {
@@ -60,6 +90,13 @@ module.exports = {
         // the operator if the resolved binary's --version != CTX_CLAUDE_VERSION_EXPECTED.
         CTX_CLAUDE_BIN: AUTHORISED_CLAUDE_BIN,
         CTX_CLAUDE_VERSION_EXPECTED: CLAUDE_VERSION,
+        // Operator page: chosen operator (Steven via chief bot), read from
+        // chief/.env at load-time above. Spread only when both resolved, so a
+        // read failure leaves them unset and the fallback path is unchanged.
+        ...(OPERATOR_CREDS.chat && OPERATOR_CREDS.token ? {
+          CTX_OPERATOR_CHAT_ID: OPERATOR_CREDS.chat,
+          CTX_OPERATOR_BOT_TOKEN: OPERATOR_CREDS.token,
+        } : {}),
         // Debug-only: set to '1' to enable SIGUSR2 signal → controlled
         // uncaughtException for testing the crash-visibility path
         // (.daemon-crashed markers + crash-loop operator Telegram alert).
