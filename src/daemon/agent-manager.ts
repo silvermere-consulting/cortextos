@@ -16,6 +16,7 @@ import { collectTelegramCommands, registerTelegramCommands } from '../bus/metric
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
 import { stripBom } from '../utils/strip-bom.js';
+import { resolveStatusRecipient } from '../telegram/status-recipient.js';
 
 type LogFn = (msg: string) => void;
 
@@ -330,6 +331,10 @@ export class AgentManager {
     const agentEnvFile = join(agentDir, '.env');
     let telegramApi: TelegramAPI | undefined;
     let chatId: string | undefined;
+    // CTX_STATUS_CHAT_ID: the ONLY recipient for machine/ops status (crash/halt/recovery).
+    // Distinct from chatId (the conversational CHAT_ID) so a client-facing agent never gets
+    // alarming daemon notices in the user's chat. See resolveStatusRecipient (JEN-LEAK path F).
+    let statusChatId: string | undefined;
     let allowedUserIds: Set<number> = new Set();
     let botToken: string | undefined;
 
@@ -354,6 +359,7 @@ export class AgentManager {
       const allowedUserMatch  = envContent.match(/^ALLOWED_USER=(.+)$/m);
       botToken = botTokenMatch?.[1]?.trim();
       chatId = chatIdMatch?.[1]?.trim();
+      statusChatId = envContent.match(/^CTX_STATUS_CHAT_ID=(.+)$/m)?.[1]?.trim();
 
       const rawAllowed = (allowedUsersMatch?.[1] ?? allowedUserMatch?.[1] ?? '').trim();
       for (const part of rawAllowed.split(',')) {
@@ -397,7 +403,7 @@ export class AgentManager {
     // can emit sendChatAction directly from the JSONL stream. Has no effect for
     // claude-code / hermes runtimes — those still use fast-checker.
     if (telegramApi && chatId) {
-      agentProcess.setTelegramHandle(telegramApi, chatId);
+      agentProcess.setTelegramHandle(telegramApi, chatId, statusChatId);
     }
     const checker = new FastChecker(agentProcess, paths, this.frameworkRoot, {
       log,
@@ -406,19 +412,35 @@ export class AgentManager {
       allowedUserIds: allowedUserIds.size > 0 ? allowedUserIds : undefined,
     });
 
-    // Send Telegram notification on crashes and session refreshes
-    if (telegramApi && chatId) {
-      const tgApi = telegramApi;
-      const tgChatId = chatId;
+    // Send Telegram notification on crashes and session refreshes.
+    // JEN-LEAK path F (2026-08-23): crash/halt/recovery are MACHINE/ops status and route to
+    // CTX_STATUS_CHAT_ID ONLY — never the conversational CHAT_ID, which for a client-facing agent
+    // (e.g. othe -> Jen) is a non-technical person on a deliberate no-contact hold. Before this fix
+    // the daemon sent 'crashed'/'HALTED'/'recovered' straight to chatId with no status routing, no
+    // night gate and no hold gate. Now: send only to the resolved status recipient; when none is
+    // configured, SUPPRESS the send and LOG it so a crash stays attributable in the daemon log
+    // without landing in a user's chat. A hold is a property of the CHAT, gated where the send happens.
+    const statusRecipient = resolveStatusRecipient({ BOT_TOKEN: botToken, CTX_STATUS_CHAT_ID: statusChatId, CHAT_ID: chatId });
+    if (statusRecipient.botToken) {
+      const statusApi = telegramApi ?? new TelegramAPI(statusRecipient.botToken);
+      const statusChat = statusRecipient.chatId;
       let prevStatus: string | null = null;
       agentProcess.onStatusChanged((status) => {
+        let msg: string | null = null;
         if (status.status === 'crashed') {
           const crashNum = status.crashCount ?? '?';
-          tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(() => {});
+          msg = `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`;
         } else if (status.status === 'halted') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`).catch(() => {});
+          msg = `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`;
         } else if (status.status === 'running' && prevStatus === 'crashed') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} recovered and is back online`).catch(() => {});
+          msg = `Agent ${name} recovered and is back online`;
+        }
+        if (msg) {
+          if (statusChat) {
+            statusApi.sendMessage(statusChat, msg).catch(() => {});
+          } else if (statusRecipient.logSkip) {
+            log(`status notice SUPPRESSED (${statusRecipient.skipReason}): ${msg}`);
+          }
         }
         prevStatus = status.status;
       });

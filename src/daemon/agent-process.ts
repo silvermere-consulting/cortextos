@@ -90,6 +90,9 @@ export class AgentProcess {
   // (each start() recreates the PTY, but the Telegram handle persists).
   private telegramApi: TelegramAPI | null = null;
   private telegramChatId: string | null = null;
+  // CTX_STATUS_CHAT_ID: the ONLY recipient for machine status (JEN-LEAK path D). Distinct from
+  // telegramChatId so the codex 'back online' notice never lands in a client's conversational chat.
+  private telegramStatusChatId: string | null = null;
   // Issue #392: tracks whether the most recently built startup prompt consumed
   // a handoff doc marker. start() reads this after spawn to decide whether the
   // daemon should fire the codex-app-server back-online Telegram directly
@@ -454,9 +457,10 @@ export class AgentProcess {
    * fire sendChatAction directly from the JSONL stream. Safe to call before
    * or after start() — the handle is re-applied on every PTY (re)spawn.
    */
-  setTelegramHandle(api: TelegramAPI, chatId: string): void {
+  setTelegramHandle(api: TelegramAPI, chatId: string, statusChatId?: string | null): void {
     this.telegramApi = api;
     this.telegramChatId = chatId;
+    this.telegramStatusChatId = statusChatId ?? null;
     if (this.config.runtime === 'codex-app-server' && this.pty) {
       (this.pty as CodexAppServerPTY).setTelegramHandle(api, chatId);
     }
@@ -1061,10 +1065,18 @@ export class AgentProcess {
     // Night-mode silent boot: match the prompt-level gate so the codex direct
     // send does not become the one path that still pings the user at night.
     if (!this.isDayMode()) return;
-    if (!this.telegramApi || !this.telegramChatId) return;
-    this.telegramApi
-      .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`)
-      .catch(() => { /* non-fatal: notification is observability only */ });
+    if (!this.telegramApi) return;
+    // JEN-LEAK path D: 'back online' is machine status — apply the same rule as
+    // resolveStatusRecipient (status -> CTX_STATUS_CHAT_ID only, never the conversational chat).
+    // Suppress-with-log when no status chat is configured. Latent today (codex-gated) but the leak
+    // becomes live the moment a client-chat agent switches runtime, so it is closed here too.
+    if (this.telegramStatusChatId) {
+      this.telegramApi
+        .sendMessage(this.telegramStatusChatId, `Agent ${this.name} is back online`)
+        .catch(() => { /* non-fatal: notification is observability only */ });
+    } else if (this.telegramChatId) {
+      this.log(`codex boot notice SUPPRESSED (no CTX_STATUS_CHAT_ID): Agent ${this.name} is back online`);
+    }
   }
 
   private startSessionTimer(): void {

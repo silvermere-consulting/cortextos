@@ -168,7 +168,7 @@ describe('AgentProcess codex-app-server runtime', () => {
     expect(mockCodexAppServerPty.setTelegramHandle).toHaveBeenCalledWith(api, '12345');
   });
 
-  it('sends back-online Telegram directly from daemon on fresh start in DAY mode (issue #392)', async () => {
+  it('sends back-online Telegram to the STATUS chat (not the conversational chat) in DAY mode (issue #392 + JEN-LEAK path D)', async () => {
     // Pin the clock to a day-mode instant (noon UTC → detectDayNightMode('UTC')
     // = day) so the boot-TG day/night gate is deterministic regardless of when
     // the suite runs. Fake only Date so session setTimeout timers are untouched.
@@ -179,10 +179,32 @@ describe('AgentProcess codex-app-server runtime', () => {
       const sendMessage = vi.fn().mockResolvedValue(undefined);
       const api = { sendChatAction: vi.fn().mockResolvedValue(undefined), sendMessage };
 
-      ap.setTelegramHandle(api as any, '12345');
+      // conversational chat 12345, STATUS chat 99999 — the notice must go to 99999.
+      ap.setTelegramHandle(api as any, '12345', '99999');
       await ap.start();
 
-      expect(sendMessage).toHaveBeenCalledWith('12345', 'Agent codex-app-agent is back online');
+      expect(sendMessage).toHaveBeenCalledWith('99999', 'Agent codex-app-agent is back online');
+      // and NEVER the conversational chat (that is the leak this routing closes)
+      expect(sendMessage).not.toHaveBeenCalledWith('12345', expect.any(String));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('SUPPRESSES back-online Telegram when no status chat is configured — never falls back to the conversational chat (JEN-LEAK path D)', async () => {
+    // The refusal arm: an agent whose CHAT_ID is a client (no CTX_STATUS_CHAT_ID) must get NO
+    // daemon-direct 'back online' ping in its user chat, even in day mode. Suppress, don't leak.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-07-04T12:00:00Z'));
+    try {
+      const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+      const sendMessage = vi.fn().mockResolvedValue(undefined);
+      const api = { sendChatAction: vi.fn().mockResolvedValue(undefined), sendMessage };
+
+      ap.setTelegramHandle(api as any, '12345'); // conversational chat only, no status chat
+      await ap.start();
+
+      expect(sendMessage).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }

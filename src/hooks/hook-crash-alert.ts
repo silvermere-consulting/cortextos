@@ -18,6 +18,10 @@ import { existsSync, readFileSync, writeFileSync, appendFileSync, unlinkSync, mk
 import { join } from 'path';
 import { homedir } from 'os';
 import { execFile } from 'child_process';
+// resolveStatusRecipient moved to the shared module 2026-08-23 (JEN-LEAK path F) so the
+// daemon's own status sends can share the rule; re-exported below for existing importers.
+import { resolveStatusRecipient } from '../telegram/status-recipient.js';
+export { resolveStatusRecipient };
 
 const DEDUP_WINDOW_MS = 10 * 60 * 1000;         // 10 minutes
 const QUIET_HOUR_START_LA = 22;                 // 22:00 America/Los_Angeles
@@ -258,38 +262,6 @@ export function classifyFromMarkers(
     return { endType: marker.type, reason };
   }
   return { endType: 'crash', reason: '' };
-}
-
-/**
- * EXPLICIT RECIPIENT ONLY (2026-07-21, third-sender finding): status/ops
- * notices go ONLY to CTX_STATUS_CHAT_ID — a chat someone explicitly
- * configured as the intended recipient — never to the conversational
- * CHAT_ID. For a single-agent org, CHAT_ID is a person who never asked for
- * ops noise (3 restart notices over 11 days, measured from the dedup
- * stamp). A status notice to someone who cannot act is not information, it
- * is intrusion. Unset = no Telegram send (crashes.log + bus notify still
- * happen), with the skip LOGGED when CHAT_ID exists so the silence is
- * attributable. Same requireExplicit shape as the daemon operator page.
- */
-export function resolveStatusRecipient(env: Record<string, string | undefined>): {
-  chatId: string | null;
-  botToken: string | undefined;
-  logSkip: boolean;
-  skipReason: string;
-} {
-  const botToken = env.BOT_TOKEN;
-  const statusChat = env.CTX_STATUS_CHAT_ID;
-  if (botToken && statusChat) {
-    return { chatId: statusChat, botToken, logSkip: false, skipReason: '' };
-  }
-  if (env.CHAT_ID && !statusChat) {
-    return {
-      chatId: null, botToken,
-      logSkip: true,
-      skipReason: 'no-CTX_STATUS_CHAT_ID (CHAT_ID present but not an explicit status recipient)',
-    };
-  }
-  return { chatId: null, botToken, logSkip: false, skipReason: 'no-credentials' };
 }
 
 async function main(): Promise<void> {
