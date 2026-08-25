@@ -1,9 +1,10 @@
 import { execFileSync, spawnSync } from 'child_process';
-import { existsSync, mkdirSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, statSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { BusPaths } from '../types/index.js';
 import { normalizeOrgName } from '../utils/org.js';
+import { hasCredential, isUnscreenableBinary } from './system.js';
 
 /**
  * Knowledge base integration — calls mmrag.py directly (cross-platform,
@@ -308,6 +309,123 @@ export function queryKnowledgeBase(
 /**
  * Ingest files into the knowledge base.
  */
+/**
+ * Screen ONE concrete file for a credential before it is embedded into the KB.
+ *
+ * Wires the CREDENTIAL predicate from the auto-commit screen (hasCredential in
+ * ./system.ts) onto the ingest path, which never had a screen. The leak route it
+ * closes: agents/{slash}memory is kb-ingested AND ships off-box in the nightly R2
+ * backup, so a credential quoted into a memory file reaches an embedding store
+ * and an off-box archive unscreened — one ordinary diligent step downstream of
+ * anyone who holds a secret.
+ *
+ * DELIBERATELY the credential predicate, NOT the full screenFile() commit policy.
+ * screenFile() refuses binaries (PDF, images) as unscreenable_binary and caps at
+ * 10MB — correct for a text-only snapshot repo, WRONG here, where PDFs and images
+ * are first-class multimodal ingest content. Applying it would break legitimate
+ * ingestion, which is a reshape, not a wire. So:
+ *   - .env by NAME       -> refuse (a secrets file must never be embedded)
+ *   - bytes are not text  -> allow (multimodal; hasCredential cannot read the raw
+ *                            bytes, and refusing every binary breaks the KB's job).
+ *   - text + hasCredential -> refuse (credential_pattern_detected)
+ *   - unreadable          -> refuse (a file we cannot read we cannot clear).
+ *
+ * 🔴 RESIDUAL — NOT the same as the auto-commit binary limit, do not read it as
+ * such. This screen runs PRE-EXTRACTION, on raw bytes. The KB does not store the
+ * binary opaquely the way the snapshot repo does — per the Document Tooling
+ * Standard it EXTRACTS text from PDFs/images (Kreuzberg / markitdown / tesseract)
+ * and embeds that text, which is then fully searchable. So a credential in a PDF's
+ * text layer passes this screen (allowed as binary) and lands in the vector store
+ * after extraction — the exact leak, through the one path this layer is blind to.
+ * Auto-commit's limit is bounded because nobody can query inside an opaque blob;
+ * this one is NOT. Closing it needs a POST-EXTRACTION screen inside the mmrag
+ * pipeline (screen exactly the text that gets embedded), which is a separate change
+ * from this wire. Filed as a follow-up; this wire closes the LIVE route (a
+ * credential quoted into a text memory file), not the binary-extraction route.
+ * Returns a block reason, or null if safe to ingest. Exported for the unit test
+ * that plants a fake credential and asserts it is refused — a screen that has
+ * never refused anything is indistinguishable from no screen.
+ */
+export function screenIngestFile(fullPath: string): string | null {
+  if (fullPath.endsWith('.env') || fullPath.includes('/.env')) return 'contains_credentials';
+  try {
+    const buf = readFileSync(fullPath);
+    if (isUnscreenableBinary(buf)) return null; // binary/multimodal — not text-screenable
+    if (hasCredential(buf.toString('utf-8'))) return 'credential_pattern_detected';
+  } catch {
+    return 'unreadable';
+  }
+  return null;
+}
+
+/**
+ * Expand an ingest path to the concrete files it covers. A file is itself; a
+ * directory is walked recursively, because mmrag recurses into directories — so a
+ * credential one level down would ride in unscreened if the screen only looked at
+ * the top path. A path that does not exist expands to nothing (mmrag reports it;
+ * the screen has nothing to check). .git is skipped: it is packed object storage,
+ * not ingest content, and walking it is a large waste — but hidden FILES such as
+ * .env are still screened, only the .git directory itself is pruned.
+ */
+function expandIngestFiles(p: string): string[] {
+  let st;
+  try {
+    st = statSync(p);
+  } catch {
+    return [];
+  }
+  if (st.isFile()) return [p];
+  if (st.isDirectory()) {
+    const out: string[] = [];
+    for (const entry of readdirSync(p, { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name === '.git') continue;
+      out.push(...expandIngestFiles(join(p, entry.name)));
+    }
+    return out;
+  }
+  return [];
+}
+
+/**
+ * Best-effort emit of a `kb_credential_blocked` error event so a refusal is
+ * countable in the activity feed and not just a stderr line nobody tails. Mirrors
+ * emitQuotaSkipEvent — never throws; a screen that cannot log still refuses.
+ */
+function emitCredentialBlockEvent(frameworkRoot: string, meta: { collection: string; count: number; files: string[] }): void {
+  try {
+    const cliPath = join(frameworkRoot, 'dist', 'cli.js');
+    if (!existsSync(cliPath)) return;
+    execFileSync(process.execPath, [cliPath, 'bus', 'log-event', 'error', 'kb_credential_blocked', 'error', '--meta', JSON.stringify(meta)], {
+      timeout: 5_000,
+      stdio: 'pipe',
+    });
+  } catch { /* best-effort */ }
+}
+
+/**
+ * Partition ingest paths into the ones safe to embed and the files refused for a
+ * credential/screen reason. A path is refused as a WHOLE if any file it expands to
+ * is refused, because mmrag recurses a directory as one unit — a dir with one dirty
+ * file fails closed rather than ingesting its clean siblings via a path mmrag would
+ * re-walk. The common case is a file path (path IS the file), so this is per-file
+ * there. Exported so the wire's refusal can be proven with real files and no mocks.
+ */
+export function screenIngestPaths(paths: string[]): {
+  cleanPaths: string[];
+  refused: { file: string; reason: string }[];
+} {
+  const refused: { file: string; reason: string }[] = [];
+  const cleanPaths: string[] = [];
+  for (const p of paths) {
+    const bad = expandIngestFiles(p)
+      .map(f => ({ file: f, reason: screenIngestFile(f) }))
+      .filter((r): r is { file: string; reason: string } => r.reason !== null);
+    if (bad.length > 0) refused.push(...bad);
+    else cleanPaths.push(p);
+  }
+  return { cleanPaths, refused };
+}
+
 export function ingestKnowledgeBase(
   paths: string[],
   options: {
@@ -369,7 +487,31 @@ export function ingestKnowledgeBase(
     console.log(`  Source: ${p}`);
   }
 
-  const args = [mmragPath, 'ingest', ...paths, '--collection', collection];
+  // --- Credential screen (wired 2026-08-25, task_1787631822832) -------------
+  // Refuse any file carrying a credential before it is embedded and shipped to R2.
+  const { cleanPaths, refused } = screenIngestPaths(paths);
+
+  if (refused.length > 0) {
+    for (const r of refused) {
+      // Named stderr line per refused file — loud, greppable, one per incident.
+      process.stderr.write(`🔴 KB-INGEST REFUSED: ${r.file} — ${r.reason}\n`);
+    }
+    emitCredentialBlockEvent(frameworkRoot, {
+      collection,
+      count: refused.length,
+      files: refused.map(r => r.file),
+    });
+  }
+
+  // Nothing clean to ingest — refuse the whole run rather than reporting success
+  // over an empty ingest (the success-badge inversion this screen exists to stop).
+  if (cleanPaths.length === 0) {
+    throw new Error(
+      `kb-ingest refused: ${refused.length} file(s) carry a credential/screen reason and no clean file remained. See the KB-INGEST REFUSED lines above; redact and re-ingest.`,
+    );
+  }
+
+  const args = [mmragPath, 'ingest', ...cleanPaths, '--collection', collection];
   if (force) args.push('--force');
 
   // Multimodal PDF ingestion via Gemini Flash routinely takes 2–5 min for
@@ -419,6 +561,16 @@ export function ingestKnowledgeBase(
     // Non-quota failure — preserve the original throw semantics so the CLI
     // surfaces the error the same way it always has.
     throw new Error(`mmrag ingest exited with status ${result.status}`);
+  }
+
+  if (refused.length > 0) {
+    // Clean content landed, but a partial ingest WITH refusals is not a success.
+    // The throw makes the exit non-zero so a refusal can never read as a clean
+    // run — the third of the three signals (non-zero exit · named stderr line ·
+    // distinct error event), the same shape the auto-commit fatal path rides.
+    throw new Error(
+      `kb-ingest: clean content ingested into ${collection}, but REFUSED ${refused.length} credential-bearing file(s): ${refused.map(r => r.file).join(', ')}. Redact and re-ingest those.`,
+    );
   }
 
   console.log(`\nIngest complete → collection: ${collection}`);
