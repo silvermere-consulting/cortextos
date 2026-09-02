@@ -142,6 +142,35 @@ describe('checkUsageApi', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
+  it('surfaces five_hour/seven_day resets_at from the nested body', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        five_hour: { utilization: 0.16, resets_at: '2026-09-02T11:00:00.000+00:00' },
+        seven_day: { utilization: 0.11, resets_at: '2026-09-06T07:00:00.000+00:00' },
+      }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+    expect(result.five_hour_resets_at).toBe('2026-09-02T11:00:00.000+00:00');
+    expect(result.seven_day_resets_at).toBe('2026-09-06T07:00:00.000+00:00');
+    // utilization is still parsed from the same nested shape
+    expect(result.seven_day_utilization).toBeCloseTo(0.11);
+  });
+
+  it('leaves resets_at undefined when the body omits it (flat shape)', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 0.5, seven_day_utilization: 0.3 }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+    expect(result.five_hour_resets_at).toBeUndefined();
+    expect(result.seven_day_resets_at).toBeUndefined();
+  });
+
   it('throws on non-ok API response', async () => {
     writeStore();
     mockFetch.mockResolvedValueOnce({

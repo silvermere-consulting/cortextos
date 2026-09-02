@@ -49,6 +49,12 @@ export interface UsageSnapshot {
   five_hour_utilization: number;
   seven_day_utilization: number;
   fetched_at: string;
+  // ISO8601 reset timestamps from the raw oauth/usage body (five_hour.resets_at /
+  // seven_day.resets_at). Optional: absent from caches written before this field
+  // existed, and absent if the API shape ever drops them. The 7d value is the
+  // weekly-cap reset a human reads off the Claude usage screen. (added 2026-09-02)
+  five_hour_resets_at?: string;
+  seven_day_resets_at?: string;
 }
 
 export interface UsageCache {
@@ -62,6 +68,8 @@ export interface CheckUsageResult {
   seven_day_utilization: number;
   cached: boolean;
   fetched_at: string;
+  five_hour_resets_at?: string;
+  seven_day_resets_at?: string;
 }
 
 export interface RotateResult {
@@ -277,8 +285,8 @@ export async function checkUsageApi(
   // hid Sondre's actual quota in the dashboard. Keep flat fallbacks in
   // case the API ever returns either shape.
   const data = await response.json() as {
-    five_hour?: { utilization?: number };
-    seven_day?: { utilization?: number };
+    five_hour?: { utilization?: number; resets_at?: string };
+    seven_day?: { utilization?: number; resets_at?: string };
     five_hour_utilization?: number;
     seven_day_utilization?: number;
     fiveHourUtilization?: number;
@@ -304,6 +312,8 @@ export async function checkUsageApi(
     five_hour_utilization: fiveHour,
     seven_day_utilization: sevenDay,
     fetched_at: fetchedAt,
+    five_hour_resets_at: data.five_hour?.resets_at,
+    seven_day_resets_at: data.seven_day?.resets_at,
   };
 
   // Update cache and accounts.json utilization fields
