@@ -558,9 +558,18 @@ export function ingestKnowledgeBase(
       emitQuotaSkipEvent(frameworkRoot, { collection, scope, agent: agent || null });
       return;
     }
-    // Non-quota failure — preserve the original throw semantics so the CLI
-    // surfaces the error the same way it always has.
-    throw new Error(`mmrag ingest exited with status ${result.status}`);
+    // Non-quota failure. Disambiguate the cause from result.signal +
+    // result.error — a signal-kill, a timeout, and a spawn-failure all present
+    // as status=null and used to collapse into one unactionable "status null"
+    // message. Emit a structured failure event so the cause is observable even
+    // if a caller swallows stderr, then throw a branch-named error. Control
+    // flow is unchanged: a non-quota failure still throws, non-zero preserved.
+    const diag = describeSpawnFailure(result, { timeoutMs: ingestTimeoutMs });
+    emitIngestFailureEvent(frameworkRoot, {
+      collection, scope, agent: agent || null,
+      branch: diag.branch, signal: diag.signal, errorCode: diag.errorCode, summary: diag.summary,
+    });
+    throw new Error(`mmrag ingest failed: ${diag.summary}`);
   }
 
   if (refused.length > 0) {
@@ -604,6 +613,107 @@ function emitQuotaSkipEvent(frameworkRoot: string, meta: { collection: string; s
     // outer try/catch swallowed the validation throw). Use category=action with
     // event=kb_quota_skip so dashboards can still group by event name.
     execFileSync(process.execPath, [cliPath, 'bus', 'log-event', 'action', 'kb_quota_skip', 'warning', '--meta', JSON.stringify(meta)], {
+      timeout: 5_000,
+      stdio: 'pipe',
+    });
+  } catch { /* best-effort */ }
+}
+
+/**
+ * Disambiguate WHY a spawnSync ingest call failed.
+ *
+ * spawnSync returns `status: null` on three completely different causes —
+ * a signal-kill, a timeout, or a spawn-failure — and the old throw collapsed
+ * all of them into "mmrag ingest exited with status null", a string that names
+ * no branch and therefore corroborates whatever cause you already suspect.
+ * (2026-09-04: that single ambiguous message let two different wrong causal
+ * stories — a chroma lock and a maxBuffer overflow — both look consistent with
+ * the same failure, costing a night of guessing.) The discriminating evidence
+ * is `result.signal` and `result.error.code`, which the throw discarded.
+ *
+ * Returns a machine-usable branch tag plus a human summary. Pure — no I/O.
+ */
+function describeSpawnFailure(
+  result: { status: number | null; signal: NodeJS.Signals | null; error?: Error & { code?: string } },
+  ctx: { timeoutMs: number },
+): { branch: string; summary: string; signal: string | null; errorCode: string | null } {
+  const signal = result.signal ?? null;
+  const errorCode = result.error?.code ?? null;
+  const errMsg = result.error?.message ?? null;
+
+  // Timeout: Node sets error.code=ETIMEDOUT and kills with SIGTERM.
+  if (errorCode === 'ETIMEDOUT') {
+    return {
+      branch: 'TIMEOUT',
+      summary: `timed out after ${ctx.timeoutMs}ms (killed with ${signal ?? 'SIGTERM'}). Raise KB_INGEST_TIMEOUT_MS or ingest fewer/smaller files.`,
+      signal, errorCode,
+    };
+  }
+  // maxBuffer overflow: Node sets error.code=ENOBUFS and kills with SIGTERM.
+  if (errorCode === 'ENOBUFS') {
+    return {
+      branch: 'MAXBUFFER',
+      summary: `child output exceeded the spawnSync maxBuffer (killed with ${signal ?? 'SIGTERM'}). The captured output was truncated at the buffer cap.`,
+      signal, errorCode,
+    };
+  }
+  // Spawn failure: the child never started (bad interpreter path, EACCES, …).
+  if (errorCode === 'ENOENT' || errorCode === 'EACCES') {
+    return {
+      branch: 'SPAWN_FAILED',
+      summary: `could not spawn the ingest process (${errorCode})${errMsg ? `: ${errMsg}` : ''}. Check the venv python path exists and is executable.`,
+      signal, errorCode,
+    };
+  }
+  // Killed by a signal with no Node-attached error code. SIGKILL is the OOM
+  // killer's signature (also manual kill -9); surface the OOM lead explicitly
+  // because it is the common cause and it leaves a trail elsewhere.
+  if (signal) {
+    const oomHint = signal === 'SIGKILL'
+      ? ' — likely OOM-killed (or kill -9). Cross-check `journalctl -k` / the oom-records for a python3 kill at this time.'
+      : '';
+    return {
+      branch: `SIGNAL_${signal}`,
+      summary: `killed by ${signal}${oomHint}`,
+      signal, errorCode,
+    };
+  }
+  // Any other spawn-layer error object without a signal.
+  if (errorCode || errMsg) {
+    return {
+      branch: 'SPAWN_ERROR',
+      summary: `spawn error${errorCode ? ` (${errorCode})` : ''}${errMsg ? `: ${errMsg}` : ''}`,
+      signal, errorCode,
+    };
+  }
+  // Genuine non-zero exit code from mmrag.py itself — this one DOES name a
+  // branch (mmrag raised and exited), so preserve it verbatim.
+  return {
+    branch: `EXIT_${result.status}`,
+    summary: `mmrag exited with status ${result.status}`,
+    signal, errorCode,
+  };
+}
+
+/**
+ * Best-effort emit of a `kb_ingest_failure` event carrying the disambiguated
+ * failure branch, so the failure rate and its CAUSE are observable in the
+ * activity feed instead of dying inside a caller's swallowed stderr. Never
+ * throws — mirrors emitQuotaSkipEvent's fail-soft contract.
+ */
+function emitIngestFailureEvent(
+  frameworkRoot: string,
+  meta: {
+    collection: string; scope: string; agent: string | null;
+    branch: string; signal: string | null; errorCode: string | null; summary: string;
+  },
+): void {
+  try {
+    const cliPath = join(frameworkRoot, 'dist', 'cli.js');
+    if (!existsSync(cliPath)) return;
+    // category=action (kb is not a VALID_CATEGORY; same constraint documented
+    // in emitQuotaSkipEvent). severity=error — this is a real failure, not a skip.
+    execFileSync(process.execPath, [cliPath, 'bus', 'log-event', 'action', 'kb_ingest_failure', 'error', '--meta', JSON.stringify(meta)], {
       timeout: 5_000,
       stdio: 'pipe',
     });

@@ -213,6 +213,69 @@ describe('ingestKnowledgeBase — Gemini quota-exhausted skip (E2)', () => {
   });
 });
 
+describe('ingestKnowledgeBase — spawn-failure disambiguation (status=null names no branch)', () => {
+  // Regression guard for 2026-09-04: spawnSync returns status=null on a
+  // signal-kill, a timeout, AND a spawn-failure — three different causes the
+  // old throw collapsed into "exited with status null". Each branch must now
+  // name itself in the thrown message so the next failure is self-diagnosing.
+
+  it('SIGKILL (OOM signature) → names the signal AND surfaces the OOM lead', () => {
+    mockConfiguredKb();
+    spawnSyncMock.mockReturnValue({ status: null, signal: 'SIGKILL', stdout: '', stderr: '' });
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/SIGKILL/);
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/OOM/i);
+    // Must NOT report the unactionable old string.
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).not.toThrow(/status null/);
+  });
+
+  it('SIGTERM (no error code) → names the signal, no OOM claim', () => {
+    mockConfiguredKb();
+    spawnSyncMock.mockReturnValue({ status: null, signal: 'SIGTERM', stdout: '', stderr: '' });
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/SIGTERM/);
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).not.toThrow(/OOM/i);
+  });
+
+  it('maxBuffer overflow (ENOBUFS) → names the buffer cause', () => {
+    mockConfiguredKb();
+    const err = Object.assign(new Error('spawnSync ENOBUFS'), { code: 'ENOBUFS' });
+    spawnSyncMock.mockReturnValue({ status: null, signal: 'SIGTERM', error: err, stdout: '', stderr: '' });
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/maxBuffer/i);
+  });
+
+  it('timeout (ETIMEDOUT) → names the timeout, not a bare signal', () => {
+    mockConfiguredKb();
+    const err = Object.assign(new Error('spawnSync ETIMEDOUT'), { code: 'ETIMEDOUT' });
+    spawnSyncMock.mockReturnValue({ status: null, signal: 'SIGTERM', error: err, stdout: '', stderr: '' });
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/timed out/i);
+  });
+
+  it('spawn failure (ENOENT) → names the spawn failure', () => {
+    mockConfiguredKb();
+    const err = Object.assign(new Error('spawnSync ENOENT'), { code: 'ENOENT' });
+    spawnSyncMock.mockReturnValue({ status: null, signal: null, error: err, stdout: '', stderr: '' });
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/could not spawn/i);
+  });
+
+  it('genuine non-zero exit code is preserved verbatim (does name a branch)', () => {
+    mockConfiguredKb();
+    spawnSyncMock.mockReturnValue({ status: 2, signal: null, stdout: '', stderr: 'ERROR: chroma write failed' });
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/exited with status 2/);
+  });
+
+  it('failure path emits a best-effort kb_ingest_failure event (fail-soft, does not throw over it)', () => {
+    mockConfiguredKb();
+    // existsSync(dist/cli.js) must be truthy for the emit to attempt execFileSync.
+    spawnSyncMock.mockReturnValue({ status: null, signal: 'SIGKILL', stdout: '', stderr: '' });
+    expect(() => ingestKnowledgeBase(['/f.md'], baseOptions)).toThrow(/SIGKILL/);
+    // The event emit rides execFileSync with a log-event kb_ingest_failure argv.
+    const emitted = execFileSyncMock.mock.calls.some((c) => {
+      const argv = (c as unknown[])[1] as string[] | undefined;
+      return Array.isArray(argv) && argv.includes('log-event') && argv.includes('kb_ingest_failure');
+    });
+    expect(emitted).toBe(true);
+  });
+});
+
 describe('queryKnowledgeBase — graceful missing-config', () => {
   it('missing config: warn + return empty KBQueryResponse, execFileSync NEVER called', () => {
     mockMissingKbConfig();
