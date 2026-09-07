@@ -1501,6 +1501,42 @@ def verify_archive_clean(zip_path: str) -> list:
     return hits
 
 
+# --- orphaned-temp startup sweep (2026-09-07, engineer; chief-reviewed) --------------------------
+# The build dir below is a TemporaryDirectory whose cleanup runs on normal exit/exception but NOT on
+# SIGTERM/SIGKILL or a restart-mid-build — so every INTERRUPTED backup orphans the ~600MB FULL-zip
+# build in /tmp, and they accumulate (measured 2026-09-07: 5 orphans back to 08-26, ~1.68GB, the
+# multi-night disk climb). A trap cannot fix this: SIGKILL is untrappable, so a startup-sweep is the
+# only reliable form. It runs BEFORE this run builds anything.
+#
+# SAFETY (chief 2026-09-07): "any prior" cannot know it is prior — an overlapping/manual run's LIVE
+# build dir must never be deleted out from under it (that yields a corrupt archive, strictly worse than
+# the disk it frees). So the sweep is gated TWO ways and FAILS SAFE — it leaves garbage rather than
+# risk an artefact: (1) a DISTINCTIVE prefix so only our own build dirs match, never arbitrary temps;
+# (2) an AGE FLOOR comfortably past the longest real run — a dir younger than the floor is left alone,
+# and a live run's build dir has a fresh mtime, so it is never a candidate.
+BACKUP_TMP_PREFIX = "ctxbackup-"
+STALE_TEMP_AGE_S = int(os.environ.get("BACKUP_TMP_STALE_S", str(3 * 3600)))  # 3h >> longest real run (~<30m)
+
+def sweep_stale_backup_temps():
+    import glob, shutil, time
+    now = time.time(); reclaimed = 0
+    for d in glob.glob(os.path.join(tempfile.gettempdir(), BACKUP_TMP_PREFIX + "*")):
+        try:
+            if not os.path.isdir(d):
+                continue
+            age = now - os.path.getmtime(d)
+            if age < STALE_TEMP_AGE_S:
+                continue  # too young — could be a LIVE concurrent run; leave it (fail safe)
+            sz = sum(f.stat().st_size for f in Path(d).rglob("*") if f.is_file())
+            shutil.rmtree(d, ignore_errors=True)
+            reclaimed += sz
+            print(f"startup-sweep: removed stale backup temp {d} (age {age/3600:.1f}h, {sz/1e6:.0f}MB orphaned)")
+        except Exception as e:  # noqa: BLE001 — a sweep failure must never block the backup
+            print(f"startup-sweep: skipped {d}: {e}", file=sys.stderr)
+    if reclaimed:
+        print(f"startup-sweep: reclaimed {reclaimed/1e6:.0f}MB of orphaned backup temps (age floor {STALE_TEMP_AGE_S//3600}h)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backup a cortextos org (content org-scoped, transport infra-scoped)")
     parser.add_argument("--org", default=DEFAULT_ORG,
@@ -1517,6 +1553,9 @@ def main():
                         help="Skip Step 2e S3 off-host tier even if configured.")
     args = parser.parse_args()
     configure_org(args.org)
+
+    # Reclaim any orphaned build dirs from a previously-killed run BEFORE we build (see above).
+    sweep_stale_backup_temps()
 
     try:
         secrets = load_secrets()
@@ -1535,7 +1574,7 @@ def main():
         print(f"Umami DB dump: skipped — infra tier, runs in the {DEFAULT_ORG} invocation")
         odoo_ok, odoo_status = True, "Odoo dumps: not run here — infra tier"
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(prefix=BACKUP_TMP_PREFIX) as tmp:
         zip_path = os.path.join(tmp, f"{ZIP_PREFIX}{date_str}.zip")
         print(f"Building backup zip...")
         size_mb, skipped = build_zip(zip_path)
