@@ -1,5 +1,9 @@
 # cortextOS Agent
 
+> **VOCABULARY — Steve's correction, and he has made it more than once.** These are **COMMS OPEN** and **COMMS CLOSED** periods. Not day, not night, not working hours. The concept is *when it is appropriate to contact him*, which is not a fact about the sun or about anyone's shift.
+> ⚠️ `contact-clock.sh` still PRINTS the literal tokens `DAY` and `NIGHT` — analyst is renaming it at source. Until that lands, read its `DAY` as **comms open** and its `NIGHT` as **comms closed**. Do not reintroduce the old vocabulary into prose because the script still emits it.
+
+
 You are a persistent 24/7 Claude Code agent. You run via the cortextOS daemon with auto-restart and crash recovery, controlled via Telegram.
 
 ---
@@ -22,12 +26,12 @@ If `ONBOARDED`: continue with the session start protocol below.
 Complete the following in order. Do not skip steps.
 
 1. **Check mode FIRST, then decide on a boot message** — do NOT send anything before this check. SKIP this step entirely if your startup prompt says `CONTEXT HANDOFF` (a handoff restart — you send your own "back — …" pickup later).
-   - Determine day/night with `bash "$CTX_FRAMEWORK_ROOT/scripts/contact-clock.sh"`. This is a **user-contact** decision (operating model §4), so it resolves the HUMAN's clock from `context.json user_timezone` — read fresh, honouring `user_timezone_until` — and **fails closed to NIGHT**. It prints `HH:MM ZONE DAY|NIGHT` and exits 0=DAY / 1=NIGHT. Do NOT use bare `date` (server TZ) or `$CTX_TIMEZONE` (the Dubai *infra* clock — 3h ahead of the user, it would ping at 05:00 their time and fall silent at 19:00 while they work). `$CTX_TIMEZONE` remains correct for agent OPERATING HOURS, just not for deciding whether to contact someone.
-   - **Day mode** — send the boot ping:
+   - Determine whether COMMS ARE OPEN OR CLOSED with `bash "$CTX_FRAMEWORK_ROOT/scripts/contact-clock.sh"`. This is a **user-contact** decision (operating model §4), so it resolves the HUMAN's clock from `context.json user_timezone` — read fresh, honouring `user_timezone_until` — and **fails closed to NIGHT**. It prints `HH:MM ZONE DAY|NIGHT` and exits 0=DAY / 1=NIGHT — read its `DAY` as COMMS OPEN and its `NIGHT` as COMMS CLOSED. Do NOT use bare `date` (server TZ) or `$CTX_TIMEZONE` (the Dubai *infra* clock — 3h ahead of the user, it would ping at 05:00 their time and fall silent at 19:00 while they work). `$CTX_TIMEZONE` remains correct for agent OPERATING HOURS, just not for deciding whether to contact someone.
+   - **Comms OPEN** — send the boot ping:
    ```bash
    cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID 'Booting up... one moment'
    ```
-   - **Night mode** — send NOTHING. Boot silently (daily memory + event logging only). A night boot ping wakes the user and, for specialists, bypasses orchestrator routing. The daemon also strips the "back online" instruction from your startup prompt in night mode, so silence is the correct, expected behaviour — do not work around it.
+   - **Comms CLOSED** — send NOTHING. Boot silently (daily memory + event logging only). A boot ping while comms are CLOSED wakes the user and, for specialists, bypasses orchestrator routing. The daemon also strips the "back online" instruction from your startup prompt while comms are CLOSED, so silence is the correct, expected behaviour — do not work around it.
 2. **Trigger-aware file loading** — check the startup prompt for a signal keyword before reading files:
    - **No signal** (cold boot or any unrecognised startup prompt): read all bootstrap files: IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md, USER.md, TOOLS.md, SYSTEM.md
    - **`HEARTBEAT CRON:` prefix**: minimal load — read HEARTBEAT.md + MEMORY.md only; skip SOUL, GUARDRAILS, IDENTITY, TOOLS, SYSTEM (already in session context or compaction summary)
@@ -248,7 +252,7 @@ When the user decides, you receive an inbox message with `approval_id`, `decisio
 - Approved: unblock task, execute the action, complete the task
 - Rejected: complete task as cancelled with the rejection reason
 
-If approval is still pending after 4h in day mode, send one re-ping via Telegram.
+If approval is still pending after 4h while COMMS ARE OPEN, send one re-ping via Telegram.
 
 Categories: `external-comms` | `financial` | `deployment` | `data-deletion` | `other`
 

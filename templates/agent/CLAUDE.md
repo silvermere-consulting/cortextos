@@ -1,5 +1,9 @@
 # Claude Remote Agent
 
+> **VOCABULARY — Steve's correction, and he has made it more than once.** These are **COMMS OPEN** and **COMMS CLOSED** periods. Not day, not night, not working hours. The concept is *when it is appropriate to contact him*, which is not a fact about the sun or about anyone's shift.
+> ⚠️ `contact-clock.sh` still PRINTS the literal tokens `DAY` and `NIGHT` — analyst is renaming it at source. Until that lands, read its `DAY` as **comms open** and its `NIGHT` as **comms closed**. Do not reintroduce the old vocabulary into prose because the script still emits it.
+
+
 Persistent 24/7 Claude Code agent controlled via Telegram. Runs via cortextos daemon with auto-restart and crash recovery.
 
 ## First Boot Check
@@ -19,7 +23,7 @@ If `ONBOARDED`: continue with the session start protocol below.
 
 See AGENTS.md for the full 13-step session start checklist. Key steps:
 
-1. **Check mode first, then decide on a boot message**: determine day/night with `bash "$CTX_FRAMEWORK_ROOT/scripts/contact-clock.sh"`. This is a **user-contact** decision (operating model §4), so it resolves the HUMAN's clock from `context.json user_timezone` — read fresh, honouring `user_timezone_until` — and **fails closed to NIGHT**. It prints `HH:MM ZONE DAY|NIGHT` and exits 0=DAY / 1=NIGHT. Do NOT use bare `date` (server TZ) or `$CTX_TIMEZONE` (the Dubai *infra* clock — 3h ahead of the user, it would ping at 05:00 their time and fall silent at 19:00 while they work). `$CTX_TIMEZONE` remains correct for agent OPERATING HOURS, just not for deciding whether to contact someone. **Day mode** — send `cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID "Booting up... one moment"`. **Night mode** — send nothing; boot silently (daily memory + event logging only). Skip entirely on a `CONTEXT HANDOFF` restart. (The daemon also suppresses the boot/online ping in night mode.)
+1. **Check mode first, then decide on a boot message**: determine whether COMMS ARE OPEN OR CLOSED with `bash "$CTX_FRAMEWORK_ROOT/scripts/contact-clock.sh"`. This is a **user-contact** decision (operating model §4), so it resolves the HUMAN's clock from `context.json user_timezone` — read fresh, honouring `user_timezone_until` — and **fails closed to NIGHT**. It prints `HH:MM ZONE DAY|NIGHT` and exits 0=DAY / 1=NIGHT — read its `DAY` as COMMS OPEN and its `NIGHT` as COMMS CLOSED. Do NOT use bare `date` (server TZ) or `$CTX_TIMEZONE` (the Dubai *infra* clock — 3h ahead of the user, it would ping at 05:00 their time and fall silent at 19:00 while they work). `$CTX_TIMEZONE` remains correct for agent OPERATING HOURS, just not for deciding whether to contact someone. **Comms OPEN** — send `cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID "Booting up... one moment"`. **Comms CLOSED** — send nothing; boot silently (daily memory + event logging only). Skip entirely on a `CONTEXT HANDOFF` restart. (The daemon also suppresses the boot/online ping in comms CLOSED.)
 2. Read all bootstrap files: IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md, USER.md, TOOLS.md, SYSTEM.md
 3. Read org knowledge base: `../../knowledge.md`
 4. Discover available skills: `cortextos bus list-skills --format text`

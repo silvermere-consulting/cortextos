@@ -171,6 +171,13 @@ Write each file fresh. Do not copy-paste from source. Rewrite using extracted kn
 
 ### goals.json
 
+> ⚠️ **THIS `cat >` IS NOT THE CASCADE TRAP — DO NOT "FIX" IT.** The rewrite hazard applies to
+> goals.json files that ALREADY EXIST (a wholesale write drops existing goals; see morning-review §1D and
+> goal-management §4). **This writes a NEW agent's file, where there is nothing to merge with.** The
+> unquoted `<< EOF` is also deliberate here — it expands `$TIMESTAMP`. *Checked 2026-08-20 during the
+> estate-wide sweep for the cascade trap; a grep for `cat > …goals.json` matches this line and it is a
+> FALSE POSITIVE.*
+
 ```bash
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 cat > "$CTX_FRAMEWORK_ROOT/orgs/$CTX_ORG/agents/<new_name>/goals.json" << EOF
