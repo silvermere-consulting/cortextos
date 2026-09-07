@@ -58,4 +58,22 @@ CRED_SHAPE='(API_KEY|_KEY|KEY_|_TOKEN|TOKEN_|PASSWORD|PASSWD|PASSPHRASE|SECRET|_
 #   RED-stormed all six agents permanently). `(=|$)` matches both forms; `BOT_TOKEN_FOO` still
 #   correctly fails both. DO NOT narrow this back to one form without running
 #   cred-matcher-selftest.sh — it replicates every live call-site shape both directions.
-CRED_NEEDED='^(BOT_TOKEN)(=|$)'
+#
+# ⚠️ THIS SET HAS TWO DISTINCT REASONS, AND THEY ARE NOT THE SAME KIND OF THING (added 2026-08-20):
+#   REASON 1 — LEGITIMATELY-HELD CREDENTIAL: it IS a secret, the agent genuinely needs it (BOT_TOKEN).
+#   REASON 2 — SHAPE FALSE-POSITIVE: it is NOT a secret at all; CRED_SHAPE matched a SUBSTRING of a
+#     public identifier. `UMAMI_*_WEBSITE_ID` is a public Umami analytics site ID (exposed in the
+#     tracking snippet on every public page). It fired ONLY because a site NAMED "ilham keynote"
+#     produced UMAMI_ILHAM_KEYNOTE_WEBSITE_ID, and `_KEY` is a substring of `_KEYNOTE`. The other five
+#     UMAMI_*_WEBSITE_ID siblings do NOT match CRED_SHAPE at all — so this is a name-collision on the
+#     SITE name, not "the WEBSITE_ID class alerts forever". The exemption is anchored on the SUFFIX
+#     `_WEBSITE_ID(=|$)` (not on UMAMI_*, so UMAMI_ADMIN_PASSWORD and UMAMI_CLOUD_API_KEY still fire;
+#     not on _ID generally). The `[A-Z0-9_]*` prefix is REQUIRED so it matches under the Form-C
+#     `^(...)$` full-anchoring where the real name carries a prefix (UMAMI_ILHAM_KEYNOTE_). Blast
+#     radius measured over live /proc envs before shipping: only the WEBSITE_ID names disappear; every
+#     real credential (incl. the two UMAMI secrets) still emerges. Guarded by a fixture in
+#     cred-matcher-selftest.sh — DO NOT ship a CRED_NEEDED change without it going green.
+#   I did NOT narrow CRED_SHAPE to fix this — narrowing the load-bearing widened matcher is the
+#   partial-fix regression this file is a monument to (23-vs-25, PASSPHRASE). A public-ID suppression
+#   is the correct surface: it removes a false POSITIVE without blinding the matcher to any true one.
+CRED_NEEDED='^(BOT_TOKEN)(=|$)|[A-Z0-9_]*_WEBSITE_ID(=|$)'

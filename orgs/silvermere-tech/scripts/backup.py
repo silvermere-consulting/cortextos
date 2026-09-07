@@ -326,6 +326,83 @@ def build_zip(dest_path: str, extra_dirs: list = None) -> tuple[float, list[str]
             if extra.exists():
                 skipped.extend(add_once(zf, extra, arc_base))
 
+        # SCOPE MANIFEST (2026-08-26, engineer). A zip that cannot state its own tier gets
+        # misread: on 2026-08-26 two readers independently read "discover-liwa absent from the
+        # CORE zip" as "not backed up" — when the core zip excludes swept projects BY DESIGN.
+        # This one file, INSIDE the archive, travels with it; the next reader opens the zip,
+        # not the config. Detected from the dest filename (the -full- convention already exists).
+        _is_full = "-full-" in os.path.basename(dest_path)
+        if _is_full:
+            _scope = (
+                "TIER=FULL  (secondary .10 + R2 — the DR copy)\n"
+                "CARRIES: the ORG_EXTRA_INCLUDE projects PLUS every SWEPT project (every\n"
+                "  projects/* dir without its own committed history: discover-liwa, ilham, pylot, ...).\n"
+                "EXCLUDES: node_modules .git __pycache__ .next dist build .cache (git history rides\n"
+                "  the separate bundle tier).\n"
+                "=> This is the tier that answers 'is project X backed up?'. If it's here, it's backed up.\n"
+            )
+        else:
+            _scope = (
+                "TIER=CORE  (gateway LXC + on-box local retain — the LEAN subset)\n"
+                "CARRIES: ONLY the ORG_EXTRA_INCLUDE projects (sized for the small gateway LXC).\n"
+                "DELIBERATELY ABSENT: every SWEPT project (discover-liwa, ilham, pylot, ...). They\n"
+                "  ride the '-full-' zip on .10/R2, NOT this one.\n"
+                "=> 'Project X absent from THIS zip' does NOT mean it is unbacked. The '-full-' zip on\n"
+                "  .10/R2 is the tier that answers 'is project X backed up?' — check THERE, not here.\n"
+                "EXCLUDES: node_modules .git __pycache__ .next dist build .cache\n"
+            )
+        zf.writestr("BACKUP-SCOPE.txt", _scope)
+
+        # NODE-MEMORY TIER (2026-08-24, engineer — task: node-layer-backup-gap).
+        # The durable memory layer migrated to ~/.claude/projects/<agent>/memory and
+        # backup.py — a CONSUMER of where-memory-lives — was never extended to follow,
+        # so the fleet's LIVE node layer had no offsite copy while the dead workspace
+        # MEMORY.md archive did. Added here under a synthetic `node-memory/` arc prefix
+        # because it lives OUTSIDE arc_base (cortextos/orgs), so add_to_zip's
+        # relative_to(arc_base) cannot handle it.
+        #
+        # SCOPED credential handling (chief 2026-08-24): each node is credential-scanned
+        # HERE, at collection, with the SAME CREDENTIAL_PATTERNS the whole-archive verify
+        # uses. A node that trips is EXCLUDED and NAMED (rides `skipped`) so it never
+        # reaches the archive — converting a single credential-bearing node from the FAIL
+        # branch (verify_archive_clean aborts the ENTIRE backup, org-wide) into a named
+        # DROP (that one node is skipped by name; everything else still ships; the count
+        # check catches the exclusion). This is SCOPE, not a weaker scanner — a stricter
+        # per-file check scoped to the node dir, with the org-wide verify still the
+        # belt-and-braces behind it. A node holding a REAL secret SHOULD be dropped from
+        # an offsite zip and surfaced, not shipped. Measured 2026-08-24: 0 of 599 nodes
+        # trip it, so this path excludes nothing today and fires only on a genuine hit.
+        #
+        # SIZE ANCHOR for a future integration check (corrected 2026-08-24, chief+engineer):
+        # the node layer is ~3.3 MB uncompressed FLEET-WIDE (all agents, 599 nodes) — NOT
+        # 1.76 MB, which is one agent's dir. Node memory is dense technical prose (kebab
+        # terms, caps, quoted strings) and deflates ~2x, NOT ~3x, so it lands at ~1.6 MB in
+        # the zip. So a CORE-size delta near ~1.6 MB is HEALTHY; a delta near the FULL ~3.3 MB
+        # uncompressed is the stored-not-deflated tell. (Do NOT read a +1.6 MB delta as a
+        # shortfall — that was a wrong anchor: per-agent basis + a ~3x ratio that this
+        # content does not have. Verified: compress_type==8 on all node entries.)
+        node_root = Path(os.path.expanduser("~/.claude/projects"))
+        if node_root.exists():
+            for mem_dir in sorted(node_root.glob("*/memory")):
+                for f in sorted(mem_dir.rglob("*")):
+                    if not f.is_file():
+                        continue
+                    if should_exclude(f):
+                        skipped.append(str(f))
+                        continue
+                    real = f.resolve()
+                    if real in seen:
+                        continue
+                    try:
+                        text = f.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        text = ""
+                    if any(rx.search(text) for _label, rx in CREDENTIAL_PATTERNS):
+                        skipped.append(f"{f} :: node-credential-hit (excluded, not shipped)")
+                        continue
+                    seen.add(real)
+                    zf.write(f, arcname="node-memory/" + str(f.relative_to(node_root)))
+
     size_mb = os.path.getsize(dest_path) / (1024 * 1024)
     return size_mb, skipped
 
@@ -1242,6 +1319,8 @@ def dump_umami_db() -> str:
 
 ODOO_HOST = os.environ.get("BACKUP_ODOO_TARGET", "cortext@10.10.10.103")
 ODOO_PG_CONTAINER = "odoo-postgres"
+ODOO_APP_CONTAINER = "odoo-app"                 # filestore lives here, not in postgres
+ODOO_FILESTORE_BASE = "/var/lib/odoo/filestore"  # per-tenant dirs under here
 KEEP_ODOO_DUMPS = 7  # per tenant, local dir (the zip/R2 tiers carry their own retention)
 
 
@@ -1300,8 +1379,61 @@ def dump_odoo_dbs() -> tuple[bool, str]:
             old = sorted(out_dir.glob(f"{db}-*.sql.gz"))
             for stale in old[:-KEEP_ODOO_DUMPS]:
                 stale.unlink()
-        return True, (f"Odoo dumps: {len(tenants)} tenant(s) OK ({', '.join(lines)}) "
-                      f"-> backups/odoo (rides FULL zip + R2; keep {KEEP_ODOO_DUMPS}/tenant)")
+        # ── PASS 2: FILESTORE SWEEP — NON-BLOCKING (added 2026-08-31, engineer) ──────────
+        # The DB tier above is COMPLETE and WRITTEN before a single line here runs. Odoo keeps
+        # attachments on disk under the filestore (outside Postgres), so pg_dump alone restores
+        # rows with dead attachment references — a DB-only backup that a row-count check calls
+        # "restorable" while it is unusable. This pass captures each dumped tenant's filestore
+        # paired 1:1 with its dump.
+        #
+        # INVARIANT (chief 2026-08-31): a filestore fault can make the RUN fail loudly, but it
+        # CANNOT unwrite a dump. So we CONTINUE past any per-tenant filestore error, accumulate,
+        # and fail at the END — never abort mid-sweep, because an abort on tenant 3 would leave
+        # 4/5/6's dumps... already written (they are, above), but we still never let a filestore
+        # problem short-circuit anything. Under any filestore fault the DB tier is byte-identical
+        # to its old behaviour. Scoped to the SAME pg_database-derived tenant set as the dumps, so
+        # a new tenant sweeps automatically and dropped-DB orphan filestores (discoverliwa,
+        # silvermere-advisory, acme-*) are ignored by construction. Attachment resolution verified
+        # 2026-08-31: all six live tenants resolve entirely within their own dirs.
+        fs_lines, fs_failures = [], []
+        for db in tenants:
+            fdest = out_dir / f"{db}-{stamp}.filestore.tar.gz"
+            try:
+                with open(fdest, "wb") as fh:
+                    cap = subprocess.run(
+                        ["ssh", *ssh_opts, ODOO_HOST,
+                         f"docker exec {ODOO_APP_CONTAINER} tar czf - -C {ODOO_FILESTORE_BASE} {db}"],
+                        stdout=fh, stderr=subprocess.PIPE, timeout=600)
+                fsize = fdest.stat().st_size if fdest.exists() else 0
+                if cap.returncode != 0:
+                    err = cap.stderr.decode(errors="replace").strip()
+                    # A tenant with zero attachments may have no filestore dir: tar says "No such
+                    # file". That is a legitimate empty, not a transport fault — record, don't fail.
+                    if "No such file" in err or "Cannot stat" in err:
+                        fdest.unlink(missing_ok=True)
+                        fs_lines.append(f"{db} no-filestore")
+                        continue
+                    fdest.unlink(missing_ok=True)
+                    fs_failures.append(f"{db}: rc={cap.returncode} {err[:80]}")
+                    continue
+                if subprocess.run(["gzip", "-t", str(fdest)], capture_output=True).returncode != 0 or fsize < 45:
+                    fdest.unlink(missing_ok=True)
+                    fs_failures.append(f"{db}: filestore gzip integrity / empty ({fsize}B)")
+                    continue
+                fs_lines.append(f"{db} {fsize/1024/1024:.1f}MB")
+                for stale in sorted(out_dir.glob(f"{db}-*.filestore.tar.gz"))[:-KEEP_ODOO_DUMPS]:
+                    stale.unlink()
+            except Exception as e:  # noqa: BLE001 — per-tenant, NON-BLOCKING by design
+                fdest.unlink(missing_ok=True)
+                fs_failures.append(f"{db}: {e.__class__.__name__}: {e}")
+        dbmsg = f"Odoo dumps: {len(tenants)} tenant(s) OK ({', '.join(lines)})"
+        fsmsg = f"filestore: {', '.join(fs_lines) if fs_lines else 'none'}"
+        if fs_failures:
+            # LOUD, but the DBs are safe — the run is marked failed to surface the filestore gap,
+            # and the dumps remain on disk and ride the tiers regardless.
+            return False, (f"{dbmsg} — FILESTORE FAILED for {len(fs_failures)}/{len(tenants)}: "
+                           f"{'; '.join(fs_failures)}. DBs are written and safe; filestore tier degraded.")
+        return True, (f"{dbmsg}; {fsmsg} -> backups/odoo (rides FULL zip + R2; keep {KEEP_ODOO_DUMPS}/tenant)")
     except Exception as e:  # noqa: BLE001 — tier reports, main() attributes + exits
         return False, f"Odoo dumps: FAILED — {e}"
 
