@@ -1537,6 +1537,123 @@ def sweep_stale_backup_temps():
         print(f"startup-sweep: reclaimed {reclaimed/1e6:.0f}MB of orphaned backup temps (age floor {STALE_TEMP_AGE_S//3600}h)")
 
 
+# --- pre-flight disk-headroom gate (2026-09-15, engineer; task_1789424010395) -----------------
+# WHY: on 2026-09-14 a hand-run of the daily backup filled the root disk to 100%. The box sits
+# CHRONICALLY at ~96% (~2.3GB free) and a single run's transient peak tipped it over — and there
+# was NO pre-flight disk check. This gate refuses to run below a headroom floor and EXITS NON-ZERO
+# LOUDLY; a silent skip would only move the next incident somewhere quieter.
+#
+# N (BACKUP_MIN_FREE_GB, default 3GB) — DERIVED, not a round number:
+#   measured single-run peak ~1.5GB  = 617MB ctxbackup temp holding the FULL zip (measured on the
+#                                       night of the fill) + ~600MB retain-copy double-write during
+#                                       the final copy + ~300MB odoo dumps written before zipping
+#   + ~1.5GB margin                   = the unmeasured git-bundle set + a post-run floor on a box
+#                                       shared by 8 agents (a disk-full is FLEET-WIDE harm)
+#   Erring high is the fail-safe direction; env-overridable so N is tunable without a code edit
+#   (and so both gate directions can be exercised on the real disk via --preflight-check).
+#
+# CHRONIC vs TIGHT (chief 2026-09-15): a permanently-on gate stops carrying information — someone
+# raises N or comments it out to push a backup through, and then it is gone. So the gate counts
+# CONSECUTIVE refusals in a state file and DISTINGUISHES a single tight night from a chronically
+# too-full disk: on the Nth consecutive refusal it ESCALATES ONCE to a human, then suppresses
+# re-paging until a pass resets it — one finding, not one-incident-per-night. Every refusal still
+# names N-wanted, N-found, the largest reclaimable target, and says THE GATE IS NOT THE PROBLEM
+# (couples to the disk-attribution finding: the gate stops the bleeding, that row lets backups run).
+BACKUP_MIN_FREE_GB = float(os.environ.get("BACKUP_MIN_FREE_GB", "3"))
+HEADROOM_CHRONIC_RUNS = int(os.environ.get("BACKUP_HEADROOM_CHRONIC_RUNS", "2"))
+HEADROOM_STATE_FILE = os.environ.get("BACKUP_HEADROOM_STATE", "/home/cortext/backups/.headroom-gate-state.json")
+HEADROOM_EXIT_CODE = 3  # distinct non-zero: "refused, did not run" — NOT a backup failure
+
+def _headroom_decision(free_bytes: int, min_free_bytes: int) -> bool:
+    """Pure pass/refuse. True = enough headroom to run. Testable both directions with no I/O."""
+    return free_bytes >= min_free_bytes
+
+def _read_headroom_state() -> dict:
+    try:
+        with open(HEADROOM_STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"consecutive_refusals": 0, "escalated": False}
+
+def _write_headroom_state(state: dict) -> None:
+    try:
+        with open(HEADROOM_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:  # state I/O must never crash or block the gate
+        print(f"headroom-gate: could not persist state: {e}", file=sys.stderr)
+
+def _largest_reclaimable() -> str:
+    """Best-effort human hint at the biggest thing to delete. Never fatal, never slow (du timeout)."""
+    import glob as _glob
+    candidates = [
+        os.path.join(tempfile.gettempdir(), BACKUP_TMP_PREFIX + "*"),  # orphaned build temps
+        "/home/cortext/.cache",
+        "/home/cortext/backups",
+    ]
+    best = None
+    for pat in candidates:
+        for p in (_glob.glob(pat) if "*" in pat else [pat]):
+            try:
+                if not os.path.exists(p):
+                    continue
+                out = subprocess.run(["du", "-sb", p], capture_output=True, text=True, timeout=20).stdout
+                sz = int(out.split("\t")[0] or 0)
+                if best is None or sz > best[1]:
+                    best = (p, sz)
+            except Exception:
+                continue
+    return f"{best[0]} (~{best[1]/1e9:.1f}GB)" if best else "unknown (du unavailable)"
+
+def _escalate_chronic(free_gb: float, largest: str) -> None:
+    """Page a human ONCE when the disk is chronically too full. Best-effort; never fatal."""
+    chat = os.environ.get("CHAT_ID") or os.environ.get("CTX_TELEGRAM_CHAT_ID")
+    text = (f"🔴 BACKUP GATE: root disk chronically too full — backups REFUSED "
+            f"{HEADROOM_CHRONIC_RUNS}+ runs running (found {free_gb:.2f}GB free, need "
+            f"{BACKUP_MIN_FREE_GB:.1f}GB). Largest reclaimable: {largest}. Backups are NOT running "
+            f"until the disk is cleared. The gate is working — the disk needs the attention. [backup.py]")
+    if chat and shutil.which("cortextos"):
+        try:
+            subprocess.run(["cortextos", "bus", "send-telegram", chat, text], timeout=30)
+            return
+        except Exception as e:
+            print(f"headroom-gate: escalation send failed: {e}", file=sys.stderr)
+    print(f"headroom-gate: ESCALATION (no telegram path): {text}", file=sys.stderr)
+
+def preflight_headroom_gate() -> None:
+    """Refuse+exit-nonzero-loud if free disk < N. Distinguishes tight vs chronic; escalates once.
+    On PASS it clears any chronic streak and returns (caller proceeds)."""
+    fs = tempfile.gettempdir()  # where the ctxbackup temp (the transient peak) is created
+    free = shutil.disk_usage(fs).free
+    min_free = int(BACKUP_MIN_FREE_GB * (1024 ** 3))
+    if _headroom_decision(free, min_free):
+        st = _read_headroom_state()
+        if st.get("consecutive_refusals") or st.get("escalated"):
+            _write_headroom_state({"consecutive_refusals": 0, "escalated": False})
+        return
+    # --- refuse ---
+    st = _read_headroom_state()
+    streak = int(st.get("consecutive_refusals", 0)) + 1
+    escalated = bool(st.get("escalated", False))
+    largest = _largest_reclaimable()
+    free_gb = free / (1024 ** 3)
+    chronic = streak >= HEADROOM_CHRONIC_RUNS
+    head = (f"🔴 BACKUP REFUSED ({streak} runs running): root disk CHRONICALLY too full to back up."
+            if chronic else
+            f"BACKUP REFUSED: disk temporarily tight (refusal #{streak}; escalates to a human at #{HEADROOM_CHRONIC_RUNS}).")
+    print(f"{head}\n"
+          f"  wanted >= {BACKUP_MIN_FREE_GB:.1f}GB free on {fs}, found {free_gb:.2f}GB.\n"
+          f"  largest reclaimable target: {largest}.\n"
+          f"  THE GATE IS NOT THE PROBLEM — it prevents a repeat of the 2026-09-14 root-disk fill.\n"
+          f"  Backups will not run until free space is restored (disk-attribution finding: "
+          f"docker ~8GB in HOME + unattributed usage). Fix the disk, not the gate.", file=sys.stderr)
+    if chronic and not escalated:
+        _escalate_chronic(free_gb, largest)
+        escalated = True
+    _write_headroom_state({"consecutive_refusals": streak, "escalated": escalated,
+                           "last_refusal_utc": datetime.now(timezone.utc).isoformat()})
+    sys.exit(HEADROOM_EXIT_CODE)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backup a cortextos org (content org-scoped, transport infra-scoped)")
     parser.add_argument("--org", default=DEFAULT_ORG,
@@ -1551,11 +1668,23 @@ def main():
                         help="Skip Step 2b off-host gateway copy.")
     parser.add_argument("--no-s3", action="store_true",
                         help="Skip Step 2e S3 off-host tier even if configured.")
+    parser.add_argument("--preflight-check", action="store_true",
+                        help="Run ONLY the disk-headroom pre-flight gate and exit "
+                             "(0 = enough free space to back up; non-zero = refused). Runs no backup — "
+                             "also the harness for proving the gate refuses below N and passes above it.")
     args = parser.parse_args()
     configure_org(args.org)
 
     # Reclaim any orphaned build dirs from a previously-killed run BEFORE we build (see above).
     sweep_stale_backup_temps()
+
+    # Pre-flight disk-headroom gate: refuse+exit-nonzero if free < N, AFTER the sweep has reclaimed
+    # orphaned temps (so the gate judges POST-reclaim free space — the same view a real run gets).
+    if args.preflight_check:
+        preflight_headroom_gate()  # exits non-zero on refuse
+        print(f"headroom-gate: PASS — >= {BACKUP_MIN_FREE_GB:.1f}GB free on {tempfile.gettempdir()}; a backup may run.")
+        return
+    preflight_headroom_gate()  # normal run: refuse before any dumps/temp/zip touch the disk
 
     try:
         secrets = load_secrets()
