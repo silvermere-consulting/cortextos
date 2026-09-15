@@ -7,7 +7,10 @@
  * to the conversational CHAT_ID — which for a client-facing agent (e.g. othe -> Jen)
  * is a non-technical person on a deliberate no-contact hold. A hook cannot suppress a
  * DAEMON-executed send, so the rule has to be shared code, not a per-file habit. This
- * module is that shared home; every status sender imports resolveStatusRecipient.
+ * module is that shared home. INTERIM (2026-09-15, task_1788868319254): env-dict callers
+ * (hook-crash-alert, agent-manager) route through resolveStatusRecipient, but the daemon
+ * agent-process path is NOT yet unified onto it — single-sourcing (patch "a") is pending a
+ * governed rebuild window (see workspace/status-recipient-single-source-PREPARED-PATCH-2026-09-08.md).
  *
  * EXPLICIT RECIPIENT ONLY (2026-07-21, third-sender finding): status/ops notices go
  * ONLY to CTX_STATUS_CHAT_ID — a chat someone explicitly configured as the intended
