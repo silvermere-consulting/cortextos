@@ -32,11 +32,12 @@ export interface AgentMemory {
   /** Number of processes attributed to the agent (claude PTY child + node children). */
   procs: number;
   /**
-   * OBSERVE-ONLY (2026-07-23): the session-root pid's own PSS in MB — the object
-   * a future per-agent ladder should measure (see collectSessionPss). Optional
-   * and populated best-effort by the metrics report; NOTHING evaluates it yet
-   * (evaluateMemoryAnomalies still fires on rss_mb). Pure instrumentation so the
-   * ladder can be recalibrated onto the session object before the swap.
+   * The session-root pid's own PSS in MB — the true per-session footprint. THE GATING FIELD:
+   * evaluateMemoryAnomalies (LEVEL ladder) gates on this since 2026-08-02, and evaluateSlope
+   * (SLOPE arm) since 2026-09-15 — NOT rss_mb, which is a process-TREE sum inflated by child
+   * builds. Optional/best-effort (populated by the emitting caller via collectSessionPss); an
+   * agent missing it is SKIPPED by the level arm and recorded in sessionPssAbsent, never fallen
+   * back to the tree-sum. rss_mb is kept as CONTEXT only.
    */
   session_pss_mb?: number;
 }
@@ -338,8 +339,9 @@ export function collectAgentMemory(procDir = '/proc'): MemorySnapshot {
  * (that would reintroduce the very defect this measures around).
  *
  * Best-effort and never throws: any unreadable/gone pid is simply skipped, so a
- * PSS read can never break the metrics report. NOTHING evaluates the result yet;
- * it is logged beside the tree-sum to accumulate a recalibration window.
+ * PSS read can never break the metrics report. This result is the GATING field for
+ * both the level ladder (since 2026-08-02) and the slope arm (since 2026-09-15);
+ * rss_mb is logged beside it as context only.
  */
 export function collectSessionPss(
   sessionKeys: Map<string, string>,

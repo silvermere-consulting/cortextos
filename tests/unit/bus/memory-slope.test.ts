@@ -6,71 +6,108 @@ import {
 } from '../../../src/bus/memory-slope.js';
 import type { MemoryAnomaly, MemorySnapshot } from '../../../src/bus/agent-memory.js';
 
-// The slope arm replaces an identity-keyed prose routing contract. These
-// fixtures are the ship-gate (chief, 2026-07-14): the synthetic riser MUST
-// fire, flat-high MUST NOT, the restart sawtooth MUST NOT, and a detector
-// with insufficient history must refuse a verdict rather than invent one.
-// No agent name appears in any predicate — the fixtures use several names to
-// prove the behaviour is name-blind.
+// The slope arm gates on session_pss_mb (2026-09-15 swap, class rss_mb_is_a_tree_sum; tuple by
+// analyst, task_1784816241829). These fixtures are the ship-gate, all through the evaluator's own
+// path: a sustained PSS riser MUST fire (WARNING with headroom, CRITICAL when constrained), while
+// three distinct negatives — low-rate, rate-gates-despite-rise>100, and a last-sample spike whose
+// regression slope PASSES so only the spike-guard stops it — MUST stay silent. Each gate is proven
+// independently. No agent name appears in any predicate. Series values are session_pss_mb (MB); the
+// arm REBASELINES by dropping the first post-restart sample, so a fixture needs min_samples+1 raw
+// points to leave min_samples after the drop.
 
-function series(agent: string, key: string, startIso: string, stepH: number, rss: number[]): MemorySample[] {
+function series(agent: string, key: string, startIso: string, stepH: number, pss: number[]): MemorySample[] {
   const t0 = Date.parse(startIso);
-  return rss.map((mb, i) => ({
+  return pss.map((mb, i) => ({
     ts: new Date(t0 + i * stepH * 3_600_000).toISOString(),
-    agent, rss_mb: mb, session_key: key,
+    agent, rss_mb: mb, session_key: key, session_pss_mb: mb,
   }));
 }
 
 describe('evaluateSlope — known-positive', () => {
-  it('FIRES on a synthetic riser: +300MB over 5h in one session (any agent name)', () => {
-    const s = series('research', '123:456', '2026-07-14T00:00:00Z', 1, [400, 460, 520, 580, 640, 700]);
+  it('FIRES on a sustained PSS riser: 25 MB/h across a session (rebaselined, spread across samples)', () => {
+    // 5 raw samples @ 2h; drop the first (340) -> [390,440,490,540] over 6h: rise 150 (>=100),
+    // regression slope 25 (>=20), max single delta 50 = 33% of rise (< 50% spike-guard) -> rising.
+    const s = series('research', '123:456', '2026-07-14T00:00:00Z', 2, [340, 390, 440, 490, 540]);
     const v = evaluateSlope(s)!;
     expect(v.verdict).toBe('rising');
-    expect(v.rise_mb).toBe(300);
-    expect(v.rate_mb_per_h).toBeGreaterThanOrEqual(30);
+    expect(v.rate_mb_per_h).toBeGreaterThanOrEqual(20);
+    expect(v.rise_mb).toBeGreaterThanOrEqual(100);
   });
 
-  it('fires INSIDE the warning band (1000-1300) — the band the prose contract hid', () => {
-    const s = series('engineer', '9:9', '2026-07-14T00:00:00Z', 1, [1000, 1060, 1120, 1180, 1240, 1300]);
+  it('fires on a real-envelope PSS leak (session sitting mid-band, climbing steadily)', () => {
+    // 340->540 is entirely within the observed PSS envelope (boot ~285, peak <=548); the point is a
+    // sustained climb is caught regardless of absolute level — the band the old tree-sum arm drowned.
+    const s = series('engineer', '9:9', '2026-07-14T00:00:00Z', 1, [300, 350, 400, 450, 500, 540]);
     const v = evaluateSlope(s)!;
-    expect(v.verdict).toBe('rising'); // a leak living exactly where nobody was looking
+    expect(v.verdict).toBe('rising');
   });
 });
 
 describe('evaluateSlope — known-negatives', () => {
-  it('does NOT fire on a flat-high baseline (1100MB +/- jitter across 8h)', () => {
+  it('does NOT fire on a flat-high PSS baseline (~500MB +/- jitter)', () => {
     const s = series('engineer', '1:1', '2026-07-14T00:00:00Z', 1,
-      [1100, 1110, 1095, 1105, 1115, 1100, 1090, 1108, 1102]);
+      [500, 510, 495, 505, 515, 500, 490, 508, 502]);
     const v = evaluateSlope(s)!;
     expect(v.verdict).toBe('flat');
   });
 
   it('does NOT fire on the daily-restart sawtooth: rising day resets with a NEW session key', () => {
-    // Session A climbs 400->900, restart, session B starts back at 400 and has
-    // only 2 samples. The series is keyed to the LATEST session: 2 samples is
-    // insufficient — never a rise stitched across the restart.
-    const a = series('engineer', 'A:100', '2026-07-14T00:00:00Z', 1, [400, 600, 800, 900]);
-    const b = series('engineer', 'B:999', '2026-07-14T05:00:00Z', 1, [400, 450]);
+    // Session A climbs, restart, session B starts fresh with only 2 samples. Keyed to the LATEST
+    // session: 2 raw -> 1 after the rebaseline drop -> insufficient; never stitched across the restart.
+    const a = series('engineer', 'A:100', '2026-07-14T00:00:00Z', 1, [400, 500, 550, 560]);
+    const b = series('engineer', 'B:999', '2026-07-14T05:00:00Z', 1, [300, 350]);
     const v = evaluateSlope([...a, ...b])!;
     expect(v.verdict).toBe('insufficient');
     expect(v.session_key).toBe('B:999');
   });
 
-  it('does NOT fire on spike-then-recede (transient peak is not a leak)', () => {
-    const s = series('writer', '2:2', '2026-07-14T00:00:00Z', 1, [400, 900, 1400, 500, 620]);
+  it('RATE GATES despite rise>100: a long benign session at 13.6 MB/h stays silent (rate ANDed with rise)', () => {
+    // 6 raw @ 2.5h; drop first (300) -> [350,384,418,452,486] over 10h: rebaselined rise 136 (>=100)
+    // but regression slope 13.6 (<20). If this fired, rate would not be gating.
+    const s = series('writer', '2:2', '2026-07-14T00:00:00Z', 2.5, [300, 350, 384, 418, 452, 486]);
     const v = evaluateSlope(s)!;
-    expect(v.verdict).not.toBe('rising'); // last sample far below peak
+    expect(v.verdict).toBe('flat');
+    expect(v.rise_mb).toBeGreaterThanOrEqual(100);      // rise clears its floor...
+    expect(v.rate_mb_per_h).toBeLessThan(20);           // ...and rate is what holds it silent
+  });
+
+  it('SPIKE-GUARD rejects a last-sample spike whose regression slope PASSES (guard is load-bearing)', () => {
+    // 5 raw @ 2h; drop first (398) -> [400,402,404,704] over 6h: rise 304, regression slope ~46 (>=20,
+    // so the RATE gate passes) but the last delta 300 is ~99% of the rise (>50%) -> spike-guard rejects.
+    // Only the spike-guard stops this; the rate gate alone would fire (the research-FP shape).
+    const s = series('research', '4:4', '2026-07-14T00:00:00Z', 2, [398, 400, 402, 404, 704]);
+    const v = evaluateSlope(s)!;
+    expect(v.verdict).not.toBe('rising');
+    expect(v.rate_mb_per_h).toBeGreaterThanOrEqual(20); // rate PASSED — proves only the spike-guard rejected it
+  });
+
+  it('does NOT fire on spike-then-recede: a mid-series peak that recedes is not a leak', () => {
+    // The OLD rss-contract suite covered this via a stillNearPeak guard; under the PSS logic the
+    // rise-uses-LAST (not max) handles it: drop first (350) -> [450,540,400,410], rise = 410-450 = -40
+    // (below floor) and regression slope negative -> flat. Kept so the negative coverage does not drop
+    // when the guard mechanism changed.
+    const s = series('writer', '2:2', '2026-07-14T00:00:00Z', 1, [350, 450, 540, 400, 410]);
+    const v = evaluateSlope(s)!;
+    expect(v.verdict).not.toBe('rising');
+  });
+
+  it('GLITCH FILTER: a phantom sub-50 PSS reading cannot manufacture a rising verdict', () => {
+    // Without the filter, dropping series[0]=520 would anchor the rebaseline on the 33 glitch and read
+    // a ~490MB phantom rise. Filtering PSS<50 first leaves a flat session -> flat.
+    const s = series('othe', '5:5', '2026-07-14T00:00:00Z', 1, [520, 33, 510, 515, 520, 525]);
+    const v = evaluateSlope(s)!;
+    expect(v.verdict).not.toBe('rising');
   });
 
   it('refuses a verdict on insufficient samples or span (no invented flat)', () => {
-    const few = series('jones', '3:3', '2026-07-14T00:00:00Z', 1, [500, 800]);
+    const few = series('jones', '3:3', '2026-07-14T00:00:00Z', 1, [500, 800]); // 2 raw -> 1 post-drop
     expect(evaluateSlope(few)!.verdict).toBe('insufficient');
-    const narrow = series('jones', '3:3', '2026-07-14T00:00:00Z', 0.2, [500, 550, 600, 660]); // 0.6h span
+    const narrow = series('jones', '3:3', '2026-07-14T00:00:00Z', 0.2, [500, 520, 540, 560, 580]); // 5 raw, 0.8h span
     expect(evaluateSlope(narrow)!.verdict).toBe('insufficient');
   });
 
   it('ignores samples with unknown session keys (no series across the unknown)', () => {
-    const s = series('othe', '', '2026-07-14T00:00:00Z', 1, [400, 600, 800, 1000, 1200]);
+    const s = series('othe', '', '2026-07-14T00:00:00Z', 1, [400, 460, 520, 580, 640, 700]);
     expect(evaluateSlope(s)!.verdict).toBe('insufficient');
   });
 });
@@ -113,6 +150,15 @@ describe('applySlopeToAnomalies — identity-free routing', () => {
     expect(anomalies).toHaveLength(1);
     expect(anomalies[0].kind).toBe('memory_slope');
   });
+
+  it('PRESSURE-tiers the slope severity: WARNING with headroom, CRITICAL when host-constrained', () => {
+    const relaxed = applySlopeToAnomalies([], [rising('research')], false).anomalies[0];
+    expect(relaxed.kind).toBe('memory_slope');
+    expect(relaxed.severity).toBe('warning'); // early warning — a PSS leak has days of runway
+    const constrained = applySlopeToAnomalies([], [rising('research')], true).anomalies[0];
+    expect(constrained.kind).toBe('memory_slope');
+    expect(constrained.severity).toBe('critical'); // rising AND the box is tight = act now
+  });
 });
 
 describe('evaluateAllSlopes + env thresholds', () => {
@@ -122,8 +168,9 @@ describe('evaluateAllSlopes + env thresholds', () => {
       mem_total_mb: 16000, mem_available_mb: 8000, available_pct: 50,
     };
     const hist = [
-      ...series('a1', 'k1', '2026-07-14T00:00:00Z', 1, [400, 500, 600, 700]),
-      ...series('a2', 'k2', '2026-07-14T00:00:00Z', 1, [500, 500, 501, 500]),
+      // 5 raw each so 4 survive the rebaseline drop. a1 climbs 50 MB/h -> rising; a2 flat.
+      ...series('a1', 'k1', '2026-07-14T00:00:00Z', 1, [350, 400, 450, 500, 550]),
+      ...series('a2', 'k2', '2026-07-14T00:00:00Z', 1, [500, 500, 501, 500, 500]),
     ];
     const vs = evaluateAllSlopes(hist, snap);
     expect(vs.find(v => v.agent === 'a1')!.verdict).toBe('rising');

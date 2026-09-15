@@ -1110,8 +1110,13 @@ function emitMemoryAnomalies(
   memory: MemorySnapshot,
   verdicts: SlopeVerdict[],
 ): { emitted: number; suppressed: number; sessionPssAbsent: string[] } {
-  const { anomalies: level, sessionPssAbsent } = evaluateMemoryAnomalies(memory, memoryThresholdsFromEnv());
-  const { anomalies, suppressed_flat } = applySlopeToAnomalies(level, verdicts);
+  const mt = memoryThresholdsFromEnv();
+  const { anomalies: level, sessionPssAbsent } = evaluateMemoryAnomalies(memory, mt);
+  // Pressure-tier the slope emit on the SAME gate the level arm uses (analyst, 2026-09-15): a rising
+  // slope emits 'critical' when the host is constrained, else 'warning' (early warning — a PSS leak
+  // takes days to reach OOM, so warn-then-escalate always has reaction time).
+  const hostConstrained = memory.mem_total_mb > 0 && memory.available_pct < mt.headroom_warn_pct;
+  const { anomalies, suppressed_flat } = applySlopeToAnomalies(level, verdicts, hostConstrained);
   if (!anomalies.length && !suppressed_flat.length) return { emitted: 0, suppressed: 0, sessionPssAbsent };
   const paths = resolvePaths(env.agentName, env.instanceId, env.org);
   for (const a of anomalies) {
@@ -1153,9 +1158,10 @@ busCommand
       return;
     }
     const t = slopeThresholdsFromEnv();
-    // OBSERVE-ONLY (2026-07-23): this is the frequent path that actually feeds
-    // the recalibration window (memory-history.jsonl). Log session-pid PSS beside
-    // the tree-sum; nothing evaluates it (evaluateAllSlopes reads only rss_mb).
+    // This is the frequent path that feeds the slope arm's evidence base
+    // (memory-history.jsonl). Log session-pid PSS — the GATING field evaluateAllSlopes
+    // reads since 2026-09-15 (rss_mb is tree-sum context only) — and populate it onto the
+    // snapshot below so the level arm gates on it too.
     const sessionKeys = collectSessionKeys('/proc', env.ctxRoot);
     const sessionPss = collectSessionPss(sessionKeys, '/proc');
     // TWO-PART FIX (2026-08-02, class rss_mb_is_a_tree_sum): the LEVEL arm gates on

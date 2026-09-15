@@ -26,10 +26,11 @@ export interface MemorySample {
   /** "<pid>:<starttime-ticks>" of the agent's oldest live process; '' if unknown. */
   session_key: string;
   /**
-   * OBSERVE-ONLY (2026-07-23): PSS (MB) of the session-root pid at sample time —
-   * the recalibration signal logged beside rss_mb (the tree-sum). Optional and
-   * best-effort; NOTHING evaluates it (evaluateSlope reads only rss_mb), so it
-   * rides through the history round-trip as pure instrumentation.
+   * PSS (MB) of the session-root pid at sample time — the true per-session footprint.
+   * THE GATING FIELD for the slope arm since 2026-09-15 (evaluateSlope reads this, not rss_mb,
+   * which is a tree-sum inflated by child builds). Optional/best-effort: a sample missing it, or
+   * below PSS_GLITCH_FLOOR_MB (smaps-miss glitch), is excluded from the slope series. rss_mb is
+   * retained beside it as CONTEXT only (no longer evaluated by either arm).
    */
   session_pss_mb?: number;
 }
@@ -48,8 +49,8 @@ export interface SlopeThresholds {
 }
 
 export const DEFAULT_SLOPE_THRESHOLDS: SlopeThresholds = {
-  min_rise_mb: 200,
-  min_rate_mb_per_h: 30,
+  min_rise_mb: 100,
+  min_rate_mb_per_h: 20,
   min_samples: 4,
   min_span_h: 2,
   retention_days: 14,
@@ -94,8 +95,12 @@ export interface SlopeVerdict {
 export interface MemorySlopeAnomaly {
   kind: 'memory_slope';
   scope: 'agent';
-  severity: 'critical';
-  tier: 'elevated';
+  /** PRESSURE-tiered (analyst, 2026-09-15): 'warning' at rate>=threshold with any headroom (early
+   *  warning — a PSS leak takes days to reach OOM, so there is always reaction time); 'critical' only
+   *  when the host is ALSO constrained. Rate magnitude does NOT tier severity — it rides in metadata
+   *  for triage. Replaces the old fixed single-'critical' emit. */
+  severity: 'warning' | 'critical';
+  tier: 'warning' | 'elevated';
   agent: string;
   session_key: string;
   rise_mb: number;
@@ -104,13 +109,38 @@ export interface MemorySlopeAnomaly {
   samples: number;
 }
 
+/** Implausible-low session_pss reading (smaps_rollup miss / VmRSS fallback at the sample instant): a
+ *  real session boot floor is ~285 MB, so anything under this is NON-DATA and must be excluded before
+ *  slope math — else a 32->548 transition reads as a phantom +516 MB/0h climb. 25/921 such rows were
+ *  measured in the 14d window (values 0/4/31/32/33). (analyst + engineer, 2026-09-15.) */
+const PSS_GLITCH_FLOOR_MB = 50;
+
+/** Least-squares slope (MB per hour) of value vs time-in-hours. Robust to endpoint noise — unlike
+ *  (last-first)/span, a single last-sample spike does not set this by itself. 0 for <2 pts or flat time. */
+function regressionSlopeMbPerH(pts: { h: number; v: number }[]): number {
+  const n = pts.length;
+  if (n < 2) return 0;
+  const meanH = pts.reduce((s, p) => s + p.h, 0) / n;
+  const meanV = pts.reduce((s, p) => s + p.v, 0) / n;
+  let num = 0, den = 0;
+  for (const p of pts) { num += (p.h - meanH) * (p.v - meanV); den += (p.h - meanH) ** 2; }
+  return den === 0 ? 0 : num / den;
+}
+
 /**
- * Evaluate one agent's CURRENT-session series. Pure.
+ * Evaluate one agent's CURRENT-session PSS series. Pure.
  *
- * The series is the subset of samples sharing the LATEST session_key, in time
- * order. Rise is measured first-to-last, guarded against spike-then-flat: the
- * last sample must still be near the series maximum (>= 90%), otherwise a
- * transient peak that already receded would read as a permanent climb.
+ * Gates on session_pss_mb — the true per-session footprint (PSS of the session-root pid) — NOT rss_mb,
+ * which is a process-TREE SUM inflated by an agent's own child builds and threw the 11:50Z research
+ * false-critical (2026-09-15 swap, class rss_mb_is_a_tree_sum; tuple by analyst, task_1784816241829).
+ *
+ * The series is the samples sharing the LATEST session_key, glitch-filtered (session_pss_mb present and
+ * >= PSS_GLITCH_FLOOR_MB). REBASELINE: the first post-restart sample is dropped (fresh boot reads low
+ * and biases the rise/slope high); all math runs on the remainder. 'rising' requires ALL of:
+ *   rebaselined rise >= min_rise_mb  (anti-blip floor, NOT the discriminator)
+ *   least-squares regression slope >= min_rate_mb_per_h  (THE discriminator; robust to endpoint noise)
+ *   no single inter-sample delta > 50% of the rebaselined rise  (spike-guard: the research FP was ONE
+ *     ~100%-of-rise jump whose regression slope alone would pass — only this rejects it)
  */
 export function evaluateSlope(
   samples: MemorySample[],
@@ -121,29 +151,35 @@ export function evaluateSlope(
   const ordered = samples
     .filter(s => s.agent === agent)
     .sort((a, b) => a.ts.localeCompare(b.ts));
-  // Series = latest session only (restart-aware by construction).
   const latestKey = ordered[ordered.length - 1].session_key;
-  const series = ordered.filter(s => s.session_key === latestKey && s.session_key !== '');
+  const sessionSeries = ordered.filter(s =>
+    s.session_key === latestKey && s.session_key !== '' &&
+    typeof s.session_pss_mb === 'number' && (s.session_pss_mb as number) >= PSS_GLITCH_FLOOR_MB);
 
   const base = { agent, session_key: latestKey };
+  // REBASELINE: drop the first post-restart sample; slope math runs on the remainder.
+  const series = sessionSeries.slice(1);
   if (series.length < t.min_samples) {
     return { ...base, verdict: 'insufficient', samples: series.length, span_h: 0, rise_mb: 0, rate_mb_per_h: 0 };
   }
+  const pss = (s: MemorySample): number => s.session_pss_mb as number;
   const first = series[0];
   const last = series[series.length - 1];
   const spanH = (Date.parse(last.ts) - Date.parse(first.ts)) / 3_600_000;
   if (!(spanH >= t.min_span_h)) {
     return { ...base, verdict: 'insufficient', samples: series.length, span_h: round1(spanH), rise_mb: 0, rate_mb_per_h: 0 };
   }
-  const riseMb = last.rss_mb - first.rss_mb;
-  const rate = riseMb / spanH;
-  const maxMb = Math.max(...series.map(s => s.rss_mb));
-  const stillNearPeak = last.rss_mb >= maxMb * 0.9;
+  const riseMb = pss(last) - pss(first);
+  const t0 = Date.parse(first.ts);
+  const rate = regressionSlopeMbPerH(series.map(s => ({ h: (Date.parse(s.ts) - t0) / 3_600_000, v: pss(s) })));
+  let maxDelta = 0;
+  for (let i = 1; i < series.length; i++) maxDelta = Math.max(maxDelta, pss(series[i]) - pss(series[i - 1]));
+  const spiky = riseMb > 0 && maxDelta > 0.5 * riseMb;
 
-  if (riseMb >= t.min_rise_mb && rate >= t.min_rate_mb_per_h && stillNearPeak) {
-    return { ...base, verdict: 'rising', samples: series.length, span_h: round1(spanH), rise_mb: riseMb, rate_mb_per_h: round1(rate) };
+  if (riseMb >= t.min_rise_mb && rate >= t.min_rate_mb_per_h && !spiky) {
+    return { ...base, verdict: 'rising', samples: series.length, span_h: round1(spanH), rise_mb: round1(riseMb), rate_mb_per_h: round1(rate) };
   }
-  return { ...base, verdict: 'flat', samples: series.length, span_h: round1(spanH), rise_mb: riseMb, rate_mb_per_h: round1(rate) };
+  return { ...base, verdict: 'flat', samples: series.length, span_h: round1(spanH), rise_mb: round1(riseMb), rate_mb_per_h: round1(rate) };
 }
 
 function round1(n: number): number { return Math.round(n * 10) / 10; }
@@ -157,10 +193,14 @@ function round1(n: number): number { return Math.round(n * 10) / 10; }
  * - elevated / critical / headroom                    -> NEVER touched here.
  * - every RISING verdict emits a memory_slope anomaly (even below every level
  *   threshold — that is the whole point: the band we agreed not to look at).
+ *   Its severity is PRESSURE-tiered: 'critical' when hostConstrained, else 'warning'
+ *   (early warning preserved). hostConstrained is the SAME gate the level arm uses
+ *   (available_pct < headroom_warn_pct) — passed in so this module stays snapshot-free.
  */
 export function applySlopeToAnomalies(
   levelAnomalies: MemoryAnomaly[],
   verdicts: SlopeVerdict[],
+  hostConstrained = false,
 ): { anomalies: (MemoryAnomaly | MemorySlopeAnomaly)[]; suppressed_flat: MemoryAnomaly[] } {
   const byAgent = new Map(verdicts.map(v => [v.agent, v]));
   const anomalies: (MemoryAnomaly | MemorySlopeAnomaly)[] = [];
@@ -177,7 +217,9 @@ export function applySlopeToAnomalies(
   for (const v of verdicts) {
     if (v.verdict === 'rising') {
       anomalies.push({
-        kind: 'memory_slope', scope: 'agent', severity: 'critical', tier: 'elevated',
+        kind: 'memory_slope', scope: 'agent',
+        severity: hostConstrained ? 'critical' : 'warning',
+        tier: hostConstrained ? 'elevated' : 'warning',
         agent: v.agent, session_key: v.session_key,
         rise_mb: v.rise_mb, rate_mb_per_h: v.rate_mb_per_h, span_h: v.span_h, samples: v.samples,
       });

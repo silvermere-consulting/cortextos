@@ -444,10 +444,9 @@ export function collectMetrics(ctxRoot: string, org?: string): MetricsReport {
     if (memory.agents.length) {
       const t = slopeThresholdsFromEnv();
       const sessionKeys = collectSessionKeys('/proc');
-      // OBSERVE-ONLY (2026-07-23): session-pid PSS logged beside the tree-sum to
-      // accumulate a recalibration window. Attached to the live snapshot for
-      // visibility in latest.json and threaded into the history; NOTHING
-      // evaluates it yet (evaluateSlope/evaluateMemoryAnomalies read rss_mb).
+      // session-pid PSS: the GATING field for both memory arms (level since 2026-08-02,
+      // slope since 2026-09-15). Attached to the live snapshot for visibility in latest.json
+      // and threaded into the history the slope arm reads. rss_mb rides beside it as context.
       const sessionPss = collectSessionPss(sessionKeys, '/proc');
       for (const a of memory.agents) {
         const pss = sessionPss.get(a.agent);
