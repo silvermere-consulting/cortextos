@@ -94,7 +94,9 @@ describe('checkUsageApi', () => {
     writeStore();
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ five_hour_utilization: 0.42, seven_day_utilization: 0.18 }),
+      // Integer-percent API (42 => 42%). Was 0.42/0.18 — fractional inputs the old
+      // dual-scale heuristic tolerated but the real endpoint never sends (see normalize()).
+      json: async () => ({ five_hour_utilization: 42, seven_day_utilization: 18 }),
     });
 
     const result = await checkUsageApi(tmpDir);
@@ -114,6 +116,33 @@ describe('checkUsageApi', () => {
     const result = await checkUsageApi(tmpDir, { force: true });
     expect(result.five_hour_utilization).toBeCloseTo(0.42);
     expect(result.seven_day_utilization).toBeCloseTo(0.18);
+  });
+
+  it('renders a true 1% as 1%, not 100% (v=1 pivot regression guard)', async () => {
+    writeStore();
+    // Integer-percent API: 1 means 1%. The old `v>1?v/100:v` heuristic guessed
+    // fraction at v=1 and stored 1.0 (=100%) — the pivot bug that false-paged the
+    // fleet on 5h and every fresh-week 7d. This case fails under the old code.
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 1, seven_day_utilization: 1 }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+    expect(result.five_hour_utilization).toBeCloseTo(0.01);
+    expect(result.seven_day_utilization).toBeCloseTo(0.01);
+  });
+
+  it('normalizes the integer-percent range without regression (99, 100, 0)', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 99, seven_day_utilization: 100 }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+    expect(result.five_hour_utilization).toBeCloseTo(0.99); // 99% stays 99%
+    expect(result.seven_day_utilization).toBeCloseTo(1.0);  // 100% genuine cap
   });
 
   it('returns cached result within TTL', async () => {
@@ -147,8 +176,8 @@ describe('checkUsageApi', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
-        five_hour: { utilization: 0.16, resets_at: '2026-09-02T11:00:00.000+00:00' },
-        seven_day: { utilization: 0.11, resets_at: '2026-09-06T07:00:00.000+00:00' },
+        five_hour: { utilization: 16, resets_at: '2026-09-02T11:00:00.000+00:00' },
+        seven_day: { utilization: 11, resets_at: '2026-09-06T07:00:00.000+00:00' },
       }),
     });
 

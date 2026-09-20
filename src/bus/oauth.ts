@@ -293,10 +293,21 @@ export async function checkUsageApi(
     sevenDayUtilization?: number;
   };
 
-  // Normalize 0–100 → 0.0–1.0 if needed
+  // Normalize integer-percent (0–100) → 0.0–1.0. The Anthropic usage API is
+  // integer-percent — PROVEN by this bug's own existence, NOT by a sample count:
+  // a TRUE 1% rendered as 100%, which is only possible if the raw value was the
+  // integer `1` (a decimal `0.01` would have rendered 1% with no bug at all).
+  // (The "4530 rows are all multiples of 0.01" test is scale-BLIND — integer 5→0.05
+  // and decimal 0.05 are indistinguishable — so it cannot establish the scale; the defect does.
+  // Diagnosis: analyst, workspace/usage-normalize-1pct-bug-2026-09-18.md.)
+  // The old `v > 1 ? v/100 : v` heuristic could not disambiguate v=1: integer 1 (=1%)
+  // vs fraction 1.0 (=100%), and guessed fraction — so a TRUE 1% was stored as 100%. That
+  // pivot false-paged the fleet on 5h AND 7d (7d hits 1% every fresh week post-Sunday-reset).
+  // Divide unconditionally: correct for all integer-percent values; a fraction-mode API would
+  // collapse loudly toward ~0 (key off an explicit API unit, not the value, if ever needed).
   const normalize = (v: number | undefined) => {
     if (v === undefined) return 0;
-    return v > 1 ? v / 100 : v;
+    return v / 100;
   };
 
   const fiveHour = normalize(
