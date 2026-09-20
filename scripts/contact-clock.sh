@@ -18,12 +18,13 @@
 # An agent running past that date would keep using a clock the user has left.
 # This reads context.json fresh every call, so the expiry actually takes effect.
 #
-# FAIL-CLOSED: if the contact clock cannot be resolved, the answer is NIGHT.
+# FAIL-CLOSED: if the contact clock cannot be resolved, the answer is COMMS-CLOSED.
 # Staying silent when unsure is recoverable; a 3am ping is not.
 #
 # Usage:  bash "$CTX_FRAMEWORK_ROOT/scripts/contact-clock.sh"
-# Output: "<HH:MM> <ZONE> <DAY|NIGHT>"  e.g. "11:24 BST DAY"
-# Exit:   0 = DAY, 1 = NIGHT (including every fail-closed path)
+# Output: "<HH:MM> <ZONE> <COMMS-OPEN|COMMS-CLOSED>"  e.g. "11:24 BST COMMS-OPEN"
+#         (one space-separated field; hyphenated so `awk '{print $3}'` / `${x##* }` stay valid)
+# Exit:   0 = COMMS-OPEN, 1 = COMMS-CLOSED (including every fail-closed path)
 
 set -uo pipefail
 ROOT="${CTX_FRAMEWORK_ROOT:-/home/cortext/cortextos}"
@@ -34,7 +35,7 @@ DAY_START="${CONTACT_DAY_START:-08}"
 DAY_END="${CONTACT_DAY_END:-22}"   # exclusive upper bound
 
 fail_closed() {
-  echo "unresolved - NIGHT (fail-closed: $1)"
+  echo "unresolved - COMMS-CLOSED (fail-closed: $1)"
   exit 1
 }
 
@@ -122,8 +123,8 @@ HOUR=$(TZ="$ZONE" date +'%H' 2>/dev/null) || fail_closed "invalid zone '$ZONE'"
 HOUR=$((10#$HOUR))
 
 if [ "$HOUR" -ge "$((10#$DAY_START))" ] && [ "$HOUR" -lt "$((10#$DAY_END))" ]; then
-  echo "$NOW DAY"
+  echo "$NOW COMMS-OPEN"
   exit 0
 fi
-echo "$NOW NIGHT"
+echo "$NOW COMMS-CLOSED"
 exit 1
