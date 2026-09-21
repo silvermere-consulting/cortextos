@@ -1605,19 +1605,29 @@ def _largest_reclaimable() -> str:
     return f"{best[0]} (~{best[1]/1e9:.1f}GB)" if best else "unknown (du unavailable)"
 
 def _escalate_chronic(free_gb: float, largest: str) -> None:
-    """Page a human ONCE when the disk is chronically too full. Best-effort; never fatal."""
-    chat = os.environ.get("CHAT_ID") or os.environ.get("CTX_TELEGRAM_CHAT_ID")
-    text = (f"🔴 BACKUP GATE: root disk chronically too full — backups REFUSED "
+    """Escalate ONCE when the disk is chronically too full. Best-effort; never fatal.
+
+    ROUTES TO CHIEF via the bus, NOT a direct operator page (2026-09-16, engineer;
+    task_1789539468054). This runs from the 22:00Z backup cron = 02:00 the operator's
+    local time; a direct Telegram to the operator at 02:00 carries nothing they can act
+    on in the moment and violates the contact-clock discipline every other path already
+    honours. Chief holds the contact clock and surfaces this at an appropriate hour. A
+    bus send-message persists in chief's inbox and redelivers on his next boot, so the
+    signal is durable even if his session is momentarily down — strictly better than a
+    fire-and-forget Telegram. (The old CHAT_ID send-telegram path was the direct-operator
+    page; kept in git history, not here.)"""
+    text = (f"🔴 BACKUP GATE (engineer): root disk chronically too full — backups REFUSED "
             f"{HEADROOM_CHRONIC_RUNS}+ runs running (found {free_gb:.2f}GB free, need "
             f"{BACKUP_MIN_FREE_GB:.1f}GB). Largest reclaimable: {largest}. Backups are NOT running "
-            f"until the disk is cleared. The gate is working — the disk needs the attention. [backup.py]")
-    if chat and shutil.which("cortextos"):
+            f"until the disk is cleared. The gate is working — the disk needs the attention. "
+            f"Surface to the operator at an appropriate hour (fired at the 22:00Z cron = 02:00 local). [backup.py]")
+    if shutil.which("cortextos"):
         try:
-            subprocess.run(["cortextos", "bus", "send-telegram", chat, text], timeout=30)
+            subprocess.run(["cortextos", "bus", "send-message", "chief", "high", text], timeout=30)
             return
         except Exception as e:
             print(f"headroom-gate: escalation send failed: {e}", file=sys.stderr)
-    print(f"headroom-gate: ESCALATION (no telegram path): {text}", file=sys.stderr)
+    print(f"headroom-gate: ESCALATION (no bus path): {text}", file=sys.stderr)
 
 def preflight_headroom_gate() -> None:
     """Refuse+exit-nonzero-loud if free disk < N. Distinguishes tight vs chronic; escalates once.
