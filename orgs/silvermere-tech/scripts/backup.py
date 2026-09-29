@@ -36,6 +36,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import shutil
 import ssl
 import subprocess
@@ -1664,6 +1665,48 @@ def preflight_headroom_gate() -> None:
     sys.exit(HEADROOM_EXIT_CODE)
 
 
+# --- self-detach guard (2026-09-27, engineer; task_1788943819734) -----------------------------
+# WHY: this script is CLAUDE-MEDIATED — the backup-daily daemon cron injects a prompt into the
+# engineer session, which runs backup.py in the FOREGROUND. Any foreground caller with a timeout
+# (the ~120s agent tool cap, a heartbeat wrapper) SIGTERMs the whole process group when it fires —
+# mid FULL-zip that leaves a partial bundle set + a /tmp orphan (observed 2026-09-08 22:00Z). The
+# startup-sweep above only HEALS that after the fact on the next run; it does not PREVENT the kill.
+#
+# FIX: an opt-in --detach that hands the heavy build+upload to a session DETACHED from the caller's
+# session/process group, so a SIGTERM to the caller's group cannot reach it. The mechanism is a pure
+# start_new_session=True (the child calls setsid() before exec -> new session, new pgroup, no
+# controlling tty). The fast synchronous gates (sweep + headroom refuse) stay in the FOREGROUND so a
+# refusal is still seen by the caller. Default (no --detach) is byte-for-byte the old behaviour, so
+# the nightly cron path is unchanged until the cron is deliberately switched to --detach.
+#
+# A bash wrapper captures the child's real exit code into <log>.rc as its final act — this is more
+# reliable than instrumenting every sys.exit() tier, and lets a poller read completion + status with
+# no live handle to a process in another session.
+BACKUP_DETACH_LOG_DIR = os.environ.get("BACKUP_DETACH_LOG_DIR", "/home/cortext/backups/detach-logs")
+
+def spawn_detached(argv, log_path):
+    """Run argv detached from the caller's session/process group; stream its output to log_path and
+    write the exit code to <log_path>.rc when it finishes. Returns the child PID. The child is a
+    session leader (start_new_session=True), so a SIGTERM/SIGKILL delivered to the CALLER's process
+    group — the way a foreground timeout kills — does not reach it."""
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    rc_path = log_path + ".rc"
+    # Remove any stale rc so a poller can never read a previous run's status as this run's.
+    try:
+        os.unlink(rc_path)
+    except FileNotFoundError:
+        pass
+    inner = " ".join(shlex.quote(a) for a in argv)
+    wrapper = f"{inner} > {shlex.quote(log_path)} 2>&1; echo $? > {shlex.quote(rc_path)}"
+    p = subprocess.Popen(
+        ["bash", "-c", wrapper],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,                       # -> setsid(): new session + pgroup, detached
+        env={**os.environ, "BACKUP_DETACHED": "1"},   # marks the child; also guards re-detach
+    )
+    return p.pid
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backup a cortextos org (content org-scoped, transport infra-scoped)")
     parser.add_argument("--org", default=DEFAULT_ORG,
@@ -1682,6 +1725,13 @@ def main():
                         help="Run ONLY the disk-headroom pre-flight gate and exit "
                              "(0 = enough free space to back up; non-zero = refused). Runs no backup — "
                              "also the harness for proving the gate refuses below N and passes above it.")
+    parser.add_argument("--detach", action="store_true",
+                        help="Run the heavy build+upload in a DETACHED session (survives a foreground "
+                             "caller's timeout/SIGTERM; see spawn_detached). The fast gates (temp sweep + "
+                             "disk headroom refuse) still run synchronously first so a refusal is seen by "
+                             "the caller; then the run is handed off and this invocation returns. Poll "
+                             "<log>.rc for the exit code. Use for manual/tool-invoked runs; the nightly "
+                             "cron keeps the default foreground path unless switched to --detach.")
     args = parser.parse_args()
     configure_org(args.org)
 
@@ -1695,6 +1745,21 @@ def main():
         print(f"headroom-gate: PASS — >= {BACKUP_MIN_FREE_GB:.1f}GB free on {tempfile.gettempdir()}; a backup may run.")
         return
     preflight_headroom_gate()  # normal run: refuse before any dumps/temp/zip touch the disk
+
+    # Self-detach: the fast gates above (sweep + headroom refuse) have run synchronously in the
+    # foreground, so a caller still sees a refusal. Hand the heavy remainder to a detached session
+    # that a foreground timeout cannot kill, then return immediately. The BACKUP_DETACHED guard stops
+    # the detached child (which re-runs this file WITHOUT --detach anyway) from recursing.
+    if args.detach and not os.environ.get("BACKUP_DETACHED"):
+        child_argv = [sys.executable, os.path.abspath(__file__)] + \
+                     [a for a in sys.argv[1:] if a != "--detach"]
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        log_path = os.path.join(BACKUP_DETACH_LOG_DIR, f"backup-{args.org}-{ts}.log")
+        pid = spawn_detached(child_argv, log_path)
+        print(f"backup detached: pid={pid}")
+        print(f"  log: {log_path}")
+        print(f"  done when this exists: {log_path}.rc  (contents = exit code, 0 = success)")
+        return
 
     try:
         secrets = load_secrets()
