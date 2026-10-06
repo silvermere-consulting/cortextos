@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import { spawnSync, execFileSync } from 'child_process';
-import { existsSync, readFileSync, readdirSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, appendFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { checkRecipient, buildRefusal, priorityBodyMismatch } from '../bus/recipient-check.js';
@@ -25,13 +25,14 @@ import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-stat
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { formatTaskRow, taskTableHeader } from './task-table.js';
 import { resolveMessageText } from './message-text.js';
+import { resolveMetaSource, classifyMetaReject } from './meta-source.js';
 import { isHeartbeatStale } from '../utils/heartbeat-staleness.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, deleteKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
 import { convertFile, convertAndIngest } from '../bus/convert-file.js';
 import { checkDeps, formatDepsTable } from '../bus/check-deps.js';
 import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, syncOAuthFromCredentials, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
-import { atomicWriteSync } from '../utils/atomic.js';
+import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv, refuseMintedIdentity, readOrgContext } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
@@ -481,7 +482,18 @@ busCommand
   .argument('<event>', 'Event name')
   .argument('<severity>', 'Severity (info, warning, error, critical)')
   .option('--meta <json>', 'Metadata JSON string', '{}')
-  .action((category: string, event: string, severity: string, opts: { meta: string }) => {
+  .option('--meta-stdin', "Read --meta JSON from stdin — apostrophes, quotes, backticks and newlines are all safe (heredoc with a quoted delimiter). Mutually exclusive with --meta and --meta-file.")
+  .option('--meta-file <path>', 'Read --meta JSON from a file (same quoting safety as --meta-stdin). Mutually exclusive with --meta and --meta-stdin.')
+  .action((category: string, event: string, severity: string, opts: { meta: string; metaStdin?: boolean; metaFile?: string }, command: Command) => {
+    // Resolve the --meta SOURCE off argv (goal #92 item 2) so shell quoting cannot mangle
+    // a complex payload (a free-text apostrophe closing a single-quoted arg was the carrier
+    // of the empty-metadata drop, task_1791166263884). stdin/file bytes bypass argv entirely.
+    try {
+      opts.meta = resolveMetaSource(opts, command.getOptionValueSource('meta') === 'cli');
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
     const validCategories: EventCategory[] = ['action', 'error', 'metric', 'milestone', 'heartbeat', 'message', 'task', 'approval'];
     if (!validCategories.includes(category as EventCategory)) {
       console.error(`Invalid category '${category}'. Must be one of: ${validCategories.join(', ')}`);
@@ -495,6 +507,35 @@ busCommand
     const env = resolveEnv();
     { const r = refuseMintedIdentity(env, 'log-event', { needsOrg: true }); if (r) { console.error(r); process.exit(1); } }
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    // FAIL-CLOSE on a malformed --meta (2026-10-05, engineer; chief task_1791167040974).
+    // Until now logEvent() SILENTLY substituted {} for a --meta that did not parse to a JSON
+    // object, so a shell-corrupted self_report wrote metadata:{} at exit 0 — unrecoverable
+    // and byte-identical to a legitimately empty event, which is why the empty-metadata class
+    // could never name a cause. Discriminator is JSON-VALIDITY not emptiness (classifyMetaReject):
+    // a valid `{}` PASSES, only unparseable / non-object input is rejected. Rejecting before the
+    // write makes `{}` in the log unambiguously legitimate — the retirement condition for the trigger.
+    const metaReject = classifyMetaReject(opts.meta);
+    if (metaReject) {
+      // clause 3 — capture the raw rejected value to a recoverable sibling JSONL so the dropped
+      // payload is no longer lost. Best-effort: the loud reject below is the guarantee.
+      try {
+        const eventsDir = join(paths.analyticsDir, 'events', env.agentName);
+        ensureDir(eventsDir);
+        const today = new Date().toISOString().split('T')[0];
+        const rec = JSON.stringify({
+          ts: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+          agent: env.agentName, org: env.org,
+          category, event, severity,
+          reason: metaReject, raw_meta: opts.meta,
+        });
+        appendFileSync(join(eventsDir, `meta-rejected-${today}.jsonl`), rec + '\n', 'utf-8');
+      } catch { /* capture is best-effort; the loud reject is the contract */ }
+      // clause 1 (nonzero rc) + clause 2 (stderr naming the offending arg). Event NOT written.
+      console.error(`log-event REJECTED: ${metaReject}`);
+      console.error(`  offending --meta: ${opts.meta}`);
+      console.error(`  NOT written (category=${category} event=${event} severity=${severity}); raw meta captured to events/${env.agentName}/meta-rejected-${new Date().toISOString().split('T')[0]}.jsonl`);
+      process.exit(1);
+    }
     logEvent(paths, env.agentName, env.org, category as EventCategory, event, severity as EventSeverity, opts.meta);
     console.log(`Logged ${category}/${event} (${severity})`);
   });
