@@ -38,6 +38,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import ssl
 import subprocess
 import sys
@@ -1538,6 +1539,44 @@ def sweep_stale_backup_temps():
         print(f"startup-sweep: reclaimed {reclaimed/1e6:.0f}MB of orphaned backup temps (age floor {STALE_TEMP_AGE_S//3600}h)")
 
 
+# --- in-run SIGTERM/SIGINT trap (2026-10-07, engineer; task_1791306288308) --------------------
+# The startup sweep above reclaims PRIOR runs' orphans, but only at RUN START — so an orphan from
+# the 22:00Z backup is first swept by the NEXT run ~24h later (or the ~26h-later agent boot). That
+# is ~24h of ~600MB on a 92%-full disk. The sweep cannot fix THIS run's orphan because it fails
+# safe on anything younger than the 3h floor, and this run's build dir is always younger than that.
+#
+# The complement is a trap: TemporaryDirectory's cleanup runs on normal exit/exception but NOT on a
+# signal (the process dies before __exit__). exit 143 (SIGTERM) is the measured foreground 120s
+# tool-kill that orphaned the 632M dir on 2026-10-06; SIGTERM/SIGINT are trappable (only SIGKILL and
+# power-loss are not — those remain the startup sweep's job, hence belt-and-suspenders). The handler
+# removes THIS run's build dir and then re-raises the signal through the default handler so the exit
+# code stays truthful (128+signum), i.e. a killed backup still reports as killed.
+_CURRENT_BUILD_TMP = None  # set to the live build dir while a build is in flight; None otherwise
+
+def _build_temp_signal_handler(signum, _frame):
+    d = _CURRENT_BUILD_TMP
+    if d and os.path.isdir(d):
+        try:
+            # The reclaim is the FUNCTION; the log line is a nicety. SIGTERM is often followed by
+            # SIGKILL on a grace timer, so do the rmtree FIRST — never spend the grace computing a
+            # size we then lose by dying mid-walk. shutil is the module-level import (importing
+            # inside a signal handler can deadlock on the import lock if the main thread holds it).
+            shutil.rmtree(d, ignore_errors=True)
+            print(f"signal-trap: {signal.Signals(signum).name} received mid-build — "
+                  f"removed this run's temp {d} before exit", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 — cleanup must never mask the signal
+            print(f"signal-trap: {signum} received; cleanup of {d} failed: {e}", file=sys.stderr)
+    # Restore the default disposition and re-raise so the exit code is the honest 128+signum
+    # (a swallowed signal would report success for a killed run — the invisible-failure class).
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+def install_build_temp_trap():
+    """Register the SIGTERM/SIGINT cleanup trap. Must run on the main thread (main() does)."""
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, _build_temp_signal_handler)
+
+
 # --- pre-flight disk-headroom gate (2026-09-15, engineer; task_1789424010395) -----------------
 # WHY: on 2026-09-14 a hand-run of the daily backup filled the root disk to 100%. The box sits
 # CHRONICALLY at ~96% (~2.3GB free) and a single run's transient peak tipped it over — and there
@@ -1732,8 +1771,16 @@ def main():
                              "the caller; then the run is handed off and this invocation returns. Poll "
                              "<log>.rc for the exit code. Use for manual/tool-invoked runs; the nightly "
                              "cron keeps the default foreground path unless switched to --detach.")
+    global _CURRENT_BUILD_TMP  # rebound when a build dir is in flight (see the with-block below)
     args = parser.parse_args()
     configure_org(args.org)
+
+    # Trap SIGTERM/SIGINT so a mid-build kill cleans THIS run's temp instead of orphaning it
+    # (the startup sweep only reclaims PRIOR runs, and not until the next run ~24h later). Belt-
+    # and-suspenders with the sweep: the trap covers the trappable kills, the sweep covers SIGKILL
+    # and power-loss. Registered before any temp is created; harmless on the detach-parent path,
+    # which returns before a build dir exists (the handler no-ops while _CURRENT_BUILD_TMP is None).
+    install_build_temp_trap()
 
     # Reclaim any orphaned build dirs from a previously-killed run BEFORE we build (see above).
     sweep_stale_backup_temps()
@@ -1779,6 +1826,10 @@ def main():
         odoo_ok, odoo_status = True, "Odoo dumps: not run here — infra tier"
 
     with tempfile.TemporaryDirectory(prefix=BACKUP_TMP_PREFIX) as tmp:
+        # Expose this run's build dir to the signal trap so a SIGTERM/SIGINT mid-build removes it
+        # before exit. Stays set through the upload phases (the dir lives until this block exits) and
+        # is reset to None just after the block, so a signal on the final exit path finds nothing.
+        _CURRENT_BUILD_TMP = tmp
         zip_path = os.path.join(tmp, f"{ZIP_PREFIX}{date_str}.zip")
         print(f"Building backup zip...")
         size_mb, skipped = build_zip(zip_path)
@@ -1969,6 +2020,10 @@ def main():
         if r2_footprint_over:
             tier_failures.append("r2-footprint")
             print(f"ERROR: r2-footprint OVER free-tier ceiling — {r2_line.strip()}", file=sys.stderr)
+
+    # Build dir is gone now (TemporaryDirectory cleaned on normal block exit); clear the trap target
+    # so a signal during the final exit path finds nothing to remove and does not double-free.
+    _CURRENT_BUILD_TMP = None
 
     # Fail loudly. A backup that reports success while shipping no history is
     # worse than no backup: it buys false confidence and nobody looks again.
