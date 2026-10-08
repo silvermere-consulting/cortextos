@@ -1551,6 +1551,22 @@ def sweep_stale_backup_temps():
 # power-loss are not — those remain the startup sweep's job, hence belt-and-suspenders). The handler
 # removes THIS run's build dir and then re-raises the signal through the default handler so the exit
 # code stays truthful (128+signum), i.e. a killed backup still reports as killed.
+#
+# DETACHED-PATH REACH (TERM-reachability probe 2026-10-08, task_1790659015189_20711981): on the
+# --detach path the child is a session leader, so WHICH restart delivers SIGTERM to it is THREE-valued,
+# not "reboot-only" — the legs are different epistemic kinds and must not be collapsed:
+#   - agent restart (daily/hard): does NOT reach it — MEASURED (child SID/PGID != caller's); the detach
+#     escapes the caller's pgroup by design, so the trap is MOOT here and the child survives (intended).
+#   - pm2 daemon restart: UNMEASURED — reasoned from topology (setsid + reparent-to-init escapes pm2's
+#     fork tree), NOT confirmed by a (destructive) live restart. SAFE EITHER WAY: if it does fire, the
+#     1.6s pm2 grace > ~50ms rmtree; if it does not, the child survives. The unknown does not change the
+#     action, so it is left unmeasured deliberately.
+#   - OS reboot / systemd shutdown: DOES reach it — systemd-shutdown TERMs all processes regardless of
+#     session; 90s grace >> ~50ms cleanup, so the trap fires and reclaims this run's ~600MB temp.
+# ⇒ On the detached path the trap's one live trigger is the OS-reboot class (plus the FOREGROUND path's
+# caller-TERM). This is the TRAP: trappable SIGTERM/SIGINT ONLY. SIGKILL / OOM / power-loss are
+# UNtrappable and are the startup sweep's job — a SEPARATE mechanism; do not conflate the two.
+# Full record: workspace/term-reachability-probe-2026-10-08.md
 _CURRENT_BUILD_TMP = None  # set to the live build dir while a build is in flight; None otherwise
 
 def _build_temp_signal_handler(signum, _frame):
