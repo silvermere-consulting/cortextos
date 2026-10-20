@@ -763,27 +763,78 @@ def upload_to_gateway(secrets, zip_path: str) -> str:
         if rc != 0:
             return f"Gateway: FAILED (mkdir) — {err.strip() or rc}"
 
+        local_size = os.path.getsize(zip_path)
+
+        # Helper: remote byte-size of a path, or None if absent / un-stat'able.
+        # Used BOTH for the pre-upload decision and the post-upload verify.
+        def _remote_size(path):
+            rc_, out_, _e = _run_ssh(
+                ["ssh"] + ssh_opts + [target, f"stat -c %s {path} 2>/dev/null"], env)
+            out_ = out_.strip()
+            return int(out_) if (rc_ == 0 and out_.isdigit()) else None
+
+        # Helper: prune the gateway dir to the `keep` newest ZIP_PREFIX zips (by mtime).
+        def _prune(keep):
+            prune_cmd = (f"ls -1t {GATEWAY_REMOTE_DIR}/{ZIP_PREFIX}*.zip 2>/dev/null "
+                         f"| tail -n +{keep + 1} | xargs -r rm -f")
+            _run_ssh(["ssh"] + ssh_opts + [target, prune_cmd], env)
+
+        # --- RECLAIM-BEFORE-UPLOAD (task_1792278152361; fixes the 2026-10-17 full-disk
+        # deadlock) ---------------------------------------------------------------
+        # scp writes the FINAL filename directly — no temp-then-rename — so a half-written
+        # upload is left named exactly like a complete backup. PRESENCE is therefore never
+        # evidence a backup landed; remote byte-size is the only discriminator. (engineer)
+        #
+        # Pre-upload size check is THREE-VALUED, deliberately NOT a blind delete of the
+        # target name (which would destroy a good zip on a same-day re-run):
+        remote_size = _remote_size(remote_file)
+        if remote_size == local_size:
+            # (1) remote == local: this exact zip is already up (same-day re-run). Skip
+            # the scp entirely — idempotent, saves re-sending ~38MB, never risks the one
+            # good copy. Still prune to normal retention.
+            _prune(KEEP_GATEWAY)
+            size_mb = local_size / (1024 * 1024)
+            return (f"Gateway: already present {fname} ({size_mb:.2f} MB) on "
+                    f"{host}:{GATEWAY_REMOTE_DIR} (size-matched, scp skipped, keep last {KEEP_GATEWAY})")
+        if remote_size is not None:
+            # (2) remote exists but != local: a partial from a prior failed write. Remove
+            # it so its slot/space is reclaimed and it can never be mistaken for a complete
+            # backup. ((3) remote absent falls through to the upload.)
+            _run_ssh(["ssh"] + ssh_opts + [target, f"rm -f {remote_file}"], env)
+
+        # Reclaim one slot BEFORE the write: prune to KEEP_GATEWAY-1 so the new copy fits
+        # even at capacity. THIS IS THE FIX FOR THE DEADLOCK, and it holds independent of
+        # root cause: the old order pruned only AFTER a successful scp, so on a full disk
+        # the scp failed, the prune was never reached, no space was freed, and every
+        # subsequent night failed identically. Pruning first frees space BEFORE the write
+        # whatever consumed it, so it helps under every candidate cause.
+        # The binding variable is BYTES-FREE, not file COUNT: on 2026-10-17 a ~5MB leg
+        # landed while a ~38MB leg to the same host was refused, then 2026-10-18 both
+        # failed — size-discrimination, i.e. the volume ran out of bytes. HYPOTHESIS,
+        # UNMEASURED: nobody has read .6's df (the barred capacity ask), so whether the dir
+        # filled from one extra 38MB file, accumulated same-name partials, or an unrelated
+        # consumer is unsettled. The window df-before/after + ls-for-wrong-size settles it;
+        # this patch does not depend on the answer.
+        # BOUNDED TRADE, on purpose: pruning ahead of a *successful* scp means a FAILED
+        # upload leaves KEEP_GATEWAY-1 copies, not KEEP_GATEWAY. That floor STABILISES at
+        # KEEP_GATEWAY-1 — it does NOT compound: the next run prunes to the same number and
+        # the next success refills to KEEP_GATEWAY. One copy traded for self-healing.
+        _prune(KEEP_GATEWAY - 1)
+
         rc, _out, err = _run_ssh(
             ["scp"] + ssh_opts + [zip_path, f"{target}:{remote_file}"], env, timeout=300)
         if rc != 0:
             return f"Gateway: FAILED (scp) — {err.strip() or rc}"
 
         # Verify the copy landed intact: remote byte-size must equal local.
-        local_size = os.path.getsize(zip_path)
-        rc, out, _err = _run_ssh(["ssh"] + ssh_opts + [target, f"stat -c %s {remote_file}"], env)
-        remote_size = out.strip()
-        if rc != 0 or not remote_size.isdigit() or int(remote_size) != local_size:
+        remote_size = _remote_size(remote_file)
+        if remote_size != local_size:
             return (f"Gateway: FAILED (size mismatch: local={local_size} "
-                    f"remote={remote_size or '?'})")
-
-        # Prune to last KEEP_GATEWAY by mtime (newest kept).
-        prune_cmd = (f"ls -1t {GATEWAY_REMOTE_DIR}/{ZIP_PREFIX}*.zip 2>/dev/null "
-                     f"| tail -n +{KEEP_GATEWAY + 1} | xargs -r rm -f")
-        _run_ssh(["ssh"] + ssh_opts + [target, prune_cmd], env)
+                    f"remote={remote_size if remote_size is not None else '?'})")
 
         size_mb = local_size / (1024 * 1024)
         return (f"Gateway: uploaded {fname} ({size_mb:.2f} MB) to {host}:{GATEWAY_REMOTE_DIR} "
-                f"(size-verified, keep last {KEEP_GATEWAY})")
+                f"(size-verified, pre-pruned to {KEEP_GATEWAY - 1}, now keep last {KEEP_GATEWAY})")
     except Exception as e:
         return f"Gateway: FAILED — {e}"
     finally:
