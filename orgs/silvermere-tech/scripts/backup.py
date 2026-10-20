@@ -799,8 +799,45 @@ def upload_to_gateway(secrets, zip_path: str) -> str:
         if remote_size is not None:
             # (2) remote exists but != local: a partial from a prior failed write. Remove
             # it so its slot/space is reclaimed and it can never be mistaken for a complete
-            # backup. ((3) remote absent falls through to the upload.)
+            # backup.
+            # arm-2 LOG (task_1792278152361): a same-dated partial existed. On the nightly
+            # first run this is a SURPRISE (implies a same-day retry); if it fires, a prior
+            # write of todays name failed mid-stream.
+            print(f"Gateway: pre-upload arm-2 PARTIAL at {remote_file} "
+                  f"({remote_size} B != local {local_size} B) -- removing, slot reclaimed "
+                  f"(same-dated prior write failed mid-stream)", file=sys.stderr)
             _run_ssh(["ssh"] + ssh_opts + [target, f"rm -f {remote_file}"], env)
+        else:
+            # (3) remote absent: no same-dated object -> fresh upload. On the nightly first
+            # run this is the EXPECTED arm (todays dated name does not exist yet). It does
+            # NOT speak to partials under OTHER dated names (names are date-stamped); the
+            # dir-listing audit below is what surfaces cross-night accumulation.
+            print(f"Gateway: pre-upload arm-3 ABSENT at {remote_file} -- fresh upload "
+                  f"(no same-dated prior object)", file=sys.stderr)
+
+        # INSTRUMENT (read-only, task_1792278152361): list ALL dated gateway zips with
+        # sizes. The same-name check above cannot see cross-night dead partials because
+        # names are date-stamped (an old failed write sits under its OWN date and the new
+        # run probes a new name). This listing makes undersized OLD dated files directly
+        # visible in the night log, which answers the accumulation question the window was
+        # opened for. Pure read; changes no upload behaviour.
+        # PRE-REGISTERED ACCUMULATION FLOORS (fixed 2026-10-20 before the 22:00Z run, so
+        # the listing FALSIFIES rather than gets interpreted). Healthy CORE sizes grow
+        # monotonically ~0.1MB/day: silvermere-tech 37.30->38.73MB over 2wk; family
+        # 4.73->4.99MB. A dated gateway zip BELOW its org floor is a retained dead partial:
+        #   silvermere-tech-backup-*.zip : flag if < 37.0 MB
+        #   family-backup-*.zip          : flag if < 4.5 MB
+        # (Floors sit below the oldest retained healthy zip with margin; a truncated
+        # partial lands well under. Reading is by eye on this listing for now.)
+        _ls_rc, _ls_out, _ls_err = _run_ssh(
+            ["ssh"] + ssh_opts + [target,
+             f"ls -l {GATEWAY_REMOTE_DIR}/{ZIP_PREFIX}*.zip 2>/dev/null"], env)
+        if _ls_out.strip():
+            print("Gateway: pre-upload dir listing (accumulation audit):\n"
+                  + _ls_out.rstrip(), file=sys.stderr)
+        else:
+            print("Gateway: pre-upload dir listing -- no prior dated zips present",
+                  file=sys.stderr)
 
         # Reclaim one slot BEFORE the write: prune to KEEP_GATEWAY-1 so the new copy fits
         # even at capacity. THIS IS THE FIX FOR THE DEADLOCK, and it holds independent of
